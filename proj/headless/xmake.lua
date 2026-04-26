@@ -1,6 +1,6 @@
 add_rules("mode.release", "mode.debug")
 
-target("headless_ofm")
+target("headless")
     set_targetdir("build")
     set_kind("binary")
     set_languages("cxx20")

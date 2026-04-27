@@ -1,21 +1,57 @@
-add_rules("mode.release", "mode.debug")
+if type(add_rules) == "function" then
+    add_rules("mode.release", "mode.debug")
+end
 
-includes("./../src/engine/xmake.lua")
-includes("./../src/ofm/xmake.lua")
+local engine_xmake = "./../src/engine/xmake.lua"
+local ofm_xmake = "./../src/ofm/xmake.lua"
+if os.isfile(engine_xmake) then
+    includes(engine_xmake)
+else
+    cprint("${yellow}warning: missing %s (did you run submodule init?)", engine_xmake)
+end
+if os.isfile(ofm_xmake) then
+    includes(ofm_xmake)
+else
+    cprint("${yellow}warning: missing %s (did you run submodule init?)", ofm_xmake)
+end
 
-add_requires("vulkansdk", "glfw 3.4", "glm 1.0.1")
-add_requires("glslang 1.3", { configs = { binaryonly = true } })
-add_requires("imgui 1.91.1",  {configs = {glfw_vulkan = true}})
 add_requires("cuda", {system=true, configs={utils={"cublas","cusparse","cusolver"}}})
-add_requires("vtk 9.3.1")
 
-set_policy("build.intermediate_directory", false)
-set_runtimes("MD")
+if type(option) == "function" then
+    option("with_gui")
+        set_default(false)
+        set_showmenu(true)
+        set_description("Enable GUI/renderer projects and their Vulkan/GLFW/ImGui/VTK dependencies")
+end
 
-includes("sim_render", "voxelization", "dynamic_obstacle")
-add_options("compile_commands")
+local function _enabled(v)
+    return v == true or v == "y" or v == "yes" or v == "true" or v == "1" or v == 1
+end
+local with_gui = false
+if type(get_config) == "function" then
+    with_gui = _enabled(get_config("with_gui"))
+elseif type(has_config) == "function" then
+    with_gui = has_config("with_gui")
+end
 
-option("all")
-    set_default(true)
-    set_showmenu(false)
-    set_description("Build all examples")
+if with_gui then
+    add_requires("vulkansdk", "glfw 3.4", "glm 1.0.1")
+    add_requires("glslang 1.3", { configs = { binaryonly = true } })
+    add_requires("imgui 1.91.1", { configs = { glfw_vulkan = true } })
+    add_requires("vtk 9.3.1")
+end
+
+if type(set_policy) == "function" then
+    set_policy("build.intermediate_directory", false)
+end
+if type(set_runtimes) == "function" then
+    set_runtimes("MD")
+end
+
+includes("dynamic_obstacle_headless")
+if with_gui then
+    includes("voxelization", "dynamic_obstacle")
+end
+if type(add_options) == "function" then
+    add_options("compile_commands")
+end

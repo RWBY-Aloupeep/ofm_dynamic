@@ -1,4 +1,6 @@
-add_rules("mode.release", "mode.debug")
+if type(add_rules) == "function" then
+    add_rules("mode.release", "mode.debug")
+end
 
 target("dynamic_obstacle")
     set_targetdir("build")

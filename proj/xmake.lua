@@ -11,7 +11,7 @@ if type(option) == "function" then
         set_description("Enable GUI/renderer projects and their Vulkan/GLFW/ImGui/VTK dependencies")
     
     option("headless")
-        set_default(false)
+        set_default(true)
         set_showmenu(true)
         set_description("Configure/build only headless targets and skip GUI/renderer dependencies")
 end

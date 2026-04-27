@@ -1,4 +1,7 @@
-add_rules("mode.release", "mode.debug")
+if type(add_rules) == "function" then
+    add_rules("mode.release", "mode.debug")
+end
+
 
 target("voxelization")
     set_targetdir("build")

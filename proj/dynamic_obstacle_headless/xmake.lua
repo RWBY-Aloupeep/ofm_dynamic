@@ -9,14 +9,16 @@ target("dynamic_obstacle_headless")
     set_languages("cxx20")
     set_kind("binary")
 
-    add_headerfiles("*.h")
-    add_files("*.cu")
+    add_files("main.cu")
     add_includedirs(".", { public = true })
 
     add_cugencodes("compute_75")
     add_cuflags("--std c++20", "-lineinfo")
 
     add_deps("ofm")
+    if type(has_target) == "function" and has_target("data_io") then
+        add_deps("data_io")
+    end
 
     add_packages("cuda")
 

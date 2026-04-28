@@ -13,8 +13,10 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-set(OFM_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../src/ofm")
-set(AMGPCG_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../src/AMGPCG_Pybind_Torch")
+set(OFM_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
+set(OFM_SRC_ROOT "${OFM_ROOT}/src")
+set(OFM_SRC_DIR "${OFM_SRC_ROOT}/ofm")
+set(AMGPCG_ROOT "${OFM_SRC_ROOT}/AMGPCG_Pybind_Torch")
 set(AMGPCG_COMMON_DIR "${AMGPCG_ROOT}/common")
 set(AMGPCG_SOLVER_DIR "${AMGPCG_ROOT}/solver")
 
@@ -40,9 +42,9 @@ file(GLOB AMGPCG_SOLVER_SOURCES CONFIGURE_DEPENDS
 
 add_executable(dynamic_obstacle_headless
     main.cu
-    "${OFM_ROOT}/ofm.cu"
-    "${OFM_ROOT}/ofm_init.cu"
-    "${OFM_ROOT}/ofm_util.cu"
+    "${OFM_SRC_DIR}/ofm.cu"
+    "${OFM_SRC_DIR}/ofm_init.cu"
+    "${OFM_SRC_DIR}/ofm_util.cu"
     ${AMGPCG_COMMON_SOURCES}
     ${AMGPCG_SOLVER_SOURCES})
 
@@ -52,10 +54,16 @@ set_target_properties(dynamic_obstacle_headless PROPERTIES
 
 target_include_directories(dynamic_obstacle_headless PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"
-    "${OFM_ROOT}"
+    "${OFM_SRC_ROOT}"
+    "${OFM_SRC_DIR}"
+    "${AMGPCG_ROOT}"
     "${AMGPCG_COMMON_DIR}"
     "${AMGPCG_SOLVER_DIR}")
 
+target_compile_options(dynamic_obstacle_headless PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-include cstdint>
+    $<$<COMPILE_LANGUAGE:CUDA>:-include cstdint>)
+    
 target_link_libraries(dynamic_obstacle_headless PRIVATE
     CUDA::cudart
     CUDA::cublas

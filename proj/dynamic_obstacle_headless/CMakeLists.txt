@@ -75,6 +75,9 @@ target_include_directories(dynamic_obstacle_headless PRIVATE
     "${AMGPCG_COMMON_DIR}"
     "${AMGPCG_SOLVER_DIR}")
 
+target_compile_definitions(dynamic_obstacle_headless PRIVATE
+    HEADLESS_DISABLE_GPU_TIMER=1)
+    
 target_compile_options(dynamic_obstacle_headless PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-include cstdint>
     $<$<COMPILE_LANGUAGE:CUDA>:-include cstdint>)

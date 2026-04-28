@@ -82,14 +82,18 @@ void OFM::UpdateBoundary(cudaStream_t _stream)
 {
     if (use_dynamic_solid_) {
         {
-            CUDA_PROFILE_SCOPE(*profiler_, _stream, "UpdateBoundaryCondition");
+            if (profiler_) {
+                CUDA_PROFILE_SCOPE(*profiler_, _stream, "UpdateBoundaryCondition");
+            }
             SetBcBySurfaceAsync(*is_bc_x_, *is_bc_y_, *is_bc_z_, *bc_val_x_, *bc_val_y_, *bc_val_z_, tile_dim_, voxel_tex_, velocity_tex_, voxelized_velocity_scaler_, _stream);
             SetCoefByIsBcAsync(*(amgpcg_.poisson_vector_[0].is_dof_), *(amgpcg_.poisson_vector_[0].a_diag_), *(amgpcg_.poisson_vector_[0].a_x_), *(amgpcg_.poisson_vector_[0].a_y_),
                                        *(amgpcg_.poisson_vector_[0].a_z_), tile_dim_, *is_bc_x_, *is_bc_y_, *is_bc_z_, _stream);
         }
 
         {
-            CUDA_PROFILE_SCOPE(*profiler_, _stream, "Rebuild Projection Matrix")
+            if (profiler_) {
+                CUDA_PROFILE_SCOPE(*profiler_, _stream, "Rebuild Projection Matrix");
+            }
             amgpcg_.BuildAsync(6.0f, -1.0f, _stream);
         }
     }
@@ -106,7 +110,9 @@ void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
     std::shared_ptr<DHMemory<float>> src_u_z = init_u_z_;
 
     {
-        CUDA_PROFILE_SCOPE(*profiler_, _stream, "Advection");
+        if (profiler_) {
+            CUDA_PROFILE_SCOPE(*profiler_, _stream, "Advection");
+        }
         AdvectN2XAsync(*tmp_u_x_, tile_dim_, *src_u_x, *last_proj_u_x, *last_proj_u_y, *last_proj_u_z, dx_, mid_dt, _stream);
         AdvectN2YAsync(*tmp_u_y_, tile_dim_, *src_u_y, *last_proj_u_x, *last_proj_u_y, *last_proj_u_z, dx_, mid_dt, _stream);
         AdvectN2ZAsync(*tmp_u_z_, tile_dim_, *src_u_z, *last_proj_u_x, *last_proj_u_y, *last_proj_u_z, dx_, mid_dt, _stream);
@@ -115,7 +121,9 @@ void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
     SetInletAsync(*bc_val_x_, *bc_val_y_, tile_dim_, inlet_norm_, inlet_angle_, _stream);
 
     {
-        CUDA_PROFILE_SCOPE(*profiler_, _stream, "Projection 1");
+        if (profiler_) {
+            CUDA_PROFILE_SCOPE(*profiler_, _stream, "Projection 1");
+        }
         ProjectAsync(_stream);
     }
 
@@ -136,14 +144,18 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
     ResetBackwardFlowMapAsync(_stream);
 
     {
-        CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Backward flowmap");
+        if (profiler_) {
+            CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Backward flowmap");
+        }
         RKAxisAsync(*psi_x_, *T_x_, tile_dim_, x_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, _dt, _stream);
         RKAxisAsync(*psi_y_, *T_y_, tile_dim_, y_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, _dt, _stream);
         RKAxisAsync(*psi_z_, *T_z_, tile_dim_, z_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, _dt, _stream);
     }
 
     {
-        CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Forward flowmap");
+        if (profiler_) {
+            CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Forward flowmap");
+        }
         RKAxisAsync(*phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, -_dt, _stream);
         RKAxisAsync(*phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, -_dt, _stream);
         RKAxisAsync(*phi_z_, *F_z_, tile_dim_, z_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, -_dt, _stream);
@@ -157,7 +169,9 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
     }
 
     {
-        CUDA_PROFILE_SCOPE(*profiler_, _stream, "BFECC");
+        if (profiler_) {
+            CUDA_PROFILE_SCOPE(*profiler_, _stream, "BFECC");
+        }
         PullbackAxisAsync(*err_u_x_, tile_dim_, x_tile_dim, *u_x_, *u_y_, *u_z_, *phi_x_, *F_x_, grid_origin_, dx_, _stream);
         PullbackAxisAsync(*err_u_y_, tile_dim_, y_tile_dim, *u_x_, *u_y_, *u_z_, *phi_y_, *F_y_, grid_origin_, dx_, _stream);
         PullbackAxisAsync(*err_u_z_, tile_dim_, z_tile_dim, *u_x_, *u_y_, *u_z_, *phi_z_, *F_z_, grid_origin_, dx_, _stream);
@@ -181,7 +195,9 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
     }
 
     {
-        CUDA_PROFILE_SCOPE(*profiler_, _stream, "Projection 2");
+        if (profiler_) {
+            CUDA_PROFILE_SCOPE(*profiler_, _stream, "Projection 2");
+        }
         ProjectAsync(_stream);
     }
 

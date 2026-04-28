@@ -55,6 +55,7 @@ set_target_properties(dynamic_obstacle_headless PROPERTIES
 target_include_directories(dynamic_obstacle_headless PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"
     "${OFM_SRC_ROOT}"
+    "${OFM_SRC_ROOT}/engine"
     "${OFM_SRC_DIR}"
     "${AMGPCG_ROOT}"
     "${AMGPCG_COMMON_DIR}"

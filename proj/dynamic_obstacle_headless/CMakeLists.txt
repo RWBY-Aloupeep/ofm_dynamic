@@ -20,6 +20,12 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(nlohmann_json)
 
+FetchContent_Declare(
+    spdlog
+    URL https://github.com/gabime/spdlog/archive/refs/tags/v1.13.0.tar.gz)
+
+FetchContent_MakeAvailable(spdlog)
+
 set(OFM_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 set(OFM_SRC_ROOT "${OFM_ROOT}/src")
 set(OFM_SRC_DIR "${OFM_SRC_ROOT}/ofm")
@@ -74,6 +80,7 @@ target_compile_options(dynamic_obstacle_headless PRIVATE
     
 target_link_libraries(dynamic_obstacle_headless PRIVATE
     nlohmann_json::nlohmann_json
+    spdlog::spdlog_header_only
     CUDA::cudart
     CUDA::cublas
     CUDA::cusparse

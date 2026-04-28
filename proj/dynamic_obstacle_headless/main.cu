@@ -7,11 +7,13 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -108,8 +110,6 @@ OFMConfiguration BuildOFMConfiguration(const HeadlessOptions& options)
     cfg.len_y = options.len_y;
     cfg.tile_dim = { options.resolution.x / 8, options.resolution.y / 8, options.resolution.z / 8 };
     cfg.grid_origin = { 0.0f, 0.0f, 0.0f };
-    cfg.neg_bc_type = { 1, 1, 1 };
-    cfg.pos_bc_type = { 1, 1, 1 };
     cfg.inlet_norm = options.inlet_norm;
     cfg.inlet_angle = options.inlet_angle;
     cfg.voxelized_velocity_scaler = options.voxelized_velocity_scaler;
@@ -118,6 +118,39 @@ OFMConfiguration BuildOFMConfiguration(const HeadlessOptions& options)
     cfg.use_dynamic_solid = false;
     cfg.solid_sdf_path = "";
     return cfg;
+}
+
+void WriteNpyFloat32(const fs::path& output_path, const float* data, int nx, int ny, int nz)
+{
+    std::ofstream out(output_path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("Failed to open output file: " + output_path.string());
+    }
+
+    constexpr char magic[] = "\x93NUMPY";
+    constexpr unsigned char major = 1;
+    constexpr unsigned char minor = 0;
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+    header += std::to_string(nx) + ", " + std::to_string(ny) + ", " + std::to_string(nz) + "), }";
+    const std::size_t preamble_size = 6 + 2 + 2;
+    const std::size_t unpadded_size = preamble_size + header.size() + 1;
+    const std::size_t padding = (16 - (unpadded_size % 16)) % 16;
+    header.append(padding, ' ');
+    header.push_back('\n');
+
+    const std::uint16_t header_len = static_cast<std::uint16_t>(header.size());
+
+    out.write(magic, 6);
+    out.put(static_cast<char>(major));
+    out.put(static_cast<char>(minor));
+    out.write(reinterpret_cast<const char*>(&header_len), sizeof(header_len));
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+
+    const std::size_t count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(count * sizeof(float)));
+    if (!out) {
+        throw std::runtime_error("Failed to write npy data to: " + output_path.string());
+    }
 }
 
 void SaveVorticityField(const ofm::OFM& solver, const fs::path& output_dir, int step, cudaStream_t stream)
@@ -135,7 +168,7 @@ void SaveVorticityField(const ofm::OFM& solver, const fs::path& output_dir, int 
     filename << "vorticity_" << std::setfill('0') << std::setw(6) << step << ".npy";
     const fs::path output_path = output_dir / filename.str();
 
-    WriteNpy<float>(output_path.string(), solver.vor_norm_->host_ptr_, { nx, ny, nz });
+    WriteNpyFloat32(output_path, solver.vor_norm_->host_ptr_, nx, ny, nz);
     std::cout << "[OFM Headless] Saved vorticity to " << output_path.string() << "\n";
 }
 

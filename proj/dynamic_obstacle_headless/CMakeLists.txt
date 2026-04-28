@@ -12,6 +12,13 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+include(FetchContent)
+
+FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+
+FetchContent_MakeAvailable(nlohmann_json)
 
 set(OFM_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 set(OFM_SRC_ROOT "${OFM_ROOT}/src")
@@ -66,6 +73,7 @@ target_compile_options(dynamic_obstacle_headless PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-include cstdint>)
     
 target_link_libraries(dynamic_obstacle_headless PRIVATE
+    nlohmann_json::nlohmann_json
     CUDA::cudart
     CUDA::cublas
     CUDA::cusparse

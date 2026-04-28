@@ -58,6 +58,7 @@ add_executable(dynamic_obstacle_headless
     "${OFM_SRC_DIR}/ofm.cu"
     "${OFM_SRC_DIR}/ofm_init.cu"
     "${OFM_SRC_DIR}/ofm_util.cu"
+    "${OFM_SRC_ROOT}/engine/core/tool/logger.cpp"
     ${AMGPCG_COMMON_SOURCES}
     ${AMGPCG_SOLVER_SOURCES})
 

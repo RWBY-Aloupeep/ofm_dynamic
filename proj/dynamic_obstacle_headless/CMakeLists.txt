@@ -47,6 +47,8 @@ file(GLOB AMGPCG_COMMON_SOURCES CONFIGURE_DEPENDS
     "${AMGPCG_COMMON_DIR}/*.cc"
     "${AMGPCG_COMMON_DIR}/*.cxx")
 
+list(REMOVE_ITEM AMGPCG_COMMON_SOURCES "${AMGPCG_COMMON_DIR}/timer.cu")
+
 file(GLOB AMGPCG_SOLVER_SOURCES CONFIGURE_DEPENDS
     "${AMGPCG_SOLVER_DIR}/*.cu"
     "${AMGPCG_SOLVER_DIR}/*.cpp"
@@ -55,6 +57,7 @@ file(GLOB AMGPCG_SOLVER_SOURCES CONFIGURE_DEPENDS
 
 add_executable(dynamic_obstacle_headless
     main.cu
+    timer_stub.cpp
     "${OFM_SRC_DIR}/ofm.cu"
     "${OFM_SRC_DIR}/ofm_init.cu"
     "${OFM_SRC_DIR}/ofm_util.cu"

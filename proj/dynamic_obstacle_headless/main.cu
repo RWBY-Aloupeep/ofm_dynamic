@@ -178,6 +178,8 @@ int main(int argc, char** argv)
         const HeadlessOptions options = ParseOptions(argc, argv);
 
         cudaSetDevice(options.device);
+        cudaDeviceProp device_prop {};
+        cudaGetDeviceProperties(&device_prop, options.device);
         fs::create_directories(options.output_dir);
 
         ofm::OFM solver;
@@ -189,11 +191,18 @@ int main(int argc, char** argv)
         cudaStreamSynchronize(stream);
 
         const auto wall_start = std::chrono::steady_clock::now();
+        const float dt = 1.0f / 30.0f;
+        const int expected_saved_frames = (options.steps - 1) / options.save_interval + 1;
         std::cout << "[OFM Headless] Simulation starts\n";
         std::cout << "[OFM Headless] Resolution: " << options.resolution.x << "x" << options.resolution.y << "x" << options.resolution.z << "\n";
-        std::cout << "[OFM Headless] Steps: " << options.steps << ", save interval: " << options.save_interval << "\n";
+        std::cout << "[OFM Headless] tile_dim: " << solver.tile_dim_.x << "x" << solver.tile_dim_.y << "x" << solver.tile_dim_.z << "\n";
+        std::cout << "[OFM Headless] dx: " << solver.dx_ << "\n";
+        std::cout << "[OFM Headless] dt: " << dt << "\n";
+        std::cout << "[OFM Headless] steps: " << options.steps << "\n";
+        std::cout << "[OFM Headless] save_interval: " << options.save_interval << "\n";
+        std::cout << "[OFM Headless] output_dir: " << options.output_dir << "\n";
+        std::cout << "[OFM Headless] CUDA device: [" << options.device << "] " << device_prop.name << "\n";
 
-        const float dt = 1.0f / 30.0f;
         for (int step = 0; step < options.steps; ++step) {
             solver.inlet_angle_ = options.inlet_angle;
             solver.inlet_norm_ = options.inlet_norm;
@@ -217,7 +226,12 @@ int main(int argc, char** argv)
         cudaStreamSynchronize(stream);
         const auto wall_end = std::chrono::steady_clock::now();
         const double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(wall_end - wall_start).count();
-        std::cout << "[OFM Headless] Finished. Total runtime: " << seconds << " s\n";
+        const double avg_seconds_per_step = seconds / static_cast<double>(options.steps);
+        std::cout << "[OFM Headless] Finished.\n";
+        std::cout << "[OFM Headless] total runtime: " << seconds << " s\n";
+        std::cout << "[OFM Headless] saved frames: " << expected_saved_frames << "\n";
+        std::cout << "[OFM Headless] average seconds per step: " << avg_seconds_per_step << " s\n";
+
 
         cudaStreamDestroy(stream);
         return 0;

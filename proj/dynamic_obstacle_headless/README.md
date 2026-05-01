@@ -24,13 +24,13 @@ cmake --build proj/dynamic_obstacle_headless/build -j
 Smoke test preset:
 
 ```bash
-proj/dynamic_obstacle_headless/run_smoke_test.sh
+proj/dynamic_obstacle_headless/tests/run_smoke_test.sh
 ```
 
 Larger preset:
 
 ```bash
-proj/dynamic_obstacle_headless/run_64_test.sh
+proj/dynamic_obstacle_headless/tests/run_64_test.sh
 ```
 
 Direct executable example:
@@ -40,20 +40,20 @@ Direct executable example:
   --steps 20 \
   --save_interval 1 \
   --resolution 32,32,32 \
-  --output_dir ./proj/dynamic_obstacle_headless/build/outputs/headless_smoke
+  --output_dir ./proj/dynamic_obstacle_headless/outputs/vorticity/headless_smoke
 ```
 
 ## Validation
 Numerical checks for NaNs/Infs and summary stats:
 
 ```bash
-python3 proj/dynamic_obstacle_headless/check_npy.py ./proj/dynamic_obstacle_headless/build/outputs/headless_smoke
+python3 proj/dynamic_obstacle_headless/scripts/check_npy.py ./proj/dynamic_obstacle_headless/outputs/vorticity/headless_smoke
 ```
 
 Visualization and optional GIF:
 
 ```bash
-python3 proj/dynamic_obstacle_headless/visualize_vorticity.py ./proj/dynamic_obstacle_headless/build/outputs/headless_smoke --axis z --index mid --log --gif
+python3 proj/dynamic_obstacle_headless/scripts/visualize_vorticity.py ./proj/dynamic_obstacle_headless/outputs/vorticity/headless_smoke --axis z --index mid --log --gif
 ```
 
 ## Output format

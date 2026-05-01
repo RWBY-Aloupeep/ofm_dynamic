@@ -56,8 +56,8 @@ file(GLOB AMGPCG_SOLVER_SOURCES CONFIGURE_DEPENDS
     "${AMGPCG_SOLVER_DIR}/*.cxx")
 
 add_executable(dynamic_obstacle_headless
-    main.cu
-    timer_stub.cpp
+    src/main.cu
+    src/timer_stub.cpp
     "${OFM_SRC_DIR}/ofm.cu"
     "${OFM_SRC_DIR}/ofm_init.cu"
     "${OFM_SRC_DIR}/ofm_util.cu"
@@ -70,7 +70,8 @@ set_target_properties(dynamic_obstacle_headless PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 target_include_directories(dynamic_obstacle_headless PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}"
+    "${CMAKE_CURRENT_LIST_DIR}/src"
+    "${CMAKE_CURRENT_LIST_DIR}/src/utils"
     "${OFM_SRC_ROOT}"
     "${OFM_SRC_ROOT}/engine"
     "${OFM_SRC_DIR}"

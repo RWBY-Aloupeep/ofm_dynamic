@@ -20,7 +20,7 @@ namespace fs = std::filesystem;
 struct HeadlessOptions {
     int steps = 1000;
     int save_interval = 10;
-    std::string output_dir = "./outputs/headless";
+    std::string output_dir = "outputs/vorticity";
     int device = 0;
     int3 resolution = { 256, 128, 128 };
     float inlet_norm = 0.05f;

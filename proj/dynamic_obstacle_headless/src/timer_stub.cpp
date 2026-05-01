@@ -1,4 +1,4 @@
-#include "timer.h"
+#include "utils/timer.h"
 
 GPUTimer::GPUTimer() = default;
 GPUTimer::GPUTimer(bool) {}

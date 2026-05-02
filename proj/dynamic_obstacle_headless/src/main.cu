@@ -105,7 +105,7 @@ void WriteConfigJson(const fs::path& config_path, const HeadlessOptions& options
     }
     out << "{\n";
     out << "  \"resolution\": [" << options.resolution.x << ", " << options.resolution.y << ", " << options.resolution.z << "],\n";
-    out << "  \"tile_dim\": [" << cfg.tile_dim.x << ", " << cfg.tile_dim.y << ", " << cfg.tile_dim.z << "],\n";
+    out << "  \"tile_dim\": [" << cfg.tile_dim[0] << ", " << cfg.tile_dim[1] << ", " << cfg.tile_dim[2] << "],\n";
     out << "  \"steps\": " << options.steps << ",\n";
     out << "  \"save_interval\": " << options.save_interval << ",\n";
     out << "  \"device\": " << options.device << ",\n";

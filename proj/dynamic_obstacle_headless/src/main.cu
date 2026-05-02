@@ -339,22 +339,24 @@ int main(int argc, char** argv)
         fs::create_directories(preview_dir);
         fs::create_directories(logs_dir);
         fs::create_directories(stats_dir);
+        
+        const OFMConfiguration cfg = BuildOFMConfiguration(options);
+        const int3 computed_tile_dim = { cfg.tile_dim[0], cfg.tile_dim[1], cfg.tile_dim[2] };
 
         std::cerr << "[DEBUG] before constructing OFM\n" << std::flush;
         SetStage("before constructing OFM");
-        ofm::OFM solver;
+        ofm::OFM solver(computed_tile_dim);
         std::cerr << "[DEBUG] after constructing OFM\n" << std::flush;
         cudaStream_t stream;
         cudaStreamCreate(&stream);
-
-        const OFMConfiguration cfg = BuildOFMConfiguration(options);
-        const int3 computed_tile_dim = { cfg.tile_dim[0], cfg.tile_dim[1], cfg.tile_dim[2] };
+        
         if (computed_tile_dim.x <= 0 || computed_tile_dim.y <= 0 || computed_tile_dim.z <= 0) {
             throw std::runtime_error("Computed tile_dim must be > 0 in each dimension before InitOFMAsync.");
         }
         WriteConfigJson(run_dir / "config.json", options, cfg, run_dir, timestamp);
         std::cerr << "resolution: " << options.resolution.x << "x" << options.resolution.y << "x" << options.resolution.z << "\n";
-        std::cerr << "computed tile_dim: " << computed_tile_dim.x << "x" << computed_tile_dim.y << "x" << computed_tile_dim.z << "\n";
+        std::cerr << "cfg.tile_dim: " << computed_tile_dim.x << "x" << computed_tile_dim.y << "x" << computed_tile_dim.z << "\n";
+        std::cerr << "solver.tile_dim_ before InitOFMAsync: " << solver.tile_dim_.x << "x" << solver.tile_dim_.y << "x" << solver.tile_dim_.z << "\n";
         SetStage("before InitOFMAsync");
         ofm::InitOFMAsync(solver, cfg, stream);
         SetStage("before init cudaStreamSynchronize");

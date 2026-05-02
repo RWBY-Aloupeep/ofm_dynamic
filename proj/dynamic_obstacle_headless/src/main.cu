@@ -427,7 +427,7 @@ int main(int argc, char** argv)
                     stream);
                 SetStage("after AddPlumeSourceAsync step " + std::to_string(step));
             }
-            sSetStage("before AdvanceAsync step " + std::to_string(step));
+            SetStage("before AdvanceAsync step " + std::to_string(step));
             std::cerr << "[DEBUG] before AdvanceAsync\n" << std::flush;
             solver.AdvanceAsync(dt, stream);
             std::cerr << "[DEBUG] after AdvanceAsync\n" << std::flush;

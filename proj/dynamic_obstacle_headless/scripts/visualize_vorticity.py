@@ -16,7 +16,7 @@ def save_vtk(arr: np.ndarray, path: Path):
     try:
         import pyvista as pv
 
-        grid = pv.UniformGrid()
+        grid = pv.ImageData()
         grid.dimensions = np.array(arr.shape) + 1
         grid.cell_data["vorticity"] = arr.flatten(order="F")
         grid.save(path)

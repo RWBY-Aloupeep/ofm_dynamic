@@ -10,9 +10,9 @@ RESOLUTION="64,64,64"
 CUDA_ARCH="75"
 STEPS=400
 SAVE_INTERVAL=40
-PLUME_STRENGTH=0.02
-PLUME_RADIUS=0.06
-SWIRL_STRENGTH=0.003
+PLUME_STRENGTH=0.08
+PLUME_RADIUS=0.08
+SWIRL_STRENGTH=0.02
 OUTPUT_ROOT="${PROJ_DIR}/outputs"
 
 NX="${RESOLUTION%%,*}"
@@ -83,7 +83,6 @@ python3 "${PROJ_DIR}/scripts/visualize_vorticity.py" "${VORT_DIR}" \
   --output_dir "${PREVIEW_DIR}" \
   --axis z \
   --index mid \
-  --log \
   --gif \
   --fps 12 \
   --vtk \

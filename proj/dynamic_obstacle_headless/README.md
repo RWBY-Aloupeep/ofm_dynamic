@@ -27,12 +27,6 @@ Smoke test preset:
 proj/dynamic_obstacle_headless/tests/run_smoke_test.sh
 ```
 
-Larger preset:
-
-```bash
-proj/dynamic_obstacle_headless/tests/run_64_test.sh
-```
-
 Direct executable example:
 
 ```bash

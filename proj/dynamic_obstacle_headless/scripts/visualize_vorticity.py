@@ -12,6 +12,44 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def save_vtk(arr: np.ndarray, path: Path):
+    try:
+        import pyvista as pv
+
+        grid = pv.UniformGrid()
+        grid.dimensions = np.array(arr.shape) + 1
+        grid.cell_data["vorticity"] = arr.flatten(order="F")
+        grid.save(path)
+
+    except Exception as e:
+        print(f"[WARN] VTK export failed: {e}")
+
+
+def save_isosurface(arr: np.ndarray, path: Path, level: float):
+    try:
+        from skimage.measure import marching_cubes
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+        verts, faces, normals, values = marching_cubes(arr, level=level)
+
+        fig = plt.figure(figsize=(6, 6))
+        ax = fig.add_subplot(111, projection="3d")
+
+        mesh = Poly3DCollection(verts[faces], alpha=0.7)
+        mesh.set_facecolor("orange")
+        ax.add_collection3d(mesh)
+
+        ax.set_xlim(0, arr.shape[0])
+        ax.set_ylim(0, arr.shape[1])
+        ax.set_zlim(0, arr.shape[2])
+
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+    except Exception as e:
+        print(f"[WARN] Isosurface render failed: {e}")
+
+
 def parse_index(index_arg: str, axis_size: int) -> int:
     if index_arg == "mid":
         return axis_size // 2
@@ -53,7 +91,14 @@ def main() -> int:
     parser.add_argument("--eps", type=float, default=1e-12, help="epsilon for log scaling")
     parser.add_argument("--gif", action="store_true", help="Also write animated GIF")
     parser.add_argument("--fps", type=int, default=5, help="GIF FPS")
+    parser.add_argument("--vtk", action="store_true", help="Export VTK files for ParaView")
+    parser.add_argument("--iso", action="store_true", help="Render isosurface images")
+    parser.add_argument("--level", type=float, default=None, help="Isosurface level (default: auto)")
     args = parser.parse_args()
+    if args.vtk:
+        print("[INFO] VTK export requires pyvista")
+    if args.iso:
+        print("[INFO] Isosurface requires scikit-image")
 
     npy_files = sorted(args.output_dir.glob("vorticity_*.npy"))
     if not npy_files:
@@ -65,6 +110,18 @@ def main() -> int:
     saved_images: list[Path] = []
     for frame_id, npy_path in enumerate(npy_files):
         arr = np.load(npy_path)
+        if args.vtk:
+            vtk_path = args.output_dir / f"{npy_path.stem}.vtk"
+            save_vtk(arr, vtk_path)
+
+        if args.iso:
+            level = args.level
+            if level is None:
+                level = float(np.percentile(arr[np.isfinite(arr)], 95))
+
+            iso_path = figures_dir / f"{npy_path.stem}_iso.png"
+            save_isosurface(arr, iso_path, level)
+
         finite = np.isfinite(arr)
         nan_count = int(np.isnan(arr).sum())
         inf_count = int(np.isinf(arr).sum())
@@ -96,7 +153,7 @@ def main() -> int:
         cbar_label = "log10(vorticity + eps)" if args.log else "vorticity norm"
         fig.colorbar(im, ax=ax, label=cbar_label)
 
-        output_png = figures_dir / f"vorticity_{frame_id:06d}_{args.axis}mid.png"
+        output_png = figures_dir / f"vorticity_{frame_id:06d}_{args.axis}{slice_idx}.png"
         fig.tight_layout()
         fig.savefig(output_png, dpi=150)
         plt.close(fig)

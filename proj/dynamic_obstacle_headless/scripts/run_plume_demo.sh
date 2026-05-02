@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "${PROJ_DIR}/../.." && pwd)"
 BUILD_DIR="${PROJ_DIR}/build"
 
 RESOLUTION="64,64,64"
-CUDA_ARCH="86"
+CUDA_ARCH="75"
 STEPS=400
 SAVE_INTERVAL=40
 PLUME_STRENGTH=0.02
@@ -33,6 +33,8 @@ echo "[INFO] OUTPUT_ROOT=${OUTPUT_ROOT}"
 echo "[INFO] RESOLUTION=${RESOLUTION}"
 
 echo "[INFO] Configuring and building..."
+rm -rf "${BUILD_DIR}"
+mkdir -p "${BUILD_DIR}"
 cmake -S "${PROJ_DIR}" -B "${BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \

@@ -103,7 +103,9 @@ def main() -> int:
 
     npy_files = sorted(args.input_dir.glob("vorticity_*.npy"))
     if not npy_files:
-        raise RuntimeError(f"No vorticity_*.npy files found in {args.input_dir}")
+        npy_files = sorted(args.input_dir.glob("frame_*.npy"))
+    if not npy_files:
+        raise RuntimeError(f"No vorticity_*.npy or frame_*.npy files found in {args.input_dir}")
 
     export_dir = args.output_dir if args.output_dir is not None else (args.input_dir / "figures")
     export_dir.mkdir(parents=True, exist_ok=True)

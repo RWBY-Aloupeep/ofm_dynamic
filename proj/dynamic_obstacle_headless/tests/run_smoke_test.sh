@@ -24,7 +24,7 @@ cmake --build "${BUILD_DIR}" -j > "${LOG_DIR}/build.log" 2>&1
 
 echo "[INFO] Running simulation..."
 "${BUILD_DIR}/dynamic_obstacle_headless" \
-  --resolution 128,128,128 \
+  --resolution 64,64,64 \
   --output_dir "${OUTPUT_DIR}" \
   > "${LOG_DIR}/sim.log" 2>&1
 

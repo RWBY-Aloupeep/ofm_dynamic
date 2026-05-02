@@ -26,7 +26,7 @@ struct HeadlessOptions {
     int save_interval = 10;
     std::string output_dir = "outputs";
     int device = 0;
-    int3 resolution = { 256, 128, 128 };
+    int3 resolution = { 128, 128, 128 };
     float inlet_norm = 0.05f;
     float inlet_angle = 90.0f;
     float voxelized_velocity_scaler = 1.8f;
@@ -291,7 +291,8 @@ int main(int argc, char** argv)
         cudaDeviceProp device_prop {};
         cudaGetDeviceProperties(&device_prop, options.device);
         const std::string timestamp = BuildTimestamp();
-        const fs::path run_dir = fs::path(options.output_dir)
+        const fs::path resolution_dir = fs::path(options.output_dir) / "plume" / ("res" + std::to_string(options.resolution.x));
+        const fs::path run_dir = resolution_dir
             / ("ps" + FormatFloatTag(options.plume_strength) + "_pr" + FormatFloatTag(options.plume_radius)
                 + "_sw" + FormatFloatTag(options.swirl_strength) + "_" + timestamp);
         const fs::path vorticity_dir = run_dir / "vorticity";
@@ -323,7 +324,7 @@ int main(int argc, char** argv)
         std::cout << "[OFM Headless] steps: " << options.steps << "\n";
         std::cout << "[OFM Headless] save_interval: " << options.save_interval << "\n";
         std::cout << "[OFM Headless] output_dir: " << options.output_dir << "\n";
-        std::cout << "[OFM Headless] Output run directory:\n  " << run_dir.string() << "\n";
+        std::cout << "[OFM Headless] RUN_DIR: " << run_dir.string() << "\n";
         std::cout << "[OFM Headless] Vorticity frames:\n  " << (vorticity_dir / "frame_%06d.npy").string() << "\n";
         std::cout << "[OFM Headless] Log file path (use shell tee):\n  " << (logs_dir / "run.log").string() << "\n";
         std::cout << "[OFM Headless] CUDA device: [" << options.device << "] " << device_prop.name << "\n";

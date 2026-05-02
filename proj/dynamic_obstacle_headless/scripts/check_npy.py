@@ -44,12 +44,18 @@ def main() -> int:
         raise FileNotFoundError(f"Path does not exist: {path}")
 
     if path.is_file():
+        if path.suffix != ".npy":
+            raise RuntimeError(f"No .npy files found in: {path}")
         files = [path]
     else:
         files = sorted(path.glob("*.npy"))
+        if not files:
+            files = sorted(path.rglob("*.npy"))
 
     if not files:
         raise RuntimeError(f"No .npy files found in: {path}")
+
+    print(f"found {len(files)} .npy files under: {path}")
 
     for file in files:
         summarize_file(file)

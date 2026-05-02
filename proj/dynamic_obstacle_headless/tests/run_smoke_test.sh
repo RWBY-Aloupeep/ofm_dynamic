@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../../.. && pwd)"
 PROJ_DIR="${ROOT_DIR}/proj/dynamic_obstacle_headless"
 BUILD_DIR="${PROJ_DIR}/build"
-OUTPUT_DIR="${PROJ_DIR}/outputs/vorticity/headless_128"
+OUTPUT_DIR="${PROJ_DIR}/outputs/plume/res128"
 LOG_DIR="${OUTPUT_DIR}/logs"
 
 rm -rf "${OUTPUT_DIR}"

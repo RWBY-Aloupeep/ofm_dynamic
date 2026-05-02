@@ -2,6 +2,7 @@
 #include "ofm.h"
 #include "ofm_init.h"
 #include "ofm_util.h"
+#include "plume_source.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -28,6 +29,10 @@ struct HeadlessOptions {
     float voxelized_velocity_scaler = 1.8f;
     float len_y = 1.0f;
     bool use_bfecc_clamp = true;
+    bool plume = true;
+    float plume_strength = 0.2f;
+    float plume_radius = 0.12f;
+    float swirl_strength = 0.05f;
 };
 
 int ParseIntArg(const char* value, const std::string& arg_name)
@@ -39,6 +44,14 @@ int ParseIntArg(const char* value, const std::string& arg_name)
     }
 }
 
+float ParseFloatArg(const char* value, const std::string& arg_name)
+{
+    try {
+        return std::stof(value);
+    } catch (...) {
+        throw std::runtime_error("Invalid float for " + arg_name + ": " + value);
+    }
+}
 void PrintUsage(const char* program)
 {
     std::cout << "Usage: " << program << " [options]\n"
@@ -48,6 +61,10 @@ void PrintUsage(const char* program)
               << "  --output_dir <path>     Output directory for .npy files\n"
               << "  --resolution <x,y,z>    Grid resolution in voxels (default: 256,128,128)\n"
               << "  --device <int>          CUDA device index (default: 0)\n"
+              << "  --plume                 Enable plume source forcing (default: off)\n"
+              << "  --plume_strength <f>    Upward plume strength (default: 0.2)\n"
+              << "  --plume_radius <f>      Plume radius as domain fraction (default: 0.12)\n"
+              << "  --swirl_strength <f>    Swirl strength around y-axis (default: 0.05)\n"
               << "  --help                  Print this help\n";
 }
 
@@ -75,6 +92,10 @@ HeadlessOptions ParseOptions(int argc, char** argv)
             PrintUsage(argv[0]);
             std::exit(0);
         }
+        if (arg == "--plume") {
+            opts.plume = true;
+            continue;
+        }
         if (i + 1 >= argc) {
             throw std::runtime_error("Missing value for argument: " + arg);
         }
@@ -90,6 +111,12 @@ HeadlessOptions ParseOptions(int argc, char** argv)
             opts.resolution = ParseResolutionArg(value);
         } else if (arg == "--device") {
             opts.device = ParseIntArg(value, arg);
+        } else if (arg == "--plume_strength") {
+            opts.plume_strength = ParseFloatArg(value, arg);
+        } else if (arg == "--plume_radius") {
+            opts.plume_radius = ParseFloatArg(value, arg);
+        } else if (arg == "--swirl_strength") {
+            opts.swirl_strength = ParseFloatArg(value, arg);
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }
@@ -100,6 +127,9 @@ HeadlessOptions ParseOptions(int argc, char** argv)
     }
     if (opts.save_interval <= 0) {
         throw std::runtime_error("--save_interval must be > 0");
+    }
+    if (opts.plume_radius <= 0.0f) {
+        throw std::runtime_error("--plume_radius must be > 0");
     }
     return opts;
 }
@@ -202,6 +232,10 @@ int main(int argc, char** argv)
         std::cout << "[OFM Headless] save_interval: " << options.save_interval << "\n";
         std::cout << "[OFM Headless] output_dir: " << options.output_dir << "\n";
         std::cout << "[OFM Headless] CUDA device: [" << options.device << "] " << device_prop.name << "\n";
+        std::cout << "[OFM Headless] plume: " << (options.plume ? "on" : "off") << "\n";
+        std::cout << "[OFM Headless] plume_strength: " << options.plume_strength << "\n";
+        std::cout << "[OFM Headless] plume_radius: " << options.plume_radius << "\n";
+        std::cout << "[OFM Headless] swirl_strength: " << options.swirl_strength << "\n";
 
         for (int step = 0; step < options.steps; ++step) {
             solver.inlet_angle_ = options.inlet_angle;
@@ -210,6 +244,14 @@ int main(int argc, char** argv)
 
             if (step > 0) {
                 solver.UpdateBoundary(stream);
+            }
+            if (options.plume) {
+                AddPlumeSourceAsync(
+                    solver,
+                    options.plume_strength,
+                    options.plume_radius,
+                    options.swirl_strength,
+                    stream);
             }
             solver.AdvanceAsync(dt, stream);
             solver.ReinitAsync(dt, stream);

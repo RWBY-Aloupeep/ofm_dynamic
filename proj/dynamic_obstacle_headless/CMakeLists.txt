@@ -57,6 +57,7 @@ file(GLOB AMGPCG_SOLVER_SOURCES CONFIGURE_DEPENDS
 
 add_executable(dynamic_obstacle_headless
     src/main.cu
+    src/plume_source.cu
     src/timer_stub.cpp
     "${OFM_SRC_DIR}/ofm.cu"
     "${OFM_SRC_DIR}/ofm_init.cu"

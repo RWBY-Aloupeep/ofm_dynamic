@@ -2,6 +2,7 @@
 #include "plume_source.h"
 
 #include <cmath>
+#include <iostream>
 
 namespace {
 __global__ void AddPlumeSourceKernel(
@@ -73,4 +74,10 @@ void AddPlumeSourceAsync(
         cx,
         cy,
         cz);
+    const cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        std::cerr << "[ERROR] AddPlumeSourceKernel launch failed: "
+                  << cudaGetErrorString(launch_err)
+                  << " (" << static_cast<int>(launch_err) << ")\n" << std::flush;
+    }
 }

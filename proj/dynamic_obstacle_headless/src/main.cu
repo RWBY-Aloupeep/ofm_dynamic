@@ -20,6 +20,19 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+static std::string last_stage;
+static int3 last_resolution = { 0, 0, 0 };
+static int3 last_tile_dim = { 0, 0, 0 };
+static std::size_t last_nx = 0;
+static std::size_t last_ny = 0;
+static std::size_t last_nz = 0;
+static std::size_t last_count = 0;
+
+static void SetStage(const std::string& s)
+{
+    last_stage = s;
+    std::cerr << "[STAGE] " << s << std::endl;
+}
 
 struct HeadlessOptions {
     int steps = 1000;
@@ -265,10 +278,15 @@ void WriteNpyFloat32(const fs::path& output_path, const float* data, int nx, int
 
 void SaveVorticityField(const ofm::OFM& solver, const fs::path& output_dir, int step, cudaStream_t stream)
 {
+    SetStage("before save frame " + std::to_string(step));
     ofm::GetCenteralVecAsync(*(solver.u_), solver.tile_dim_, *(solver.init_u_x_), *(solver.init_u_y_), *(solver.init_u_z_), stream);
     ofm::GetVorNormAsync(*(solver.vor_norm_), solver.tile_dim_, *(solver.u_), solver.dx_, stream);
     solver.vor_norm_->DevToHostAsync(stream);
+    std::cerr << "[DEBUG] before cudaStreamSynchronize\n" << std::flush;
+    SetStage("before save cudaStreamSynchronize frame " + std::to_string(step));
     cudaStreamSynchronize(stream);
+    std::cerr << "[DEBUG] after cudaStreamSynchronize\n" << std::flush;
+    SetStage("after save cudaStreamSynchronize frame " + std::to_string(step));
 
     const int nx = solver.tile_dim_.x * 8;
     const int ny = solver.tile_dim_.y * 8;
@@ -277,15 +295,33 @@ void SaveVorticityField(const ofm::OFM& solver, const fs::path& output_dir, int 
     std::ostringstream filename;
     filename << "frame_" << std::setfill('0') << std::setw(6) << step << ".npy";
     const fs::path output_path = output_dir / filename.str();
+    const std::size_t count = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+    const double mb = static_cast<double>(count * sizeof(float)) / 1024.0 / 1024.0;
+    std::cerr << "[DEBUG] save frame=" << step
+              << " path=" << output_path.string()
+              << " shape=(" << nx << "," << ny << "," << nz << ")"
+              << " count=" << count
+              << " estimated_mb=" << mb << "\n" << std::flush;
 
     WriteNpyFloat32(output_path, solver.vor_norm_->host_ptr_, nx, ny, nz);
-    std::cout << "[OFM Headless] Saved vorticity to " << output_path.string() << "\n";
+    std::cout << "[OFM Headless] Saved vorticity to " << output_path.string() << "\n" << std::flush;
+    SetStage("after save frame " + std::to_string(step));
 }
 
 int main(int argc, char** argv)
 {
     try {
+        SetStage("cli parsing");
         const HeadlessOptions options = ParseOptions(argc, argv);
+        last_resolution = options.resolution;
+        std::cerr << "[DEBUG] cli resolution=" << options.resolution.x << "x" << options.resolution.y << "x" << options.resolution.z << "\n";
+        std::cerr << "[DEBUG] cli steps=" << options.steps << "\n";
+        std::cerr << "[DEBUG] cli save_interval=" << options.save_interval << "\n";
+        std::cerr << "[DEBUG] cli output_dir=" << options.output_dir << "\n";
+        std::cerr << "[DEBUG] cli plume_strength=" << options.plume_strength << "\n";
+        std::cerr << "[DEBUG] cli plume_radius=" << options.plume_radius << "\n";
+        std::cerr << "[DEBUG] cli swirl_strength=" << options.swirl_strength << "\n";
+        std::cerr << "[DEBUG] cli device=" << options.device << "\n" << std::flush;
 
         cudaSetDevice(options.device);
         cudaDeviceProp device_prop {};
@@ -304,14 +340,36 @@ int main(int argc, char** argv)
         fs::create_directories(logs_dir);
         fs::create_directories(stats_dir);
 
+        std::cerr << "[DEBUG] before constructing OFM\n" << std::flush;
+        SetStage("before constructing OFM");
         ofm::OFM solver;
+        std::cerr << "[DEBUG] after constructing OFM\n" << std::flush;
         cudaStream_t stream;
         cudaStreamCreate(&stream);
 
         const OFMConfiguration cfg = BuildOFMConfiguration(options);
         WriteConfigJson(run_dir / "config.json", options, cfg, run_dir, timestamp);
+        SetStage("before InitOFMAsync");
         ofm::InitOFMAsync(solver, cfg, stream);
+        SetStage("before init cudaStreamSynchronize");
         cudaStreamSynchronize(stream);
+        SetStage("after init cudaStreamSynchronize");
+        const std::size_t nx = static_cast<std::size_t>(solver.tile_dim_.x) * 8ULL;
+        const std::size_t ny = static_cast<std::size_t>(solver.tile_dim_.y) * 8ULL;
+        const std::size_t nz = static_cast<std::size_t>(solver.tile_dim_.z) * 8ULL;
+        const std::size_t count = nx * ny * nz;
+        last_tile_dim = solver.tile_dim_;
+        last_nx = nx;
+        last_ny = ny;
+        last_nz = nz;
+        last_count = count;
+        const double velocity_mb = static_cast<double>(count * sizeof(float3)) / 1024.0 / 1024.0;
+        const double scalar_mb = static_cast<double>(count * sizeof(float)) / 1024.0 / 1024.0;
+        std::cerr << "[DEBUG] solver.tile_dim=" << solver.tile_dim_.x << "x" << solver.tile_dim_.y << "x" << solver.tile_dim_.z << "\n";
+        std::cerr << "[DEBUG] voxel dims nx/ny/nz=" << nx << "/" << ny << "/" << nz << "\n";
+        std::cerr << "[DEBUG] voxel count=" << count << "\n";
+        std::cerr << "[DEBUG] estimated velocity memory MB=" << velocity_mb << "\n";
+        std::cerr << "[DEBUG] estimated scalar memory MB=" << scalar_mb << "\n" << std::flush;
 
         const auto wall_start = std::chrono::steady_clock::now();
         const float dt = 1.0f / 30.0f;
@@ -339,18 +397,46 @@ int main(int argc, char** argv)
             solver.voxelized_velocity_scaler_ = options.voxelized_velocity_scaler;
 
             if (step > 0) {
+                SetStage("before UpdateBoundary step " + std::to_string(step));
+                std::cerr << "[DEBUG] before UpdateBoundary\n" << std::flush;
                 solver.UpdateBoundary(stream);
+                std::cerr << "[DEBUG] after UpdateBoundary\n" << std::flush;
+                SetStage("after UpdateBoundary step " + std::to_string(step));
             }
             if (options.plume) {
+                SetStage("before AddPlumeSourceAsync step " + std::to_string(step));
+                const std::size_t pnx = static_cast<std::size_t>(solver.tile_dim_.x) * 8ULL;
+                const std::size_t pny = static_cast<std::size_t>(solver.tile_dim_.y) * 8ULL;
+                const std::size_t pnz = static_cast<std::size_t>(solver.tile_dim_.z) * 8ULL;
+                const std::size_t pcount = pnx * pny * pnz;
+                const int min_dim = std::min({ static_cast<int>(pnx), static_cast<int>(pny), static_cast<int>(pnz) });
+                const float radius = fmaxf(options.plume_radius * static_cast<float>(min_dim), 1e-4f);
+                const float cx = 0.5f * static_cast<float>(pnx);
+                const float cy = 0.15f * static_cast<float>(pny);
+                const float cz = 0.5f * static_cast<float>(pnz);
+                std::cerr << "[DEBUG] plume params strength=" << options.plume_strength
+                          << " radius_norm=" << options.plume_radius
+                          << " swirl=" << options.swirl_strength << "\n";
+                std::cerr << "[DEBUG] plume dims nx/ny/nz/count=" << pnx << "/" << pny << "/" << pnz << "/" << pcount << "\n";
+                std::cerr << "[DEBUG] plume radius/cx/cy/cz=" << radius << "/" << cx << "/" << cy << "/" << cz << "\n" << std::flush;
                 AddPlumeSourceAsync(
                     solver,
                     options.plume_strength,
                     options.plume_radius,
                     options.swirl_strength,
                     stream);
+                SetStage("after AddPlumeSourceAsync step " + std::to_string(step));
             }
+            sSetStage("before AdvanceAsync step " + std::to_string(step));
+            std::cerr << "[DEBUG] before AdvanceAsync\n" << std::flush;
             solver.AdvanceAsync(dt, stream);
+            std::cerr << "[DEBUG] after AdvanceAsync\n" << std::flush;
+            SetStage("after AdvanceAsync step " + std::to_string(step));
+            SetStage("before ReinitAsync step " + std::to_string(step));
+            std::cerr << "[DEBUG] before ReinitAsync\n" << std::flush;
             solver.ReinitAsync(dt, stream);
+            std::cerr << "[DEBUG] after ReinitAsync\n" << std::flush;
+            SetStage("after ReinitAsync step " + std::to_string(step));
 
             if (step % options.save_interval == 0) {
                 SaveVorticityField(solver, vorticity_dir, step, stream);
@@ -361,7 +447,11 @@ int main(int argc, char** argv)
             }
         }
 
+        SetStage("before final cudaStreamSynchronize");
+        std::cerr << "[DEBUG] before cudaStreamSynchronize\n" << std::flush;
         cudaStreamSynchronize(stream);
+        std::cerr << "[DEBUG] after cudaStreamSynchronize\n" << std::flush;
+        SetStage("after final cudaStreamSynchronize");
         const auto wall_end = std::chrono::steady_clock::now();
         const double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(wall_end - wall_start).count();
         const double avg_seconds_per_step = seconds / static_cast<double>(options.steps);
@@ -373,6 +463,15 @@ int main(int argc, char** argv)
 
         cudaStreamDestroy(stream);
         return 0;
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "[OFM Headless] std::bad_alloc caught\n";
+        std::cerr << "what: " << e.what() << "\n";
+        std::cerr << "Last stage: " << last_stage << "\n";
+        std::cerr << "resolution: " << last_resolution.x << "x" << last_resolution.y << "x" << last_resolution.z << "\n";
+        std::cerr << "tile_dim: " << last_tile_dim.x << "x" << last_tile_dim.y << "x" << last_tile_dim.z << "\n";
+        std::cerr << "voxel dims: " << last_nx << "x" << last_ny << "x" << last_nz << "\n";
+        std::cerr << "count: " << last_count << "\n";
+        return 1;
     } catch (const std::exception& e) {
         std::cerr << "[OFM Headless] Error: " << e.what() << "\n";
         return 1;

@@ -21,10 +21,10 @@ cmake --build proj/dynamic_obstacle_headless/build -j
 ```
 
 ## Run
-Smoke test preset:
+Plume demo:
 
 ```bash
-proj/dynamic_obstacle_headless/tests/run_smoke_test.sh
+proj/dynamic_obstacle_headless/scripts/run_plume_demo.sh
 ```
 
 Direct executable example:

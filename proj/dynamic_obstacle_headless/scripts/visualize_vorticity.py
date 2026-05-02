@@ -84,7 +84,8 @@ def maybe_write_gif(fig_paths: list[Path], gif_path: Path, fps: int) -> Optional
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Visualize OFM headless vorticity .npy outputs")
-    parser.add_argument("output_dir", type=Path, help="Directory containing vorticity_*.npy files")
+    parser.add_argument("input_dir", type=Path, help="Directory containing vorticity_*.npy files")
+    parser.add_argument("--output_dir", type=Path, default=None, help="Directory for generated previews/exports (default: <input_dir>/figures)")
     parser.add_argument("--axis", choices=["x", "y", "z"], default="z", help="Slice axis")
     parser.add_argument("--index", default="mid", help="Slice index or 'mid'")
     parser.add_argument("--log", action="store_true", help="Apply log10(vorticity + eps)")
@@ -100,18 +101,18 @@ def main() -> int:
     if args.iso:
         print("[INFO] Isosurface requires scikit-image")
 
-    npy_files = sorted(args.output_dir.glob("vorticity_*.npy"))
+    npy_files = sorted(args.input_dir.glob("vorticity_*.npy"))
     if not npy_files:
-        raise RuntimeError(f"No vorticity_*.npy files found in {args.output_dir}")
+        raise RuntimeError(f"No vorticity_*.npy files found in {args.input_dir}")
 
-    figures_dir = args.output_dir / "figures"
-    figures_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = args.output_dir if args.output_dir is not None else (args.input_dir / "figures")
+    export_dir.mkdir(parents=True, exist_ok=True)
 
     saved_images: list[Path] = []
     for frame_id, npy_path in enumerate(npy_files):
         arr = np.load(npy_path)
         if args.vtk:
-            vtk_path = args.output_dir / f"{npy_path.stem}.vtk"
+            vtk_path = export_dir / f"{npy_path.stem}.vtk"
             save_vtk(arr, vtk_path)
 
         if args.iso:
@@ -119,7 +120,7 @@ def main() -> int:
             if level is None:
                 level = float(np.percentile(arr[np.isfinite(arr)], 95))
 
-            iso_path = figures_dir / f"{npy_path.stem}_iso.png"
+            iso_path = export_dir / f"{npy_path.stem}_iso.png"
             save_isosurface(arr, iso_path, level)
 
         finite = np.isfinite(arr)
@@ -153,16 +154,16 @@ def main() -> int:
         cbar_label = "log10(vorticity + eps)" if args.log else "vorticity norm"
         fig.colorbar(im, ax=ax, label=cbar_label)
 
-        output_png = figures_dir / f"vorticity_{frame_id:06d}_{args.axis}{slice_idx}.png"
+        output_png = export_dir / f"vorticity_{frame_id:06d}_{args.axis}{slice_idx}.png"
         fig.tight_layout()
         fig.savefig(output_png, dpi=150)
         plt.close(fig)
         saved_images.append(output_png)
 
-    print(f"Saved {len(saved_images)} slice images to {figures_dir}")
+    print(f"Saved {len(saved_images)} slice images to {export_dir}")
 
     if args.gif:
-        gif_msg = maybe_write_gif(saved_images, figures_dir / f"vorticity_{args.axis}mid.gif", args.fps)
+        gif_msg = maybe_write_gif(saved_images, export_dir / f"vorticity_{args.axis}mid.gif", args.fps)
         if gif_msg:
             print(gif_msg)
         else:

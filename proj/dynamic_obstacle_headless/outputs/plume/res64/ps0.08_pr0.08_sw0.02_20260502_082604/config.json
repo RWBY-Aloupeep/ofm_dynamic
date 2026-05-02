@@ -1,0 +1,14 @@
+{
+  "resolution": [64, 64, 64],
+  "tile_dim": [8, 8, 8],
+  "steps": 400,
+  "save_interval": 40,
+  "device": 0,
+  "plume_strength": 0.08,
+  "plume_radius": 0.08,
+  "swirl_strength": 0.02,
+  "output_dir": "/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/proj/dynamic_obstacle_headless/outputs",
+  "run_dir": "/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/proj/dynamic_obstacle_headless/outputs/plume/res64/ps0.08_pr0.08_sw0.02_20260502_082604",
+  "timestamp": "20260502_082604",
+  "git_commit_hash": "4f91f67"
+}

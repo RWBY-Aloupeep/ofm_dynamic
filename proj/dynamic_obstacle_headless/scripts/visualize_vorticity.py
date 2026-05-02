@@ -92,6 +92,7 @@ def main() -> int:
     parser.add_argument("--eps", type=float, default=1e-12, help="epsilon for log scaling")
     parser.add_argument("--gif", action="store_true", help="Also write animated GIF")
     parser.add_argument("--fps", type=int, default=5, help="GIF FPS")
+    parser.add_argument("--crop-boundary", type=int, default=0, help="Crop N voxels from each domain boundary before plotting")
     parser.add_argument("--vtk", action="store_true", help="Export VTK files for ParaView")
     parser.add_argument("--iso", action="store_true", help="Render isosurface images")
     parser.add_argument("--level", type=float, default=None, help="Isosurface level (default: auto)")
@@ -113,6 +114,11 @@ def main() -> int:
     saved_images: list[Path] = []
     for frame_id, npy_path in enumerate(npy_files):
         arr = np.load(npy_path)
+        if args.crop_boundary > 0:
+            crop = args.crop_boundary
+            if min(arr.shape) <= 2 * crop:
+                raise ValueError(f"--crop-boundary {crop} too large for frame shape {arr.shape}")
+            arr = arr[crop:-crop, crop:-crop, crop:-crop]
         if args.vtk:
             vtk_path = export_dir / f"{npy_path.stem}.vtk"
             save_vtk(arr, vtk_path)

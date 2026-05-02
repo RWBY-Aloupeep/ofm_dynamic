@@ -57,7 +57,7 @@ void AddPlumeSourceAsync(
     const int min_dim = std::min(nx, std::min(ny, nz));
     const float radius = fmaxf(plume_radius * static_cast<float>(min_dim), 1e-4f);
     const float cx = 0.5f * static_cast<float>(nx);
-    const float cy = 0.15f * static_cast<float>(ny);
+    const float cy = 0.22f * static_cast<float>(ny);
     const float cz = 0.5f * static_cast<float>(nz);
 
     const int count = nx * ny * nz;

@@ -8,11 +8,11 @@ BUILD_DIR="${PROJ_DIR}/build"
 
 RESOLUTION="64,64,64"
 CUDA_ARCH="75"
-STEPS=400
-SAVE_INTERVAL=40
-PLUME_STRENGTH=0.08
-PLUME_RADIUS=0.08
-SWIRL_STRENGTH=0.02
+STEPS=1000
+SAVE_INTERVAL=50
+PLUME_STRENGTH=0.12
+PLUME_RADIUS=0.06
+SWIRL_STRENGTH=0.03
 OUTPUT_ROOT="${PROJ_DIR}/outputs"
 
 NX="${RESOLUTION%%,*}"
@@ -83,6 +83,8 @@ python3 "${PROJ_DIR}/scripts/visualize_vorticity.py" "${VORT_DIR}" \
   --output_dir "${PREVIEW_DIR}" \
   --axis z \
   --index mid \
+  --log \
+  --crop-boundary 8 \
   --gif \
   --fps 12 \
   --vtk \

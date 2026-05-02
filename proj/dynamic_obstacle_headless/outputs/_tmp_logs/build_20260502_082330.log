@@ -1,0 +1,50 @@
+-- The CXX compiler identification is GNU 11.2.0
+-- The CUDA compiler identification is NVIDIA 12.6.85
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /sw/gcc/11.2.0/bin/g++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /sw/cuda/12.6.3/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found CUDAToolkit: /sw/cuda/12.6.3/include (found version "12.6.85") 
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Failed
+-- Looking for pthread_create in pthreads
+-- Looking for pthread_create in pthreads - not found
+-- Looking for pthread_create in pthread
+-- Looking for pthread_create in pthread - found
+-- Found Threads: TRUE  
+-- Using the multi-header code from /gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/proj/dynamic_obstacle_headless/build/_deps/nlohmann_json-src/include/
+-- Build spdlog: 1.13.0
+-- Build type: Release
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/proj/dynamic_obstacle_headless/build
+[ 13%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/src/main.cu.o
+[ 13%] Building CXX object _deps/spdlog-build/CMakeFiles/spdlog.dir/src/spdlog.cpp.o
+[ 22%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/src/plume_source.cu.o
+[ 22%] Building CXX object CMakeFiles/dynamic_obstacle_headless.dir/src/timer_stub.cpp.o
+[ 22%] Building CXX object _deps/spdlog-build/CMakeFiles/spdlog.dir/src/stdout_sinks.cpp.o
+[ 31%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/ofm/ofm.cu.o
+[ 31%] Building CXX object _deps/spdlog-build/CMakeFiles/spdlog.dir/src/color_sinks.cpp.o
+[ 36%] Building CXX object _deps/spdlog-build/CMakeFiles/spdlog.dir/src/file_sinks.cpp.o
+[ 45%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/ofm/ofm_init.cu.o
+[ 45%] Building CXX object _deps/spdlog-build/CMakeFiles/spdlog.dir/src/async.cpp.o
+[ 50%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/ofm/ofm_util.cu.o
+[ 54%] Building CXX object _deps/spdlog-build/CMakeFiles/spdlog.dir/src/cfg.cpp.o
+[ 63%] Building CXX object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/engine/core/tool/logger.cpp.o
+[ 63%] Building CXX object _deps/spdlog-build/CMakeFiles/spdlog.dir/src/bundled_fmtlib_format.cpp.o
+[ 68%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/AMGPCG_Pybind_Torch/common/data_io.cu.o
+[ 72%] Building CXX object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/AMGPCG_Pybind_Torch/common/mem.cc.o
+[ 77%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/AMGPCG_Pybind_Torch/common/util.cu.o
+[ 81%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/AMGPCG_Pybind_Torch/solver/amgpcg.cu.o
+[ 86%] Building CUDA object CMakeFiles/dynamic_obstacle_headless.dir/gscratch/amath/diwenxu/fire_pfm/ofm_dynamic/src/AMGPCG_Pybind_Torch/solver/trim_poisson.cu.o
+[ 90%] Linking CXX static library libspdlog.a
+[ 90%] Built target spdlog
+[ 95%] Linking CUDA device code CMakeFiles/dynamic_obstacle_headless.dir/cmake_device_link.o
+[100%] Linking CXX executable dynamic_obstacle_headless
+[100%] Built target dynamic_obstacle_headless

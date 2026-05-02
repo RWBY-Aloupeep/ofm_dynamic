@@ -34,7 +34,7 @@ Direct executable example:
   --steps 20 \
   --save_interval 1 \
   --resolution 32,32,32 \
-  --output_dir ./proj/dynamic_obstacle_headless/outputs/vorticity/headless_smoke
+  --output_dir ./proj/dynamic_obstacle_headless/outputs
 ```
 
 ## Validation
@@ -51,11 +51,18 @@ python3 proj/dynamic_obstacle_headless/scripts/visualize_vorticity.py ./proj/dyn
 ```
 
 ## Output format
-Each saved frame is written as:
-- file pattern: `vorticity_XXXXXX.npy`
-- field: vorticity norm
-- dtype: `float32`
-- shape: `(Nx, Ny, Nz)`
+Each run is written under:
+
+`<output_dir>/plume/res{NX}/ps{plume_strength}_pr{plume_radius}_sw{swirl_strength}_{YYYYMMDD_HHMMSS}/`
+
+With subdirectories:
+- `vorticity/` (`frame_XXXXXX.npy`)
+- `preview/`
+- `logs/`
+- `stats/`
+
+And metadata:
+- `config.json`
 
 ## Current limitations
 - Minimal smoke-test-focused flow.

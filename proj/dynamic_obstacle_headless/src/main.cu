@@ -5,12 +5,15 @@
 #include "plume_source.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,7 +24,7 @@ namespace fs = std::filesystem;
 struct HeadlessOptions {
     int steps = 1000;
     int save_interval = 10;
-    std::string output_dir = "outputs/vorticity";
+    std::string output_dir = "outputs";
     int device = 0;
     int3 resolution = { 256, 128, 128 };
     float inlet_norm = 0.05f;
@@ -42,6 +45,83 @@ int ParseIntArg(const char* value, const std::string& arg_name)
     } catch (...) {
         throw std::runtime_error("Invalid integer for " + arg_name + ": " + value);
     }
+}
+
+std::string BuildTimestamp()
+{
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm {};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y%m%d_%H%M%S");
+    return oss.str();
+}
+
+std::string FormatFloatTag(float value)
+{
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(6) << value;
+    std::string s = oss.str();
+    while (!s.empty() && s.back() == '0') {
+        s.pop_back();
+    }
+    if (!s.empty() && s.back() == '.') {
+        s.pop_back();
+    }
+    return s.empty() ? "0" : s;
+}
+
+std::optional<std::string> TryGetGitCommitHash()
+{
+    FILE* pipe = popen("git rev-parse --short HEAD 2>/dev/null", "r");
+    if (!pipe) {
+        return std::nullopt;
+    }
+    char buffer[128];
+    std::string result;
+    if (fgets(buffer, sizeof(buffer), pipe)) {
+        result = buffer;
+    }
+    pclose(pipe);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+        result.pop_back();
+    }
+    if (result.empty()) {
+        return std::nullopt;
+    }
+    return result;
+}
+
+void WriteConfigJson(const fs::path& config_path, const HeadlessOptions& options, const OFMConfiguration& cfg, const fs::path& run_dir, const std::string& timestamp)
+{
+    std::ofstream out(config_path);
+    if (!out) {
+        throw std::runtime_error("Failed to open config file: " + config_path.string());
+    }
+    out << "{\n";
+    out << "  \"resolution\": [" << options.resolution.x << ", " << options.resolution.y << ", " << options.resolution.z << "],\n";
+    out << "  \"tile_dim\": [" << cfg.tile_dim.x << ", " << cfg.tile_dim.y << ", " << cfg.tile_dim.z << "],\n";
+    out << "  \"steps\": " << options.steps << ",\n";
+    out << "  \"save_interval\": " << options.save_interval << ",\n";
+    out << "  \"device\": " << options.device << ",\n";
+    out << "  \"plume_strength\": " << options.plume_strength << ",\n";
+    out << "  \"plume_radius\": " << options.plume_radius << ",\n";
+    out << "  \"swirl_strength\": " << options.swirl_strength << ",\n";
+    out << "  \"output_dir\": \"" << options.output_dir << "\",\n";
+    out << "  \"run_dir\": \"" << run_dir.string() << "\",\n";
+    out << "  \"timestamp\": \"" << timestamp << "\"";
+    const std::optional<std::string> commit_hash = TryGetGitCommitHash();
+    if (commit_hash.has_value()) {
+        out << ",\n  \"git_commit_hash\": \"" << commit_hash.value() << "\"\n";
+    } else {
+        out << "\n";
+    }
+    out << "}\n";
 }
 
 float ParseFloatArg(const char* value, const std::string& arg_name)
@@ -195,7 +275,7 @@ void SaveVorticityField(const ofm::OFM& solver, const fs::path& output_dir, int 
     const int nz = solver.tile_dim_.z * 8;
 
     std::ostringstream filename;
-    filename << "vorticity_" << std::setfill('0') << std::setw(6) << step << ".npy";
+    filename << "frame_" << std::setfill('0') << std::setw(6) << step << ".npy";
     const fs::path output_path = output_dir / filename.str();
 
     WriteNpyFloat32(output_path, solver.vor_norm_->host_ptr_, nx, ny, nz);
@@ -210,13 +290,25 @@ int main(int argc, char** argv)
         cudaSetDevice(options.device);
         cudaDeviceProp device_prop {};
         cudaGetDeviceProperties(&device_prop, options.device);
-        fs::create_directories(options.output_dir);
+        const std::string timestamp = BuildTimestamp();
+        const fs::path run_dir = fs::path(options.output_dir) / "plume" / ("res" + std::to_string(options.resolution.x))
+            / ("ps" + FormatFloatTag(options.plume_strength) + "_pr" + FormatFloatTag(options.plume_radius)
+                + "_sw" + FormatFloatTag(options.swirl_strength) + "_" + timestamp);
+        const fs::path vorticity_dir = run_dir / "vorticity";
+        const fs::path preview_dir = run_dir / "preview";
+        const fs::path logs_dir = run_dir / "logs";
+        const fs::path stats_dir = run_dir / "stats";
+        fs::create_directories(vorticity_dir);
+        fs::create_directories(preview_dir);
+        fs::create_directories(logs_dir);
+        fs::create_directories(stats_dir);
 
         ofm::OFM solver;
         cudaStream_t stream;
         cudaStreamCreate(&stream);
 
         const OFMConfiguration cfg = BuildOFMConfiguration(options);
+        WriteConfigJson(run_dir / "config.json", options, cfg, run_dir, timestamp);
         ofm::InitOFMAsync(solver, cfg, stream);
         cudaStreamSynchronize(stream);
 
@@ -231,6 +323,9 @@ int main(int argc, char** argv)
         std::cout << "[OFM Headless] steps: " << options.steps << "\n";
         std::cout << "[OFM Headless] save_interval: " << options.save_interval << "\n";
         std::cout << "[OFM Headless] output_dir: " << options.output_dir << "\n";
+        std::cout << "[OFM Headless] Output run directory:\n  " << run_dir.string() << "\n";
+        std::cout << "[OFM Headless] Vorticity frames:\n  " << (vorticity_dir / "frame_%06d.npy").string() << "\n";
+        std::cout << "[OFM Headless] Log file path (use shell tee):\n  " << (logs_dir / "run.log").string() << "\n";
         std::cout << "[OFM Headless] CUDA device: [" << options.device << "] " << device_prop.name << "\n";
         std::cout << "[OFM Headless] plume: " << (options.plume ? "on" : "off") << "\n";
         std::cout << "[OFM Headless] plume_strength: " << options.plume_strength << "\n";
@@ -257,7 +352,7 @@ int main(int argc, char** argv)
             solver.ReinitAsync(dt, stream);
 
             if (step % options.save_interval == 0) {
-                SaveVorticityField(solver, options.output_dir, step, stream);
+                SaveVorticityField(solver, vorticity_dir, step, stream);
             }
 
             if (step % 50 == 0 || step + 1 == options.steps) {

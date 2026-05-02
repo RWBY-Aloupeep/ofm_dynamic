@@ -171,7 +171,7 @@ int3 ParseResolutionArg(const std::string& value)
         throw std::runtime_error("Invalid --resolution format. Expected x,y,z with positive integers.");
     }
     if (resolution.x % 8 != 0 || resolution.y % 8 != 0 || resolution.z % 8 != 0) {
-        throw std::runtime_error("Resolution must be divisible by 8 in each dimension.");
+        throw std::runtime_error("resolution must be divisible by 8 because OFM uses 8^3 tiles.");
     }
     return resolution;
 }
@@ -348,7 +348,13 @@ int main(int argc, char** argv)
         cudaStreamCreate(&stream);
 
         const OFMConfiguration cfg = BuildOFMConfiguration(options);
+        const int3 computed_tile_dim = { cfg.tile_dim[0], cfg.tile_dim[1], cfg.tile_dim[2] };
+        if (computed_tile_dim.x <= 0 || computed_tile_dim.y <= 0 || computed_tile_dim.z <= 0) {
+            throw std::runtime_error("Computed tile_dim must be > 0 in each dimension before InitOFMAsync.");
+        }
         WriteConfigJson(run_dir / "config.json", options, cfg, run_dir, timestamp);
+        std::cerr << "resolution: " << options.resolution.x << "x" << options.resolution.y << "x" << options.resolution.z << "\n";
+        std::cerr << "computed tile_dim: " << computed_tile_dim.x << "x" << computed_tile_dim.y << "x" << computed_tile_dim.z << "\n";
         SetStage("before InitOFMAsync");
         ofm::InitOFMAsync(solver, cfg, stream);
         SetStage("before init cudaStreamSynchronize");
@@ -365,7 +371,7 @@ int main(int argc, char** argv)
         last_count = count;
         const double velocity_mb = static_cast<double>(count * sizeof(float3)) / 1024.0 / 1024.0;
         const double scalar_mb = static_cast<double>(count * sizeof(float)) / 1024.0 / 1024.0;
-        std::cerr << "[DEBUG] solver.tile_dim=" << solver.tile_dim_.x << "x" << solver.tile_dim_.y << "x" << solver.tile_dim_.z << "\n";
+        std::cerr << "solver.tile_dim_: " << solver.tile_dim_.x << "x" << solver.tile_dim_.y << "x" << solver.tile_dim_.z << "\n";
         std::cerr << "[DEBUG] voxel dims nx/ny/nz=" << nx << "/" << ny << "/" << nz << "\n";
         std::cerr << "[DEBUG] voxel count=" << count << "\n";
         std::cerr << "[DEBUG] estimated velocity memory MB=" << velocity_mb << "\n";

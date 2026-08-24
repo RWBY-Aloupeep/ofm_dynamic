@@ -1,0 +1,42 @@
+# Solver self-check harness
+
+A headless, console-only driver for the OFM solver. It exists so the solver can be
+built and exercised on a compute node with no display, which the interactive
+applications in `proj/dynamic_obstacle` and `proj/voxelization` cannot do because
+they open a GLFW/Vulkan window.
+
+Those applications are untouched. This directory is a **separate xmake project**
+that is deliberately not referenced from `proj/xmake.lua`, so the GUI build path
+keeps its Vulkan/GLFW/ImGui/VTK dependencies and this one links only CUDA.
+
+## Build and run
+
+```
+module load cuda/12.6.3
+cd proj/selfcheck
+xmake -P . -y
+./build/selfcheck
+```
+
+`-P .` matters: without it xmake walks up, finds `proj/xmake.lua`, and tries to
+resolve the GUI packages. Compute nodes on klone have no outbound network, so any
+package that is not already cached will fail there; configure on the login node if
+xmake ever needs to download something.
+
+## How it links against the solver
+
+Only the numerical stack is compiled: `src/ofm/ofm.cu`, `src/ofm/ofm_util.cu`, and
+the `common`/`solver` sources from `src/AMGPCG_Pybind_Torch`. Two accommodations
+are needed, both contained here so that neither `src/ofm` nor the submodules are
+modified:
+
+- `src/ofm/ofm_init.cu` is excluded. It is the only solver file that depends on the
+  engine's JSON `Configuration` type; the harness configures the solver directly in
+  code instead, following the same sequence as `ofm::InitOFMAsync`.
+- `compat/core/tool/logger.h` replaces the engine's spdlog logger, which
+  `AMGPCG_Pybind_Torch/common/timer.cu` includes for its `INFO_ALL`/`ERROR_ALL`
+  macros.
+
+`xmake.lua` also force-includes `<cstdint>`, because `common/mem.cc` uses `uint8_t`
+without including it and relies on a transitive include that GCC here does not
+provide.

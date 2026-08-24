@@ -1,6 +1,99 @@
+# --- Build system (xmake) ---
+.xmake/
 *.xmake/
-*.vscode/
-*.idea/
 build/
-logs/
 compile_commands.json
+.cache/
+
+# --- Compiled objects and binaries ---
+*.o
+*.obj
+# ...but .obj is also the Wavefront mesh format; keep mesh assets tracked.
+!**/assets/**/*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# --- CUDA intermediates ---
+*.ptx
+*.cubin
+*.fatbin
+*.i
+*.ii
+
+# --- Visual Studio (upstream uses the vsxmake autoupdate plugin on Windows) ---
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.*
+*.suo
+*.user
+*.pdb
+*.ilk
+vsxmake*/
+
+# --- Editors and IDEs ---
+.vscode/
+*.vscode/
+.idea/
+*.idea/
+*.swp
+*.swo
+*~
+
+# --- OS clutter ---
+.DS_Store
+Thumbs.db
+
+# --- Runtime output ---
+logs/
+*.log
+# Dear ImGui writes window layout state at runtime; the two committed copies are
+# upstream defaults, but new ones should not be added.
+**/imgui.ini
+
+# --- Simulation output and analysis data ---
+# Field dumps, checkpoints, and rendered frames can be very large; keep them out
+# of git and store them under scratch instead.
+output/
+outputs/
+results/
+data/
+checkpoints/
+frames/
+*.vtk
+*.vti
+*.vts
+*.vtu
+*.pvd
+*.pvtu
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.mp4
+*.avi
+
+# --- Python (analysis and plotting scripts, AMGPCG pybind bindings) ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# --- HPC job artifacts ---
+slurm-*.out
+*.sbatch.log
+core.*
+
+# --- Literature PDFs ---
+# Papers live in the project's Zotero library, not in this repository.
+*.pdf

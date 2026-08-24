@@ -40,19 +40,68 @@ reachable via the Zotero Web API (credentials in persistent memory, not in this 
 needs a specific paper's claim, fetch and read the actual PDF via that API rather than answering
 from general recall — citation-level precision is load-bearing for this project's methodology.
 
+## Compute environment (UW Hyak klone)
+
+All work happens on **UW Hyak `klone`**. Documentation: https://hyak.uw.edu/docs
+
+**Do complex work on a compute node, never on the login node.** `klone-login01` and its siblings
+are shared, and are for editing, git, and job submission only. Compilation, simulation runs,
+voxelization, and any long or memory-hungry analysis must be submitted to a compute node — either
+interactively with `salloc` or as a batch job with `sbatch`.
+
+Run `hyakalloc` to see the current allocation and what is free right now. As of 2026-08-24 this
+account can submit to two Slurm accounts:
+
+| Account | Partition | Resources |
+|---|---|---|
+| `amath` | `cpu-g2` | 320 CPUs, 2519G |
+| `amath` | `gpu-l40s` | 32 CPUs, 377G, **2 GPUs** |
+| `amath` | `gpu-rtx6k` | 40 CPUs, 376G, **8 GPUs** |
+| `stf` | `compute`, `compute-hugemem`, `cpu-g2`, `cpu-g2-mem2x` | CPU-only, up to 680 CPUs / 5038G |
+| `stf` | `gpu-l40`, `gpu-l40s` | **8 and 10 GPUs** |
+
+The `ckpt` partition additionally offers idle cluster-wide capacity, but jobs there are
+preemptible — fine for restartable sweeps, not for a long single run.
+
+Typical interactive GPU session for this project:
+
+```
+salloc -A amath -p gpu-l40s --gpus=1 -c 8 --mem=64G --time=4:00:00
+module load cuda/12.6.3
+```
+
+`cuda/12.6.3` matches the CUDA version this codebase targets; `module avail` lists the rest.
+
+Two hardware notes that matter for the solver:
+
+- GPU generations differ across partitions. `gpu-rtx6k` is Turing (`sm_75`), which is exactly what
+  `add_cugencodes("compute_75")` in the xmake files targets; `gpu-l40` and `gpu-l40s` are Ada
+  (`sm_89`). Verify the codegen flags before assuming a build runs on the L40S nodes — the
+  gencode list likely needs `sm_89` added rather than relying on PTX JIT.
+- The example applications are interactive GLFW/Vulkan/ImGui windows, which will not open on a
+  headless compute node as-is. Upstream has a `headless-export` branch that may be a useful
+  starting point for producing field output without a display.
+
+Storage: this repo lives under `/gscratch/amath/diwenxu` (GPFS, mounted at `/mmfs1`). Simulation
+output belongs there or under scratch, not in the repository — see `.gitignore`.
+
 ## Build
+
+Build on a compute node, not the login node (see above).
 
 ```
 git submodule update --init --recursive   # required — src/engine and src/AMGPCG_Pybind_Torch
                                             # are submodules and start out empty after a plain clone
+module load cuda/12.6.3
 cd proj
 xmake build
 ```
 
 Toolchain: xmake, C++20, CUDA 12.6 (`compute_75` codegen), Vulkan, VTK 9.3.1, GLFW/GLM/Dear ImGui
-(fetched by xmake via `add_requires`). The original author only verified this on Windows 11 + RTX
-4080 laptop — CUDA/Vulkan availability on this Linux/HPC environment is unconfirmed, and
-`proj/xmake.lua` includes a `sim_render` subproject directory that does not exist in this repo
+(fetched by xmake via `add_requires`). CUDA 12.6 is available on klone as a module; Vulkan
+availability on the compute nodes is still unconfirmed, and that matters because the current
+applications are windowed. The original author only verified this on Windows 11 + RTX 4080 laptop.
+Also, `proj/xmake.lua` includes a `sim_render` subproject directory that does not exist in this repo
 (only `dynamic_obstacle` and `voxelization` do) — that stray include will need removing or a build
 target selected explicitly (`xmake build dynamic_obstacle`) before a full build succeeds.
 

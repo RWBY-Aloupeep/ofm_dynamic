@@ -3,6 +3,8 @@
 #include "amgpcg.h"
 #include "timer.h"
 
+#include <vector>
+
 namespace ofm {
 class OFM {
 public:
@@ -13,6 +15,14 @@ public:
 
     // simulation parameters
     int step_;
+    // Number of steps in one reinitialization cycle. 1 reproduces the one-step
+    // (OFM) scheme exactly; larger values restore the LFM cycle, which keeps the
+    // projected velocity of every step in the cycle and marches the flow map
+    // through that history at reinitialization.
+    int reinit_every_ = 1;
+    // Order of the flow-map marching scheme: 2, 4, or anything else for TVD-RK3
+    // (the order OFM shipped with, kept as the default).
+    int rk_order_ = 3;
 
     // boundary
     float inlet_norm_;
@@ -54,9 +64,10 @@ public:
     std::shared_ptr<DHMemory<float>> err_u_x_;
     std::shared_ptr<DHMemory<float>> err_u_y_;
     std::shared_ptr<DHMemory<float>> err_u_z_;
-    std::shared_ptr<DHMemory<float>> mid_u_x_;
-    std::shared_ptr<DHMemory<float>> mid_u_y_;
-    std::shared_ptr<DHMemory<float>> mid_u_z_;
+    // One entry per step of the reinitialization cycle.
+    std::vector<std::shared_ptr<DHMemory<float>>> mid_u_x_;
+    std::vector<std::shared_ptr<DHMemory<float>>> mid_u_y_;
+    std::vector<std::shared_ptr<DHMemory<float>>> mid_u_z_;
 
     // vorticity
     std::shared_ptr<DHMemory<float>> vor_norm_;
@@ -77,8 +88,8 @@ public:
     GPUTimer* profiler_ = nullptr;
 
     OFM() = default;
-    OFM(int3 _tile_dim);
-    void Alloc(int3 _tile_dim);
+    OFM(int3 _tile_dim, int _reinit_every = 1);
+    void Alloc(int3 _tile_dim, int _reinit_every = 1);
     void SetProfilier(GPUTimer* _profiler);
     void UpdateBoundary(cudaStream_t _stream);
     void AdvanceAsync(float _dt, cudaStream_t _stream);

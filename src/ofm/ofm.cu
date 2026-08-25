@@ -3,14 +3,15 @@
 #include <cub/cub.cuh>
 
 namespace ofm {
-OFM::OFM(int3 _tile_dim)
+OFM::OFM(int3 _tile_dim, int _reinit_every)
 {
-    Alloc(_tile_dim);
+    Alloc(_tile_dim, _reinit_every);
 }
 
-void OFM::Alloc(int3 _tile_dim)
+void OFM::Alloc(int3 _tile_dim, int _reinit_every)
 {
     tile_dim_     = _tile_dim;
+    reinit_every_ = _reinit_every < 1 ? 1 : _reinit_every;
 
     int3 x_tile_dim = { tile_dim_.x + 1, tile_dim_.y, tile_dim_.z };
     int3 y_tile_dim = { tile_dim_.x, tile_dim_.y + 1, tile_dim_.z };
@@ -52,9 +53,14 @@ void OFM::Alloc(int3 _tile_dim)
     init_u_x_ = std::make_shared<DHMemory<float>>(x_voxel_num);
     init_u_y_ = std::make_shared<DHMemory<float>>(y_voxel_num);
     init_u_z_ = std::make_shared<DHMemory<float>>(z_voxel_num);
-    mid_u_x_  = std::make_shared<DHMemory<float>>(x_voxel_num);
-    mid_u_y_  = std::make_shared<DHMemory<float>>(y_voxel_num);
-    mid_u_z_  = std::make_shared<DHMemory<float>>(z_voxel_num);
+    mid_u_x_.resize(reinit_every_);
+    mid_u_y_.resize(reinit_every_);
+    mid_u_z_.resize(reinit_every_);
+    for (int i = 0; i < reinit_every_; i++) {
+        mid_u_x_[i] = std::make_shared<DHMemory<float>>(x_voxel_num);
+        mid_u_y_[i] = std::make_shared<DHMemory<float>>(y_voxel_num);
+        mid_u_z_[i] = std::make_shared<DHMemory<float>>(z_voxel_num);
+    }
     tmp_u_x_  = std::make_shared<DHMemory<float>>(x_voxel_num);
     tmp_u_y_  = std::make_shared<DHMemory<float>>(y_voxel_num);
     tmp_u_z_  = std::make_shared<DHMemory<float>>(z_voxel_num);
@@ -97,13 +103,45 @@ void OFM::UpdateBoundary(cudaStream_t _stream)
 
 void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
 {
-    float mid_dt = 0.5f * _dt;
-    std::shared_ptr<DHMemory<float>> last_proj_u_x = init_u_x_;
-    std::shared_ptr<DHMemory<float>> last_proj_u_y = init_u_y_;
-    std::shared_ptr<DHMemory<float>> last_proj_u_z = init_u_z_;
-    std::shared_ptr<DHMemory<float>> src_u_x = init_u_x_;
-    std::shared_ptr<DHMemory<float>> src_u_y = init_u_y_;
-    std::shared_ptr<DHMemory<float>> src_u_z = init_u_z_;
+    // Leapfrog schedule, following Algorithm 1 of the LFM paper: the first two steps
+    // of a reinitialization cycle start the integrator (a half step, then a full
+    // step), and every step after that advects the velocity from two steps back
+    // across 2*dt using the velocity of the previous step. With reinit_every_ == 1
+    // only the first branch is ever reached, which is exactly the one-step scheme
+    // OFM shipped; the leapfrog steps proper require a cycle of at least three.
+    int cycle_step = step_ % reinit_every_;
+    float mid_dt;
+    std::shared_ptr<DHMemory<float>> last_proj_u_x;
+    std::shared_ptr<DHMemory<float>> last_proj_u_y;
+    std::shared_ptr<DHMemory<float>> last_proj_u_z;
+    std::shared_ptr<DHMemory<float>> src_u_x;
+    std::shared_ptr<DHMemory<float>> src_u_y;
+    std::shared_ptr<DHMemory<float>> src_u_z;
+    if (cycle_step == 0) {
+        mid_dt        = 0.5f * _dt;
+        last_proj_u_x = init_u_x_;
+        last_proj_u_y = init_u_y_;
+        last_proj_u_z = init_u_z_;
+        src_u_x       = init_u_x_;
+        src_u_y       = init_u_y_;
+        src_u_z       = init_u_z_;
+    } else if (cycle_step == 1) {
+        mid_dt        = _dt;
+        last_proj_u_x = mid_u_x_[0];
+        last_proj_u_y = mid_u_y_[0];
+        last_proj_u_z = mid_u_z_[0];
+        src_u_x       = mid_u_x_[0];
+        src_u_y       = mid_u_y_[0];
+        src_u_z       = mid_u_z_[0];
+    } else {
+        mid_dt        = 2.0f * _dt;
+        last_proj_u_x = mid_u_x_[cycle_step - 1];
+        last_proj_u_y = mid_u_y_[cycle_step - 1];
+        last_proj_u_z = mid_u_z_[cycle_step - 1];
+        src_u_x       = mid_u_x_[cycle_step - 2];
+        src_u_y       = mid_u_y_[cycle_step - 2];
+        src_u_z       = mid_u_z_[cycle_step - 2];
+    }
 
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Advection");
@@ -119,9 +157,9 @@ void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
         ProjectAsync(_stream);
     }
 
-    mid_u_x_.swap(tmp_u_x_);
-    mid_u_y_.swap(tmp_u_y_);
-    mid_u_z_.swap(tmp_u_z_);
+    mid_u_x_[cycle_step].swap(tmp_u_x_);
+    mid_u_y_[cycle_step].swap(tmp_u_y_);
+    mid_u_z_[cycle_step].swap(tmp_u_z_);
 
     step_++;
 }
@@ -137,16 +175,22 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
 
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Backward flowmap");
-        RKAxisAsync(*psi_x_, *T_x_, tile_dim_, x_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, _dt, _stream);
-        RKAxisAsync(*psi_y_, *T_y_, tile_dim_, y_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, _dt, _stream);
-        RKAxisAsync(*psi_z_, *T_z_, tile_dim_, z_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, _dt, _stream);
+        // Walk the cycle's velocity history backwards in time.
+        for (int i = reinit_every_ - 1; i >= 0; i--) {
+            RKAxisAsync(rk_order_, *psi_x_, *T_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, _dt, _stream);
+            RKAxisAsync(rk_order_, *psi_y_, *T_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, _dt, _stream);
+            RKAxisAsync(rk_order_, *psi_z_, *T_z_, tile_dim_, z_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, _dt, _stream);
+        }
     }
 
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Forward flowmap");
-        RKAxisAsync(*phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, -_dt, _stream);
-        RKAxisAsync(*phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, -_dt, _stream);
-        RKAxisAsync(*phi_z_, *F_z_, tile_dim_, z_tile_dim, *mid_u_x_, *mid_u_y_, *mid_u_z_, grid_origin_, dx_, -_dt, _stream);
+        // ... and forwards for the forward map, so the two meet at the cycle's ends.
+        for (int i = 0; i < reinit_every_; i++) {
+            RKAxisAsync(rk_order_, *phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
+            RKAxisAsync(rk_order_, *phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
+            RKAxisAsync(rk_order_, *phi_z_, *F_z_, tile_dim_, z_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
+        }
     }
 
     {

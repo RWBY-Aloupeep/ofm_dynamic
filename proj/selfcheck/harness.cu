@@ -112,10 +112,11 @@ __global__ void AddRingVelocityKernel(float* u_axis, int3 axis_tile_dim, int com
 
 void SetupSolver(ofm::OFM& solver, const SolverConfig& config, GPUTimer& profiler, cudaStream_t stream)
 {
-    solver.Alloc(config.tile_dim);
+    solver.Alloc(config.tile_dim, config.reinit_every);
     solver.SetProfilier(&profiler);
 
     solver.step_        = 0;
+    solver.rk_order_    = config.rk_order;
     solver.dx_          = config.len_y / static_cast<float>(8 * config.tile_dim.y);
     solver.grid_origin_ = { 0.0f, 0.0f, 0.0f };
     solver.inlet_norm_  = config.inlet_norm;

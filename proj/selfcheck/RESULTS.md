@@ -95,6 +95,81 @@ produces.
   containing the ring radius), but the harness has not been validated against a
   case with a known answer.
 
+## Follow-up: OFM is LFM at `n = 1`, and what changes when `n` is raised
+
+The caveat above -- that LFM's ladder is measured at a reinitialization interval of 10
+while OFM resets every step -- turned out to be testable rather than merely a caveat.
+Reading the LFM reference implementation (<https://github.com/yuchen-sun-cg/lfm>) against
+`src/ofm` shows the two solvers are the same code: `*_util.cu` is ~92% identical, and the
+differences are the marching-order dispatch, one cosmetic signature, and OFM's added
+dynamic-boundary kernel. `OFM::ReinitAsync` and `LFM::ReinitAsync` agree line for line
+after the map march. **OFM is LFM specialised to `reinit_every = 1`, plus dynamic
+boundaries.**
+
+Two mechanisms are lost in that specialisation. The flow map spans one step instead of
+`n`, and -- less obviously -- LFM's `AdvanceAsync` implements a leapfrog time integrator
+whose third branch advects the velocity from two steps back across `2*dt`. That branch is
+reached only when `step % n >= 2`, so at `n = 1` the solver runs the integrator's start-up
+half-step forever and never takes a leapfrog step at all. The LFM paper ablates exactly
+this (Section 6.2, Fig. 10b: "we replaced the leapfrog method in LFM with directly
+advecting the midpoint velocities sequentially. The modified method can not preserve the
+vortex pairs well").
+
+`reinit_every_` and `rk_order_` are now parameters of `ofm::OFM`, so both schemes run in
+this harness with everything else held fixed: same rings, same tracker, same grid, same 15
+CG iterations, same `dt = 1/60`, and the loop counted in advection steps so the physical
+time axis is identical. `reinit_every = 1` with TVD-RK3 is the default and reproduces the
+baseline above.
+
+| `n` | RK | leaps | peak w @200 | @400 | @560 | loss @400 | max abs dr | at step |
+|---|---|---|---|---|---|---|---|---|
+| 1 | TVD-RK3 | 1 | 11.10 | 11.31 | 11.59 | 26.1% | 0.0626 | 51 |
+| 1 | RK4 | 1 | 11.10 | 11.31 | 11.59 | 26.1% | 0.0626 | 51 |
+| 2 | RK4 | 1 | 12.36 | 11.89 | 12.27 | 22.3% | 0.0643 | 42 |
+| 5 | RK4 | 1 | 14.29 | 12.93 | 12.97 | 15.5% | 0.0656 | 45 |
+| 10 | RK4 | 1 | 16.07 | 13.74 | 13.45 | **10.2%** | 0.0645 | 50 |
+| 10 | TVD-RK3 | 1 | 16.07 | 13.74 | 13.45 | 10.2% | 0.0645 | 50 |
+
+Seeded peak vorticity is 15.30 in every run. The window stops at step 560, before the
+rings reach the wall guard at step ~575.
+
+**Vorticity preservation improves strongly and monotonically with `n`.** Loss at step 400
+falls from 26.1% to 10.2%, a factor of 2.6, and at step 200 the `n = 10` run is still
+above its seeded peak. Kinetic-energy loss falls from 3.3% to 2.0%. This is the result
+that matters for the attribution work: a direct measurement of the numerical dissipation
+floor as a function of the reinitialization interval. Both solvers are inviscid, so all of
+it is numerical.
+
+**The leap count does not move.** It is 1 at every interval, and more tellingly the radial
+separation that drives leapfrogging is nearly identical across all six runs: it peaks at
+0.063-0.066 around step 42-51 and then collapses below 0.0013 in every case. Dissipation
+varies by a factor of 2.6 across these runs while the separation history barely moves at
+all. So in this configuration the leapfrog mechanism is not ended by dissipation, and the
+expectation that the baseline's "1 leap" was a consequence of `n = 1` is wrong. What ends
+it is the ring configuration -- which makes the "geometry" open question above the binding
+one, not the boundary conditions and not the scheme.
+
+**Marching order is irrelevant here.** RK4 and TVD-RK3 agree to the digits shown at both
+`n = 1` and `n = 10`. At `n = 1` that is expected, since the map is marched one step from
+identity.
+
+**Long intervals cost stability.** Both `n = 10` runs go non-finite at step 860, well
+after the rings have hit the far wall (step ~575) and the field has become violent -- peak
+vorticity is already 160 at step 810. `n = 5` and below complete all 900 steps. Nothing
+here affects the leapfrog window itself, but it does bound how far `n` can be pushed
+inside an enclosure.
+
+### What this changes
+
+The reinitialization interval is now the main accuracy knob available, and it is cheap:
+`n = 5` reinitializes once per five steps instead of once per step, so it is *faster* than
+`n = 1` per unit of simulated time while dissipating 40% less vorticity. For the
+circulation-attribution work the relevant target is the dissipation floor rather than the
+leap count, and this table is the first measurement of it.
+
+Raising the leap count, if it is wanted as a published comparison, needs a different ring
+configuration rather than a different scheme. That search is not done here.
+
 ## Separate finding: the source-term channel is not wired up
 
 `RKAxisAccumulateForceAsync` — the path integral that carries external forces and
@@ -103,13 +178,25 @@ in `src/ofm/ofm_util.cu` and declared in `ofm_util.h`, but **nothing calls it**.
 It does not appear in `OFM::ReinitAsync`, anywhere else in `ofm.cu`, or in either
 application.
 
-This matters beyond the self-check suite. It is the same channel LFM used to
-introduce viscosity and thereby produce its Kármán vortex street, and it is the
-channel the baroclinic and vegetation-drag source terms are meant to enter
-through. The mechanism exists and is validated in LFM, and the kernels are present
-here, but the shipped solver does not use them. The Kármán case cannot be run
-until that call is added, and adding it changes `src/ofm`, so it is left as a
-decision rather than done here.
+This matters beyond the self-check suite. It is the channel the baroclinic and
+vegetation-drag source terms are meant to enter through.
+
+The LFM paper is explicit that this is how it introduced viscosity: Algorithm 1
+carries the viscous and external-force terms as
+`u_0 += (dt/rho) F^T_{0,i+1/2} (mu*lap(u) + f)(Phi_{0,i+1/2})` accumulated over the
+cycle, Equation (8) gives that midpoint quadrature of the path integral, and Section
+6.2 states the Karman vortex street (Fig. 8) was produced "by incorporating viscosity
+through the path integral during forward marching".
+
+What the LFM source shows is that **the released code does not implement those lines
+either**. `RKAxisAccumulateForceAsync` has no caller in LFM's repository, and LFM
+contains no viscosity term at all; the public code is the inviscid subset of
+Algorithm 1. So the wiring exists in neither repository and has to be written, with
+Algorithm 1 and Equation (8) as the spec. Note also that the kernel *assigns*
+`f_axis = f . T` rather than accumulating it, so the running sum over the cycle is the
+caller's responsibility, and `ofm::OFM` owns no force buffer to sum into. Both solvers
+as shipped being inviscid is also why the vorticity losses measured above are entirely
+numerical.
 
 ## Reproducing
 
@@ -121,6 +208,9 @@ cd proj/selfcheck && xmake -P . -y
 ```
 
 `--radius`, `--core`, `--circulation`, `--spacing`, `--dt` and `--steps` are all
-settable. The CSV carries per-sample kinetic energy, peak speed, peak vorticity,
+settable, as are `--reinit-every N` (1 = the one-step scheme, the default) and
+`--rk-order 2|3|4` (3 = TVD-RK3, the default). The interval sweep above is that same
+command with `--reinit-every` set to 1, 2, 5 and 10; `--steps` counts advection steps, so
+the simulated time is the same for every interval. The CSV carries per-sample kinetic energy, peak speed, peak vorticity,
 both ring positions in the (axial, radial) plane, their separation and the running
 leap count.

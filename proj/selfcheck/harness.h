@@ -18,6 +18,11 @@ struct SolverConfig {
     float inlet_angle = 0.0f;
     int cg_iter      = 15;
     bool bfecc_clamp = true;
+    // Steps per reinitialization cycle. 1 is the one-step (OFM) scheme; the LFM
+    // paper runs its leapfrog vortex ring figure at 10.
+    int reinit_every = 1;
+    // Flow-map marching order: 2, 4, or anything else for TVD-RK3.
+    int rk_order     = 3;
 };
 
 // A circular vortex filament with a regularized (Rosenhead-Moore) core.

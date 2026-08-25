@@ -402,9 +402,15 @@ __global__ void RK4AxisKernel(float3* _psi_axis, float3* _T_axis, int3 _tile_dim
         float3 u4          = InterpMacN2Grad(grad, _tile_dim, _u_x, _u_y, _u_z, intp_pos, _inv_dx);
         float3 dT_axis_dt4 = MatMulVec(grad, T);
         // final
-        _psi_axis[idx]     = { trans_pos.x - one_over_six_dt * (u1.x + 2.0f * u2.x + 2.0f * u3.x + u4.x),
-                               pos.y - one_over_six_dt * (u1.y + 2.0f * u2.y + 2.0f * u3.y + u4.y),
-                               pos.z - one_over_six_dt * (u1.z + 2.0f * u2.z + 2.0f * u3.z + u4.z) };
+        // Upstream mixes frames here, taking x from the origin-shifted trans_pos but y
+        // and z from the unshifted pos, and never shifting back. The two agree only when
+        // grid_origin is zero, which holds in every configuration upstream ships and in
+        // the self-check harness, so this changes no existing result. Marching
+        // consistently in the shifted frame and shifting back is correct for any origin.
+        float3 final_pos   = { trans_pos.x - one_over_six_dt * (u1.x + 2.0f * u2.x + 2.0f * u3.x + u4.x),
+                               trans_pos.y - one_over_six_dt * (u1.y + 2.0f * u2.y + 2.0f * u3.y + u4.y),
+                               trans_pos.z - one_over_six_dt * (u1.z + 2.0f * u2.z + 2.0f * u3.z + u4.z) };
+        _psi_axis[idx]     = { final_pos.x + _grid_origin.x, final_pos.y + _grid_origin.y, final_pos.z + _grid_origin.z };
         _T_axis[idx]       = { T1.x - one_over_six_dt * (dT_axis_dt1.x + 2.0f * dT_axis_dt2.x + 2.0f * dT_axis_dt3.x + dT_axis_dt4.x),
                                T1.y - one_over_six_dt * (dT_axis_dt1.y + 2.0f * dT_axis_dt2.y + 2.0f * dT_axis_dt3.y + dT_axis_dt4.y),
                                T1.z - one_over_six_dt * (dT_axis_dt1.z + 2.0f * dT_axis_dt2.z + 2.0f * dT_axis_dt3.z + dT_axis_dt4.z) };
@@ -476,7 +482,7 @@ __global__ void TVDRK3AxisKernel(float3* _psi_axis, float3* _T_axis, int3 _tile_
     }
 }
 
-void RKAxisAsync(DHMemory<float3>& _psi_axis, DHMemory<float3>& _T_axis, int3 _tile_dim, int3 _axis_tile_dim,
+void RKAxisAsync(int _rk_order, DHMemory<float3>& _psi_axis, DHMemory<float3>& _T_axis, int3 _tile_dim, int3 _axis_tile_dim,
                  const DHMemory<float>& _u_x, const DHMemory<float>& _u_y, const DHMemory<float>& _u_z, float3 _grid_origin, float _dx, float _dt, cudaStream_t _stream)
 {
     float3* psi_axis  = _psi_axis.dev_ptr_;
@@ -486,7 +492,12 @@ void RKAxisAsync(DHMemory<float3>& _psi_axis, DHMemory<float3>& _T_axis, int3 _t
     const float* u_z  = _u_z.dev_ptr_;
     int axis_tile_num = Prod(_axis_tile_dim);
     float inv_dx      = 1.0f / _dx;
-    TVDRK3AxisKernel<<<axis_tile_num, 128, 0, _stream>>>(psi_axis, T_axis, _tile_dim, u_x, u_y, u_z, _grid_origin, inv_dx, _dt);
+    if (_rk_order == 2)
+        RK2AxisKernel<<<axis_tile_num, 128, 0, _stream>>>(psi_axis, T_axis, _tile_dim, u_x, u_y, u_z, _grid_origin, inv_dx, _dt);
+    else if (_rk_order == 4)
+        RK4AxisKernel<<<axis_tile_num, 128, 0, _stream>>>(psi_axis, T_axis, _tile_dim, u_x, u_y, u_z, _grid_origin, inv_dx, _dt);
+    else
+        TVDRK3AxisKernel<<<axis_tile_num, 128, 0, _stream>>>(psi_axis, T_axis, _tile_dim, u_x, u_y, u_z, _grid_origin, inv_dx, _dt);
 }
 
 __device__ float3 InterpMacN2(int3 _tile_dim, const float* _u_x, const float* _u_y, const float* _u_z, float3 _trans_pos, float _inv_dx)
@@ -822,9 +833,15 @@ __global__ void RK4AxisAccumulateForceKernel(float3* _psi_axis, float3* _T_axis,
         float3 u4          = InterpMacN2Grad(grad, _tile_dim, _u_x, _u_y, _u_z, intp_pos, _inv_dx);
         float3 dT_axis_dt4 = MatMulVec(grad, T);
         // final
-        _psi_axis[idx]     = { trans_pos.x - one_over_six_dt * (u1.x + 2.0f * u2.x + 2.0f * u3.x + u4.x),
-                               pos.y - one_over_six_dt * (u1.y + 2.0f * u2.y + 2.0f * u3.y + u4.y),
-                               pos.z - one_over_six_dt * (u1.z + 2.0f * u2.z + 2.0f * u3.z + u4.z) };
+        // Upstream mixes frames here, taking x from the origin-shifted trans_pos but y
+        // and z from the unshifted pos, and never shifting back. The two agree only when
+        // grid_origin is zero, which holds in every configuration upstream ships and in
+        // the self-check harness, so this changes no existing result. Marching
+        // consistently in the shifted frame and shifting back is correct for any origin.
+        float3 final_pos   = { trans_pos.x - one_over_six_dt * (u1.x + 2.0f * u2.x + 2.0f * u3.x + u4.x),
+                               trans_pos.y - one_over_six_dt * (u1.y + 2.0f * u2.y + 2.0f * u3.y + u4.y),
+                               trans_pos.z - one_over_six_dt * (u1.z + 2.0f * u2.z + 2.0f * u3.z + u4.z) };
+        _psi_axis[idx]     = { final_pos.x + _grid_origin.x, final_pos.y + _grid_origin.y, final_pos.z + _grid_origin.z };
         _T_axis[idx]       = { T1.x - one_over_six_dt * (dT_axis_dt1.x + 2.0f * dT_axis_dt2.x + 2.0f * dT_axis_dt3.x + dT_axis_dt4.x),
                                T1.y - one_over_six_dt * (dT_axis_dt1.y + 2.0f * dT_axis_dt2.y + 2.0f * dT_axis_dt3.y + dT_axis_dt4.y),
                                T1.z - one_over_six_dt * (dT_axis_dt1.z + 2.0f * dT_axis_dt2.z + 2.0f * dT_axis_dt3.z + dT_axis_dt4.z) };

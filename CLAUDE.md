@@ -129,14 +129,20 @@ where the actual per-kernel math lives, not in `ofm.cu`.
 
 Per-frame control flow (driven by `PhysicsEngineUser::step()` in `proj/*/physics.cu`, one call each
 per frame):
-1. **`OFM::AdvanceAsync`** — midpoint-advects the previous frame's projected velocity by itself
-   (`AdvectN2{X,Y,Z}Async`), applies the inlet BC, and pressure-projects once ("Projection 1") to
-   get a half-step velocity (`mid_u_{x,y,z}_`).
-2. **`OFM::ReinitAsync`** — the flow map is **reset to identity and re-marched from scratch every
-   single frame** (this is the "one-step", `n=1`, design the OFM thesis trades accuracy for
-   real-time speed with — see the project memory on OFM/LFM for why this matters for the
-   attribution work: there is no long-range map to preserve state across). It RK-marches both the
-   backward map (ψ, T) and forward map (φ, F) using the half-step velocity, reconstructs velocity
+1. **`OFM::AdvanceAsync`** — advects the previous step's projected velocity, applies the inlet BC,
+   and pressure-projects once ("Projection 1"), storing the result in `mid_u_{x,y,z}_[step %
+   reinit_every_]`. Which velocity is advected, and over what interval, follows the leapfrog
+   schedule of LFM's Algorithm 1: a half step at the start of a reinitialization cycle, a full step
+   next, and thereafter the velocity from *two* steps back advected across `2*dt` by the velocity of
+   the previous step. At `reinit_every_ == 1` only the first branch is ever reached.
+2. **`OFM::ReinitAsync`** — called once per reinitialization cycle (**not** once per step unless
+   `reinit_every_ == 1`). The flow map is reset to identity and re-marched through the cycle's
+   stored velocity history — backward map (ψ, T) walking the history in reverse, forward map (φ, F)
+   walking it forwards. `reinit_every_` defaults to 1, which reproduces the "one-step" (`n=1`)
+   scheme the OFM thesis trades accuracy for real-time speed with; larger values restore LFM's
+   multi-step cycle. `rk_order_` selects the marching order (2, 4, or TVD-RK3 by default). Note that
+   drivers must call `AdvanceAsync` `reinit_every_` times per `ReinitAsync`, and that the solver's
+   velocity state (`init_u_`) is only current at a cycle boundary. It reconstructs velocity
    at the new time by pulling the *initial impulse* back through `T` (impulse/covector
    reconstruction, not direct velocity advection), runs one BFECC error-compensation pass (forward
    pull through φ/F, subtract, backward-pull the error through T, apply a half correction, optional
@@ -156,6 +162,9 @@ memory for the full reasoning): the solver is **incompressible, constant-density
 scalar pressure field, no density field anywhere in `OFM`/`ofm_util.cu`) — wildfire combustion needs
 `∇·u ≠ 0` from thermal expansion, which will mean touching `AdvanceAsync`/`ReinitAsync`/
 `ProjectAsync` and the divergence/pressure kernels, not just adding a new app on top. And the flow
-map genuinely has no persistent state across frames (confirmed by `ReinitAsync` resetting to
-identity every call) — any cross-frame circulation accumulator the attribution work needs has to be
-built as new state, not recovered from the existing map.
+map has no persistent state across reinitializations (`ReinitAsync` resets it to identity every
+call) — any circulation accumulator the attribution work needs has to be built as new state, not
+recovered from the existing map. The channel source terms must enter through is the path integral of
+LFM's Algorithm 1 / Equation (8); `RKAxisAccumulateForceAsync` implements its integrand (note it
+*assigns* rather than accumulates, so the running sum is the caller's job) but is called by nothing,
+here or in LFM's own release, so both solvers as shipped are inviscid.

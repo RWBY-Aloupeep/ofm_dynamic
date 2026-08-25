@@ -144,13 +144,15 @@ struct RingParams {
     float x_start     = 0.30f;
 };
 
-int RunLeapfrogRings(int total_steps, int diag_every, const char* csv_path, RingParams rp, float dt)
+int RunLeapfrogRings(int total_steps, int diag_every, const char* csv_path, RingParams rp, float dt, int reinit_every, int rk_order)
 {
     cudaStream_t stream = 0;
     selfcheck::SolverConfig config;
     config.tile_dim = { 32, 16, 16 }; // 256 x 128 x 128, matching LFM Table 4 for Figure 14
     config.len_y    = 1.0f;
     config.cg_iter  = 15;             // LFM Table 4 reports 15 CG iterations for this case
+    config.reinit_every = reinit_every;
+    config.rk_order     = rk_order;
 
     ofm::OFM solver;
     GPUTimer profiler(64);
@@ -210,11 +212,22 @@ int RunLeapfrogRings(int total_steps, int diag_every, const char* csv_path, Ring
     printf("rings: R=%.3f core=%.3f Gamma=%.3f at x=%.3f and x=%.3f, dx=%.5f (%.1f cells per radius)\n",
            radius, core, circulation, x_trail, x_lead, dx, radius / dx);
 
-    for (int step = 0; step < total_steps; step++) {
+    // One reinitialization cycle is reinit_every advection steps followed by a single
+    // reinitialization. Between reinitializations the solver's reported velocity is
+    // stale -- init_u_ is only refreshed by ReinitAsync -- so diagnostics are sampled
+    // at cycle boundaries. The loop counter stays in advection steps so that the
+    // physical time axis is identical for every reinitialization interval.
+    const int cycle_steps = config.reinit_every;
+    int step              = 0;
+    int next_diag         = 0;
+    int diag_count        = 0;
+    while (step < total_steps) {
         profiler.beginFrame();
-        solver.AdvanceAsync(dt, stream);
+        for (int i = 0; i < cycle_steps; i++)
+            solver.AdvanceAsync(dt, stream);
         solver.ReinitAsync(dt, stream);
         cudaStreamSynchronize(stream);
+        step += cycle_steps;
 
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -223,8 +236,10 @@ int RunLeapfrogRings(int total_steps, int diag_every, const char* csv_path, Ring
             return 1;
         }
 
-        if (step % diag_every != 0)
+        if (step < next_diag)
             continue;
+        next_diag = step + diag_every;
+        diag_count++;
 
         const selfcheck::FieldStats stats = selfcheck::ComputeFieldStats(solver, stream);
         if (!stats.finite) {
@@ -280,7 +295,7 @@ int RunLeapfrogRings(int total_steps, int diag_every, const char* csv_path, Ring
                 step, step * dt, stats.kinetic_energy, stats.max_speed, stats.max_vorticity,
                 clusters[0].x, clusters[0].r, clusters[1].x, clusters[1].r, separation, leaps);
 
-        if (step % (diag_every * 20) == 0)
+        if (diag_count % 20 == 1)
             printf("step %5d  t=%6.3f  KE=%.4e  max|w|=%7.3f  A=(%.3f,%.3f) B=(%.3f,%.3f) sep=%.4f leaps=%d%s\n",
                    step, step * dt, stats.kinetic_energy, stats.max_vorticity,
                    clusters[0].x, clusters[0].r, clusters[1].x, clusters[1].r, separation, leaps,
@@ -307,7 +322,9 @@ int main(int argc, char** argv)
     int diag_every          = 10;
     std::string csv_path    = "leapfrog3d.csv";
     RingParams rp;
-    float dt = 1.0f / 60.0f;
+    float dt         = 1.0f / 60.0f;
+    int reinit_every = 1; // 1 = one-step (OFM); LFM runs its Figure 14 at 10
+    int rk_order     = 3; // TVD-RK3, the order OFM shipped with
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -327,17 +344,22 @@ int main(int argc, char** argv)
             rp.circulation = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--spacing" && i + 1 < argc)
             rp.spacing = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--reinit-every" && i + 1 < argc)
+            reinit_every = std::atoi(argv[++i]);
+        else if (arg == "--rk-order" && i + 1 < argc)
+            rk_order = std::atoi(argv[++i]);
         else if (arg == "--dt" && i + 1 < argc)
             dt = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--help") {
             printf("usage: selfcheck [--test leapfrog3d] [--steps N] [--diag-every N] [--csv PATH]\n"
-                   "                 [--radius R] [--core S] [--circulation G] [--spacing D]\n");
+                   "                 [--radius R] [--core S] [--circulation G] [--spacing D]\n"
+                   "                 [--reinit-every N] [--rk-order 2|3|4] [--dt DT]\n");
             return 0;
         }
     }
 
     if (test == "leapfrog3d")
-        return RunLeapfrogRings(total_steps, diag_every, csv_path.c_str(), rp, dt);
+        return RunLeapfrogRings(total_steps, diag_every, csv_path.c_str(), rp, dt, reinit_every, rk_order);
 
     printf("unknown test: %s\n", test.c_str());
     return 1;

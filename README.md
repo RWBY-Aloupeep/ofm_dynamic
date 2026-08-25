@@ -34,8 +34,10 @@ the wildfire-specific physics or diagnostics has been added yet. Planned work, r
    (2D leapfrog, Kármán vortex street, 3D leapfrog vortex rings).
 2. **Low-Mach extension** — the upstream solver is incompressible and constant-density; wildfire
    combustion drives `∇·u ≠ 0` through thermal expansion. This is the main open methodological risk.
-3. **Cross-step attribution** — the flow map is reinitialized every time step, so the per-source
-   circulation budget has to be accumulated across reinitializations as new persistent state.
+3. **Cross-step attribution** — the flow map carries no state across reinitializations, so the
+   per-source circulation budget has to be accumulated as new persistent state. LFM's Algorithm 1
+   and Equation (8) specify the path integral that viscous and external source terms enter through;
+   the kernel for it (`RKAxisAccumulateForceAsync`) is present but is called by neither upstream.
 4. **Validation stages** — buoyant-plume-in-crossflow and fire-line-with-slope configurations drawn
    from the literature, a lee-slope vorticity-driven lateral spread case, and quantitative comparison
    against published wildfire benchmark datasets.
@@ -85,6 +87,15 @@ scratch.
 OFM in turn builds on **[Leapfrog Flow Maps](https://yuchen-sun-cg.github.io/projects/lfm/)** (Sun
 et al., *ACM Transactions on Graphics* 44(4), 2025), which contributed the hybrid velocity–impulse
 leapfrog integrator and the matrix-free AMGPCG GPU Poisson solver that this code depends on.
+
+OFM is LFM specialised to a reinitialization cycle of one step, with dynamic-boundary support added.
+Because this project needs accuracy rather than the real-time budget that specialisation buys,
+LFM's multi-step reinitialization cycle has been merged back into `src/ofm`, together with its RK2
+and RK4 marching kernels, from the reference implementation at
+<https://github.com/yuchen-sun-cg/lfm>. `reinit_every_ = 1` with TVD-RK3 reproduces the one-step
+scheme exactly and remains the default, so the behaviour of the example applications is unchanged.
+That merged cycle is upstream's work in both origin and design; see `proj/selfcheck/RESULTS.md` for
+what it was merged in order to measure.
 
 Upstream remains available as the `upstream` git remote:
 

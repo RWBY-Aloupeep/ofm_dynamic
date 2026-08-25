@@ -18,6 +18,12 @@ xmake -P . -y
 ./build/selfcheck
 ```
 
+The harness drives the solver in reinitialization cycles: `--reinit-every N` runs `N`
+advection steps per reinitialization (`N = 1`, the default, is the one-step scheme OFM
+ships with; LFM runs its leapfrog figure at 10), and `--rk-order 2|3|4` selects the
+flow-map marching order. Diagnostics are sampled at cycle boundaries, because the solver's
+velocity state is only current there.
+
 `-P .` matters: without it xmake walks up, finds `proj/xmake.lua`, and tries to
 resolve the GUI packages. Compute nodes on klone have no outbound network, so any
 package that is not already cached will fail there; configure on the login node if

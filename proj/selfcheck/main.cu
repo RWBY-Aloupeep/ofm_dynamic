@@ -605,6 +605,83 @@ int RunAttribution(int total_steps, int diag_every, const char* csv_path, Burger
     return 0;
 }
 
+// D1, second half: stretching and tilting reported separately.
+//
+// The fire whirl and VLS literature argues that vertical vorticity comes from
+// tilting ambient horizontal vorticity rather than from stretching, but nobody has
+// measured the two terms against each other. Splitting them is a pointwise
+// diagnostic of the vertical vorticity equation,
+//
+//     D w_z / Dt = w_x d_x w + w_y d_y w  +  w_z d_z w
+//                  \_____tilting_____/       \_stretching_/
+//
+// and this calibrates the operator rather than the solver: an analytic field goes
+// in, no time stepping happens, and what comes out is compared with the closed-form
+// answer. The field is linear, so central differences are exact on it and anything
+// beyond round-off is a bug in the operator, not truncation error.
+int RunTiltingStretching(int res_tiles, float core, float circulation)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim = { res_tiles, res_tiles, res_tiles };
+    config.len_y    = 1.0f;
+    config.cg_iter  = 15;
+
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+
+    printf("tilting/stretching operator check, grid %d^3\n\n", res_tiles * 8);
+
+    // --- case 1: analytic shear field, both terms non-zero and uniform ---
+    const selfcheck::ShearSpec spec = { 1.0f, 0.7f, 0.5f, 0.3f, 0.0f };
+    const double tilt_exact    = static_cast<double>(spec.c) * spec.s;
+    const double stretch_exact = 2.0 * static_cast<double>(spec.omega) * spec.g;
+
+    selfcheck::SetShearFieldAsync(solver, spec, stream);
+    cudaStreamSynchronize(stream);
+    const selfcheck::TiltStretch a = selfcheck::MeasureTiltingStretching(solver, stream);
+    if (!a.valid) {
+        printf("case 1: non-finite result\n");
+        return 1;
+    }
+
+    const double tilt_err    = (a.tilting_mean - tilt_exact) / tilt_exact;
+    const double stretch_err = (a.stretching_mean - stretch_exact) / stretch_exact;
+
+    printf("case 1 -- analytic shear field (omega=%.2f c=%.2f s=%.2f g=%.2f)\n",
+           spec.omega, spec.c, spec.s, spec.g);
+    printf("  tilting     measured %+.8f   exact %+.8f   rel err %+.3e\n",
+           a.tilting_mean, tilt_exact, tilt_err);
+    printf("  stretching  measured %+.8f   exact %+.8f   rel err %+.3e\n",
+           a.stretching_mean, stretch_exact, stretch_err);
+    printf("  tilting share of the two: %.1f%%  (exact %.1f%%)\n\n",
+           100.0 * a.ratio, 100.0 * tilt_exact / (tilt_exact + stretch_exact));
+
+    // --- case 2: a purely columnar vortex has no vertical velocity at all, so
+    //     both terms must vanish; this catches spurious coupling between them ---
+    solver.init_u_x_->ClearDevAsync(stream);
+    solver.init_u_y_->ClearDevAsync(stream);
+    solver.init_u_z_->ClearDevAsync(stream);
+    const selfcheck::ColumnVortexSpec col = { 0.5f, 0.5f, core, circulation };
+    selfcheck::AddColumnVortexAsync(solver, col, true, stream);
+    cudaStreamSynchronize(stream);
+    const selfcheck::TiltStretch b = selfcheck::MeasureTiltingStretching(solver, stream);
+    if (!b.valid) {
+        printf("case 2: non-finite result\n");
+        return 1;
+    }
+    printf("case 2 -- columnar vortex, w = 0 so both terms must vanish\n");
+    printf("  mean |tilting|    %.3e\n", b.tilting_abs_mean);
+    printf("  mean |stretching| %.3e\n\n", b.stretching_abs_mean);
+
+    const bool pass = std::fabs(tilt_err) < 1e-4 && std::fabs(stretch_err) < 1e-4;
+    printf("=== D1 tilting/stretching ===\n");
+    printf("%s: the split reproduces the analytic terms to %.1e and %.1e\n",
+           pass ? "PASS" : "FAIL", std::fabs(tilt_err), std::fabs(stretch_err));
+    return pass ? 0 : 1;
+}
+
 int main(int argc, char** argv)
 {
     std::string test        = "leapfrog3d";
@@ -664,13 +741,17 @@ int main(int argc, char** argv)
                    "                 [--steps N] [--diag-every N] [--reinit-every N] [--rk-order 2|3|4]\n"
                    "                 [--res-tiles T]  (T tiles per side, 8T cells; default 16 = 128^3)\n"
                    "       selfcheck --test attribution [--nu NU] [--loop-radius R] [--reinit-every N]\n"
-                   "                 [--res-tiles T] [--steps N] [--diag-every N]\n");
+                   "                 [--res-tiles T] [--steps N] [--diag-every N]\n"
+                   "       selfcheck --test tilting [--res-tiles T]\n");
             return 0;
         }
     }
 
     if (test == "leapfrog3d")
         return RunLeapfrogRings(total_steps, diag_every, csv_path.c_str(), rp, dt, reinit_every, rk_order);
+
+    if (test == "tilting")
+        return RunTiltingStretching(res_tiles, bp.core, bp.circulation);
 
     if (test == "attribution") {
         if (!dt_set)

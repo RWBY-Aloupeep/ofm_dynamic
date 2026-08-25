@@ -52,6 +52,35 @@ struct ColumnDiag {
     bool valid;
 };
 
+// A divergence-free velocity field with closed-form vorticity and vertical-velocity
+// gradient, used to calibrate the tilting/stretching operator:
+//
+//   u = ( -omega y - (g/2) x,  omega x - c z - (g/2) y,  w0 + s x + g z )
+//
+// giving vorticity (c, -s, 2 omega) and grad(w) = (s, 0, g), so that
+//   tilting    = w_x d_x w + w_y d_y w = c s
+//   stretching = w_z d_z w             = 2 omega g
+// both uniform in space, which makes any error in the operator obvious.
+struct ShearSpec {
+    float omega; // solid-body rotation rate about z
+    float c;     // vertical shear of the y velocity, sets w_x
+    float s;     // horizontal gradient of the vertical velocity, sets w_y and d_x w
+    float g;     // vertical stretching rate
+    float w0;
+};
+
+// Split of the vertical vorticity source into the two terms the fire whirl
+// literature argues about. Averages are over the interior, excluding the two
+// outermost cell layers where the centred differences would be one-sided.
+struct TiltStretch {
+    double tilting_mean;
+    double stretching_mean;
+    double tilting_abs_mean;
+    double stretching_abs_mean;
+    double ratio; // |tilting| / (|tilting| + |stretching|)
+    bool valid;
+};
+
 // Cell-centered scalar field pulled back to the host, in plain x-major order.
 struct HostField {
     int3 dim;
@@ -89,6 +118,13 @@ void AddColumnVortexAsync(ofm::OFM& solver, const ColumnVortexSpec& spec, bool p
 // Peak vorticity and the radius of peak azimuthal velocity, by radial binning
 // about the axis over the whole column.
 ColumnDiag MeasureColumnVortex(ofm::OFM& solver, float centre_x, float centre_y, cudaStream_t stream);
+
+// Writes the analytic shear field above into the solver's velocity state.
+void SetShearFieldAsync(ofm::OFM& solver, const ShearSpec& spec, cudaStream_t stream);
+
+// Reports tilting and stretching separately, by central differences on the
+// cell-centred velocity.
+TiltStretch MeasureTiltingStretching(ofm::OFM& solver, cudaStream_t stream);
 
 // Line integral of a staggered vector field around a circle of the given radius,
 // centred on (centre_x, centre_y) in the mid-z plane, traversed counter-clockwise.

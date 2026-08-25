@@ -373,12 +373,40 @@ when attribution is not asked for.
 
 `--loop-radius` overrides the loop radius, which defaults to the seeded core.
 
-### Still open in D1
+### Stretching and tilting, reported separately
 
-The plan also requires **stretching and tilting reported separately**
-(`w_z d_z w` against `w_x d_x w + w_y d_y w`), which is a pointwise diagnostic of
-the vorticity equation rather than part of the circulation budget. That half is not
-done here.
+The other half of D1. The fire whirl and VLS literature argues that vertical
+vorticity comes from tilting ambient horizontal vorticity rather than from
+stretching, but no paper in the corpus measures the two against each other:
+
+    D w_z / Dt = w_x d_x w + w_y d_y w  +  w_z d_z w
+                 \_____tilting_____/       \_stretching_/
+
+This is a pointwise diagnostic of the vorticity equation, not part of the
+circulation budget, so it is calibrated against an analytic field rather than
+against the solver: the field goes in, no time stepping happens, and the output is
+compared with the closed form. The field
+
+    u = ( -W y - (g/2) x,  W x - c z - (g/2) y,  w0 + s x + g z )
+
+is divergence free with vorticity `(c, -s, 2W)` and `grad(w) = (s, 0, g)`, so
+`tilting = c s` and `stretching = 2 W g`, both uniform in space and independently
+tunable. It is also **linear**, on which central differences are exact — so
+anything above round-off is an error in the operator, not truncation.
+
+| grid | tilting rel. err | stretching rel. err |
+|---|---|---|
+| 128^3 | -2.4e-08 | -2.5e-09 |
+| 64^3 | +1.3e-08 | -3.4e-08 |
+
+Both at float round-off, and independent of resolution as the linear field
+requires. A second case seeds a purely columnar vortex, where `w = 0` everywhere
+and both terms must vanish: mean `|tilting|` comes back at 2e-15 and mean
+`|stretching|` at 3.8e-11, so the two terms are not leaking into each other.
+
+```
+./build/selfcheck --test tilting --res-tiles 16
+```
 
 ## The source-term channel: how it was found missing
 

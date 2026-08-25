@@ -179,6 +179,42 @@ float3 SampleCentred(const float3* data, int3 td, float3 grid_origin, float dx, 
     return acc;
 }
 
+__global__ void SetShearVelocityKernel(float* u_axis, int3 axis_tile_dim, int component,
+                                       float3 grid_origin, float dx, selfcheck::ShearSpec spec)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(axis_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        const int idx        = tile_idx * 512 + voxel_idx;
+
+        float3 offset;
+        if (component == 0)
+            offset = { 0.0f, 0.5f, 0.5f };
+        else if (component == 1)
+            offset = { 0.5f, 0.0f, 0.5f };
+        else
+            offset = { 0.5f, 0.5f, 0.0f };
+
+        const float px = grid_origin.x + (ijk.x + offset.x) * dx;
+        const float py = grid_origin.y + (ijk.y + offset.y) * dx;
+        const float pz = grid_origin.z + (ijk.z + offset.z) * dx;
+
+        float v;
+        if (component == 0)
+            v = -spec.omega * py - 0.5f * spec.g * px;
+        else if (component == 1)
+            v = spec.omega * px - spec.c * pz - 0.5f * spec.g * py;
+        else
+            v = spec.w0 + spec.s * px + spec.g * pz;
+        u_axis[idx] = v;
+    }
+}
+
 } // namespace
 
 void SetupSolver(ofm::OFM& solver, const SolverConfig& config, GPUTimer& profiler, cudaStream_t stream)
@@ -378,6 +414,82 @@ ColumnDiag MeasureColumnVortex(ofm::OFM& solver, float centre_x, float centre_y,
         }
     }
     return diag;
+}
+
+void SetShearFieldAsync(ofm::OFM& solver, const ShearSpec& spec, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const int3 y_tile_dim = { td.x, td.y + 1, td.z };
+    const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
+
+    SetShearVelocityKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+        solver.init_u_x_->dev_ptr_, x_tile_dim, 0, solver.grid_origin_, solver.dx_, spec);
+    SetShearVelocityKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
+        solver.init_u_y_->dev_ptr_, y_tile_dim, 1, solver.grid_origin_, solver.dx_, spec);
+    SetShearVelocityKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(
+        solver.init_u_z_->dev_ptr_, z_tile_dim, 2, solver.grid_origin_, solver.dx_, spec);
+}
+
+TiltStretch MeasureTiltingStretching(ofm::OFM& solver, cudaStream_t stream)
+{
+    const int3 td = solver.tile_dim_;
+    ofm::GetCenteralVecAsync(*(solver.u_), td, *(solver.init_u_x_), *(solver.init_u_y_), *(solver.init_u_z_), stream);
+    solver.u_->DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const double inv_2dx = 1.0 / (2.0 * solver.dx_);
+    const float3* u = solver.u_->host_ptr_;
+
+    TiltStretch out = { 0.0, 0.0, 0.0, 0.0, 0.0, true };
+    long long count = 0;
+
+    auto at = [&](int i, int j, int k) { return u[IjkToIdx(td, { i, j, k })]; };
+
+    // Two layers in from every face: the vorticity needs one neighbour and the
+    // gradient of w another, and one-sided differences at the wall would bias the
+    // average without saying anything about the operator.
+    for (int i = 2; i < nx - 2; i++)
+        for (int j = 2; j < ny - 2; j++)
+            for (int k = 2; k < nz - 2; k++) {
+                const float3 xp = at(i + 1, j, k), xm = at(i - 1, j, k);
+                const float3 yp = at(i, j + 1, k), ym = at(i, j - 1, k);
+                const float3 zp = at(i, j, k + 1), zm = at(i, j, k - 1);
+
+                const double w_x = (yp.z - ym.z) * inv_2dx - (zp.y - zm.y) * inv_2dx;
+                const double w_y = (zp.x - zm.x) * inv_2dx - (xp.z - xm.z) * inv_2dx;
+                const double w_z = (xp.y - xm.y) * inv_2dx - (yp.x - ym.x) * inv_2dx;
+
+                const double dwdx = (xp.z - xm.z) * inv_2dx;
+                const double dwdy = (yp.z - ym.z) * inv_2dx;
+                const double dwdz = (zp.z - zm.z) * inv_2dx;
+
+                const double tilting    = w_x * dwdx + w_y * dwdy;
+                const double stretching = w_z * dwdz;
+
+                if (!isfinite(tilting) || !isfinite(stretching)) {
+                    out.valid = false;
+                    return out;
+                }
+                out.tilting_mean += tilting;
+                out.stretching_mean += stretching;
+                out.tilting_abs_mean += std::fabs(tilting);
+                out.stretching_abs_mean += std::fabs(stretching);
+                count++;
+            }
+
+    if (count == 0) {
+        out.valid = false;
+        return out;
+    }
+    out.tilting_mean /= count;
+    out.stretching_mean /= count;
+    out.tilting_abs_mean /= count;
+    out.stretching_abs_mean /= count;
+    const double denom = out.tilting_abs_mean + out.stretching_abs_mean;
+    out.ratio = denom > 0.0 ? out.tilting_abs_mean / denom : 0.0;
+    return out;
 }
 
 double CirculationOnCircle(ofm::OFM& solver,

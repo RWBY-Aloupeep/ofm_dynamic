@@ -75,6 +75,29 @@ public:
     // solver
     AMGPCG amgpcg_;
 
+    // Source terms: viscosity and external force, carried the way LFM's
+    // Algorithm 1 carries them. Off by default, which leaves the solver exactly
+    // as it shipped -- inviscid, with no path integral evaluated.
+    bool use_source_term_ = false;
+    float viscosity_      = 0.0f; // kinematic, i.e. mu/rho
+    // External force per unit mass. Zeroed by Alloc; write into it to add
+    // buoyancy, baroclinic generation or drag.
+    std::shared_ptr<DHMemory<float>> f_x_;
+    std::shared_ptr<DHMemory<float>> f_y_;
+    std::shared_ptr<DHMemory<float>> f_z_;
+    // Total source nu*lap(u) + f, rebuilt whenever it is needed.
+    std::shared_ptr<DHMemory<float>> src_x_;
+    std::shared_ptr<DHMemory<float>> src_y_;
+    std::shared_ptr<DHMemory<float>> src_z_;
+    // The advected velocity with the source already added (u-dagger in Algorithm 1).
+    std::shared_ptr<DHMemory<float>> star_u_x_;
+    std::shared_ptr<DHMemory<float>> star_u_y_;
+    std::shared_ptr<DHMemory<float>> star_u_z_;
+    // One quadrature sample of the Eq. (8) path integral, per staggered axis.
+    std::shared_ptr<DHMemory<float>> s_axis_x_;
+    std::shared_ptr<DHMemory<float>> s_axis_y_;
+    std::shared_ptr<DHMemory<float>> s_axis_z_;
+
     // bfecc clamp
     bool use_bfecc_clamp_;
 
@@ -97,5 +120,7 @@ public:
     void ResetForwardFlowMapAsync(cudaStream_t _stream);
     void ResetBackwardFlowMapAsync(cudaStream_t _stream);
     void ProjectAsync(cudaStream_t _stream);
+    // Fills src_{x,y,z}_ with nu*lap(u) + f for the velocity passed in.
+    void ComputeSourceAsync(const DHMemory<float>& _u_x, const DHMemory<float>& _u_y, const DHMemory<float>& _u_z, cudaStream_t _stream);
 };
 }

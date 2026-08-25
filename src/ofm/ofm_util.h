@@ -22,6 +22,11 @@ void PullbackAxisAsync(DHMemory<float>& _dst_axis, int3 _tile_dim, int3 _axis_ti
 void PullbackCenterAsync(DHMemory<float>& _dst, int3 _tile_dim, const DHMemory<float>& _src, const DHMemory<float3>& _psi_c, float3 _grid_origin, float _dx, cudaStream_t _stream);
 
 void AddFieldsAsync(DHMemory<float>& _dst, int3 _tile_dim, DHMemory<float>& _src1, DHMemory<float>& _src2, float _coef2, cudaStream_t _stream);
+void LaplacianAxisAsync(DHMemory<float>& _lap_axis, int3 _axis_tile_dim, int3 _max_ijk, const DHMemory<float>& _u_axis, float _dx, cudaStream_t _stream);
+
+void ContractSourceAxisAsync(DHMemory<float>& _s_axis, int3 _tile_dim, int3 _axis_tile_dim, const DHMemory<float3>& _map_axis, const DHMemory<float3>& _jacobian_axis,
+                             const DHMemory<float>& _s_x, const DHMemory<float>& _s_y, const DHMemory<float>& _s_z, float3 _grid_origin, float _dx, cudaStream_t _stream);
+
 
 void GetCentralPsiAsync(DHMemory<float3>& _psi_c, int3 _tile_dim, const DHMemory<float3>& _psi_x, const DHMemory<float3>& _psi_y, const DHMemory<float3>& _psi_z, cudaStream_t _stream);
 

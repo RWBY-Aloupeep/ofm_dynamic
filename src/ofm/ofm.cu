@@ -68,6 +68,25 @@ void OFM::Alloc(int3 _tile_dim, int _reinit_every)
     err_u_y_  = std::make_shared<DHMemory<float>>(y_voxel_num);
     err_u_z_  = std::make_shared<DHMemory<float>>(z_voxel_num);
 
+    // source terms
+    f_x_      = std::make_shared<DHMemory<float>>(x_voxel_num);
+    f_y_      = std::make_shared<DHMemory<float>>(y_voxel_num);
+    f_z_      = std::make_shared<DHMemory<float>>(z_voxel_num);
+    src_x_    = std::make_shared<DHMemory<float>>(x_voxel_num);
+    src_y_    = std::make_shared<DHMemory<float>>(y_voxel_num);
+    src_z_    = std::make_shared<DHMemory<float>>(z_voxel_num);
+    star_u_x_ = std::make_shared<DHMemory<float>>(x_voxel_num);
+    star_u_y_ = std::make_shared<DHMemory<float>>(y_voxel_num);
+    star_u_z_ = std::make_shared<DHMemory<float>>(z_voxel_num);
+    s_axis_x_ = std::make_shared<DHMemory<float>>(x_voxel_num);
+    s_axis_y_ = std::make_shared<DHMemory<float>>(y_voxel_num);
+    s_axis_z_ = std::make_shared<DHMemory<float>>(z_voxel_num);
+    // The force field is read every step once source terms are on, so it must
+    // start at zero rather than at whatever the allocation happened to contain.
+    cudaMemset(f_x_->dev_ptr_, 0, x_voxel_num * sizeof(float));
+    cudaMemset(f_y_->dev_ptr_, 0, y_voxel_num * sizeof(float));
+    cudaMemset(f_z_->dev_ptr_, 0, z_voxel_num * sizeof(float));
+
     // vorticity
     vor_norm_ = std::make_shared<DHMemory<float>>(voxel_num);
 
@@ -103,6 +122,10 @@ void OFM::UpdateBoundary(cudaStream_t _stream)
 
 void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
 {
+    int3 x_tile_dim = { tile_dim_.x + 1, tile_dim_.y, tile_dim_.z };
+    int3 y_tile_dim = { tile_dim_.x, tile_dim_.y + 1, tile_dim_.z };
+    int3 z_tile_dim = { tile_dim_.x, tile_dim_.y, tile_dim_.z + 1 };
+
     // Leapfrog schedule, following Algorithm 1 of the LFM paper: the first two steps
     // of a reinitialization cycle start the integrator (a half step, then a full
     // step), and every step after that advects the velocity from two steps back
@@ -145,6 +168,18 @@ void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
 
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Advection");
+        // Algorithm 1 lines 1, 6 and 12: the advected velocity picks up the source
+        // over the same interval it is advected across, evaluated on the velocity
+        // that transports it. All three of those lines are this one expression.
+        if (use_source_term_) {
+            ComputeSourceAsync(*last_proj_u_x, *last_proj_u_y, *last_proj_u_z, _stream);
+            AddFieldsAsync(*star_u_x_, x_tile_dim, *src_u_x, *src_x_, mid_dt, _stream);
+            AddFieldsAsync(*star_u_y_, y_tile_dim, *src_u_y, *src_y_, mid_dt, _stream);
+            AddFieldsAsync(*star_u_z_, z_tile_dim, *src_u_z, *src_z_, mid_dt, _stream);
+            src_u_x = star_u_x_;
+            src_u_y = star_u_y_;
+            src_u_z = star_u_z_;
+        }
         AdvectN2XAsync(*tmp_u_x_, tile_dim_, *src_u_x, *last_proj_u_x, *last_proj_u_y, *last_proj_u_z, dx_, mid_dt, _stream);
         AdvectN2YAsync(*tmp_u_y_, tile_dim_, *src_u_y, *last_proj_u_x, *last_proj_u_y, *last_proj_u_z, dx_, mid_dt, _stream);
         AdvectN2ZAsync(*tmp_u_z_, tile_dim_, *src_u_z, *last_proj_u_x, *last_proj_u_y, *last_proj_u_z, dx_, mid_dt, _stream);
@@ -186,10 +221,39 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Forward flowmap");
         // ... and forwards for the forward map, so the two meet at the cycle's ends.
+        //
+        // With source terms on, this loop also evaluates the path integral of
+        // Eq. (8) -- Algorithm 1 lines 5, 10 and 16. The quadrature points are the
+        // step midpoints, so each step is marched in two halves and the source is
+        // contracted with the forward Jacobian in between, then accumulated into
+        // the initial-time impulse. That accumulation has to happen here, before
+        // the pullback below reads init_u_.
+        const float half_dt = 0.5f * _dt;
         for (int i = 0; i < reinit_every_; i++) {
-            RKAxisAsync(rk_order_, *phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
-            RKAxisAsync(rk_order_, *phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
-            RKAxisAsync(rk_order_, *phi_z_, *F_z_, tile_dim_, z_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
+            if (!use_source_term_) {
+                RKAxisAsync(rk_order_, *phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
+                RKAxisAsync(rk_order_, *phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
+                RKAxisAsync(rk_order_, *phi_z_, *F_z_, tile_dim_, z_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
+                continue;
+            }
+
+            RKAxisAsync(rk_order_, *phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
+            RKAxisAsync(rk_order_, *phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
+            RKAxisAsync(rk_order_, *phi_z_, *F_z_, tile_dim_, z_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
+
+            ComputeSourceAsync(*mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], _stream);
+
+            ContractSourceAxisAsync(*s_axis_x_, tile_dim_, x_tile_dim, *phi_x_, *F_x_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
+            ContractSourceAxisAsync(*s_axis_y_, tile_dim_, y_tile_dim, *phi_y_, *F_y_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
+            ContractSourceAxisAsync(*s_axis_z_, tile_dim_, z_tile_dim, *phi_z_, *F_z_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
+
+            AddFieldsAsync(*init_u_x_, x_tile_dim, *init_u_x_, *s_axis_x_, _dt, _stream);
+            AddFieldsAsync(*init_u_y_, y_tile_dim, *init_u_y_, *s_axis_y_, _dt, _stream);
+            AddFieldsAsync(*init_u_z_, z_tile_dim, *init_u_z_, *s_axis_z_, _dt, _stream);
+
+            RKAxisAsync(rk_order_, *phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
+            RKAxisAsync(rk_order_, *phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
+            RKAxisAsync(rk_order_, *phi_z_, *F_z_, tile_dim_, z_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
         }
     }
 
@@ -252,6 +316,26 @@ void OFM::ResetBackwardFlowMapAsync(cudaStream_t _stream)
     ResetToIdentityXASync(*psi_x_, *T_x_, x_tile_dim, grid_origin_, dx_, _stream);
     ResetToIdentityYASync(*psi_y_, *T_y_, y_tile_dim, grid_origin_, dx_, _stream);
     ResetToIdentityZASync(*psi_z_, *T_z_, z_tile_dim, grid_origin_, dx_, _stream);
+}
+
+void OFM::ComputeSourceAsync(const DHMemory<float>& _u_x, const DHMemory<float>& _u_y, const DHMemory<float>& _u_z, cudaStream_t _stream)
+{
+    int3 x_tile_dim = { tile_dim_.x + 1, tile_dim_.y, tile_dim_.z };
+    int3 y_tile_dim = { tile_dim_.x, tile_dim_.y + 1, tile_dim_.z };
+    int3 z_tile_dim = { tile_dim_.x, tile_dim_.y, tile_dim_.z + 1 };
+    int3 x_max_ijk  = { tile_dim_.x * 8, tile_dim_.y * 8 - 1, tile_dim_.z * 8 - 1 };
+    int3 y_max_ijk  = { tile_dim_.x * 8 - 1, tile_dim_.y * 8, tile_dim_.z * 8 - 1 };
+    int3 z_max_ijk  = { tile_dim_.x * 8 - 1, tile_dim_.y * 8 - 1, tile_dim_.z * 8 };
+
+    LaplacianAxisAsync(*src_x_, x_tile_dim, x_max_ijk, _u_x, dx_, _stream);
+    LaplacianAxisAsync(*src_y_, y_tile_dim, y_max_ijk, _u_y, dx_, _stream);
+    LaplacianAxisAsync(*src_z_, z_tile_dim, z_max_ijk, _u_z, dx_, _stream);
+
+    // src = f + nu * lap(u). Writing back into src_ is safe: AddFieldsKernel
+    // reads and writes the same index.
+    AddFieldsAsync(*src_x_, x_tile_dim, *f_x_, *src_x_, viscosity_, _stream);
+    AddFieldsAsync(*src_y_, y_tile_dim, *f_y_, *src_y_, viscosity_, _stream);
+    AddFieldsAsync(*src_z_, z_tile_dim, *f_z_, *src_z_, viscosity_, _stream);
 }
 
 void OFM::ProjectAsync(cudaStream_t _stream)

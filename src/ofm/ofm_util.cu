@@ -868,6 +868,104 @@ void RKAxisAccumulateForceAsync(int _rk_order, DHMemory<float3>& _psi_axis, DHMe
         RK4AxisAccumulateForceKernel<<<axis_tile_num, 128, 0, _stream>>>(psi_axis, T_axis, f_axis, _tile_dim, u_x, u_y, u_z, f_x, f_y, f_z, _grid_origin, inv_dx, _dt);
 }
 
+// ---------------------------------------------------------------------------
+// Source terms along the flow map
+//
+// LFM Algorithm 1 carries viscosity and external force in two places: added to
+// the velocity that does the advecting, and accumulated into the initial-time
+// impulse as the path integral of Eq. (8). The two kernels below supply the
+// pieces the solver needs for both; see OFM::AdvanceAsync / OFM::ReinitAsync
+// for how they are driven.
+// ---------------------------------------------------------------------------
+
+// Seven-point Laplacian of one staggered velocity component. Out-of-range
+// neighbours are clamped onto the centre sample, so their contribution
+// vanishes -- a zero-gradient (free-slip) wall, which is what the wall boundary
+// condition in SetWallBc*Kernel imposes on the tangential components.
+__global__ void LaplacianAxisKernel(float* _lap_axis, int3 _axis_tile_dim, int3 _max_ijk, const float* _u_axis, float _inv_dx_sqr)
+{
+    int tile_idx  = blockIdx.x;
+    int3 tile_ijk = TileIdxToIjk(_axis_tile_dim, tile_idx);
+    int t_id      = threadIdx.x;
+    for (int i = 0; i < 4; i++) {
+        int voxel_idx  = t_id + i * 128;
+        int idx        = tile_idx * 512 + voxel_idx;
+        int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+
+        if (ijk.x > _max_ijk.x || ijk.y > _max_ijk.y || ijk.z > _max_ijk.z) {
+            _lap_axis[idx] = 0.0f;
+            continue;
+        }
+
+        float centre = _u_axis[idx];
+        float lap    = 0.0f;
+        for (int axis = 0; axis < 3; axis++)
+            for (int side = -1; side <= 1; side += 2) {
+                int3 nb = ijk;
+                if (axis == 0)
+                    nb.x += side;
+                else if (axis == 1)
+                    nb.y += side;
+                else
+                    nb.z += side;
+                nb.x = nb.x < 0 ? 0 : (nb.x > _max_ijk.x ? _max_ijk.x : nb.x);
+                nb.y = nb.y < 0 ? 0 : (nb.y > _max_ijk.y ? _max_ijk.y : nb.y);
+                nb.z = nb.z < 0 ? 0 : (nb.z > _max_ijk.z ? _max_ijk.z : nb.z);
+                lap += _u_axis[IjkToIdx(_axis_tile_dim, nb)] - centre;
+            }
+        _lap_axis[idx] = lap * _inv_dx_sqr;
+    }
+}
+
+void LaplacianAxisAsync(DHMemory<float>& _lap_axis, int3 _axis_tile_dim, int3 _max_ijk, const DHMemory<float>& _u_axis, float _dx, cudaStream_t _stream)
+{
+    float* lap_axis     = _lap_axis.dev_ptr_;
+    const float* u_axis = _u_axis.dev_ptr_;
+    int axis_tile_num   = Prod(_axis_tile_dim);
+    float inv_dx_sqr    = 1.0f / (_dx * _dx);
+    LaplacianAxisKernel<<<axis_tile_num, 128, 0, _stream>>>(lap_axis, _axis_tile_dim, _max_ijk, u_axis, inv_dx_sqr);
+}
+
+// One quadrature sample of the Eq. (8) path integral: evaluate the source field
+// at the flow-map position and contract it with the map's Jacobian column for
+// this staggered axis, giving (Fᵀ s)_axis. The map is not advanced -- the caller
+// places it on the quadrature point first.
+//
+// RKAxisAccumulateForceAsync in this file does the same contraction but samples
+// at the *start* of the step and marches a whole step in the same pass, which is
+// a left-endpoint rule. Eq. (8) asks for midpoints, so the solver drives the
+// march itself in half steps and calls this instead.
+__global__ void ContractSourceAxisKernel(float* _s_axis, int3 _tile_dim, const float3* _map_axis, const float3* _jacobian_axis,
+                                         const float* _s_x, const float* _s_y, const float* _s_z, float3 _grid_origin, float _inv_dx)
+{
+    int tile_idx = blockIdx.x;
+    int t_id     = threadIdx.x;
+    for (int i = 0; i < 4; i++) {
+        int voxel_idx    = t_id + i * 128;
+        int idx          = tile_idx * 512 + voxel_idx;
+        float3 pos       = _map_axis[idx];
+        float3 jac       = _jacobian_axis[idx];
+        float3 trans_pos = { pos.x - _grid_origin.x, pos.y - _grid_origin.y, pos.z - _grid_origin.z };
+        float3 s         = InterpMacN2(_tile_dim, _s_x, _s_y, _s_z, trans_pos, _inv_dx);
+        _s_axis[idx]     = s.x * jac.x + s.y * jac.y + s.z * jac.z;
+    }
+}
+
+void ContractSourceAxisAsync(DHMemory<float>& _s_axis, int3 _tile_dim, int3 _axis_tile_dim, const DHMemory<float3>& _map_axis, const DHMemory<float3>& _jacobian_axis,
+                             const DHMemory<float>& _s_x, const DHMemory<float>& _s_y, const DHMemory<float>& _s_z, float3 _grid_origin, float _dx, cudaStream_t _stream)
+{
+    float* s_axis                = _s_axis.dev_ptr_;
+    const float3* map_axis       = _map_axis.dev_ptr_;
+    const float3* jacobian_axis  = _jacobian_axis.dev_ptr_;
+    const float* s_x             = _s_x.dev_ptr_;
+    const float* s_y             = _s_y.dev_ptr_;
+    const float* s_z             = _s_z.dev_ptr_;
+    int axis_tile_num            = Prod(_axis_tile_dim);
+    float inv_dx                 = 1.0f / _dx;
+    ContractSourceAxisKernel<<<axis_tile_num, 128, 0, _stream>>>(s_axis, _tile_dim, map_axis, jacobian_axis, s_x, s_y, s_z, _grid_origin, inv_dx);
+}
+
 __global__ void AddFieldsKernel(float* _dst, float* _src1, float* _src2, float _coef2)
 {
     int tile_idx = blockIdx.x;

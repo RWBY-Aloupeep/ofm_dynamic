@@ -108,6 +108,47 @@ __global__ void AddRingVelocityKernel(float* u_axis, int3 axis_tile_dim, int com
     }
 }
 
+// Burgers profile, evaluated on one staggered component. Uniform along z.
+__global__ void AddColumnVelocityKernel(float* u_axis, int3 axis_tile_dim, int component,
+                                        float3 grid_origin, float dx, selfcheck::ColumnVortexSpec spec)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(axis_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        const int idx        = tile_idx * 512 + voxel_idx;
+
+        float3 offset;
+        if (component == 0)
+            offset = { 0.0f, 0.5f, 0.5f };
+        else if (component == 1)
+            offset = { 0.5f, 0.0f, 0.5f };
+        else
+            offset = { 0.5f, 0.5f, 0.0f };
+
+        const float px = grid_origin.x + (ijk.x + offset.x) * dx;
+        const float py = grid_origin.y + (ijk.y + offset.y) * dx;
+
+        const float rx = px - spec.centre_x;
+        const float ry = py - spec.centre_y;
+        const float r2 = rx * rx + ry * ry;
+        const float r  = sqrtf(r2);
+
+        float v = 0.0f;
+        if (component != 2 && r > 1e-6f) {
+            const float b2      = spec.core * spec.core;
+            const float u_theta = spec.circulation / (2.0f * 3.14159265359f * r) * (1.0f - expf(-r2 / b2));
+            // theta_hat = (-ry, rx) / r
+            v = (component == 0) ? (-u_theta * ry / r) : (u_theta * rx / r);
+        }
+        u_axis[idx] += v;
+    }
+}
+
 } // namespace
 
 void SetupSolver(ofm::OFM& solver, const SolverConfig& config, GPUTimer& profiler, cudaStream_t stream)
@@ -221,6 +262,92 @@ FieldStats ComputeFieldStats(ofm::OFM& solver, cudaStream_t stream)
             stats.max_vorticity = w;
     }
     return stats;
+}
+
+void AddColumnVortexAsync(ofm::OFM& solver, const ColumnVortexSpec& spec, bool project, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const int3 y_tile_dim = { td.x, td.y + 1, td.z };
+    const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
+
+    AddColumnVelocityKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+        solver.init_u_x_->dev_ptr_, x_tile_dim, 0, solver.grid_origin_, solver.dx_, spec);
+    AddColumnVelocityKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
+        solver.init_u_y_->dev_ptr_, y_tile_dim, 1, solver.grid_origin_, solver.dx_, spec);
+    AddColumnVelocityKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(
+        solver.init_u_z_->dev_ptr_, z_tile_dim, 2, solver.grid_origin_, solver.dx_, spec);
+
+    if (project)
+        ProjectCurrentVelocityAsync(solver, stream);
+}
+
+ColumnDiag MeasureColumnVortex(ofm::OFM& solver, float centre_x, float centre_y, cudaStream_t stream)
+{
+    const int3 td = solver.tile_dim_;
+    ofm::GetCenteralVecAsync(*(solver.u_), td, *(solver.init_u_x_), *(solver.init_u_y_), *(solver.init_u_z_), stream);
+    ofm::GetVorNormAsync(*(solver.vor_norm_), td, *(solver.u_), solver.dx_, stream);
+    solver.u_->DevToHostAsync(stream);
+    solver.vor_norm_->DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const float dx = solver.dx_;
+
+    ColumnDiag diag = { 0.0f, 0.0f, 0.0f, true };
+
+    // Peak vorticity. vor_norm_ is written in plain x-major order.
+    for (int i = 0; i < nx * ny * nz; i++) {
+        const float w = solver.vor_norm_->host_ptr_[i];
+        if (!isfinite(w)) {
+            diag.valid = false;
+            break;
+        }
+        if (w > diag.max_vorticity)
+            diag.max_vorticity = w;
+    }
+    if (!diag.valid)
+        return diag;
+
+    // Azimuthal velocity binned by radius, averaged over azimuth and over the
+    // whole column. solver.u_ is in tiled order, so it has to be indexed through
+    // IjkToIdx rather than read straight through.
+    const float r_max      = 0.45f;
+    const int bin_num      = static_cast<int>(r_max / dx);
+    std::vector<double> sum(bin_num, 0.0);
+    std::vector<int> count(bin_num, 0);
+
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++) {
+            const float px = solver.grid_origin_.x + (i + 0.5f) * dx;
+            const float py = solver.grid_origin_.y + (j + 0.5f) * dx;
+            const float rx = px - centre_x;
+            const float ry = py - centre_y;
+            const float r  = sqrtf(rx * rx + ry * ry);
+            const int bin  = static_cast<int>(r / dx);
+            if (bin >= bin_num || r < 1e-6f)
+                continue;
+            for (int k = 0; k < nz; k++) {
+                const float3 v = solver.u_->host_ptr_[IjkToIdx(td, { i, j, k })];
+                if (!isfinite(v.x) || !isfinite(v.y)) {
+                    diag.valid = false;
+                    return diag;
+                }
+                sum[bin] += (-v.x * ry + v.y * rx) / r;
+                count[bin]++;
+            }
+        }
+
+    for (int b = 0; b < bin_num; b++) {
+        if (count[b] == 0)
+            continue;
+        const float mean = static_cast<float>(sum[b] / count[b]);
+        if (mean > diag.u_theta_peak) {
+            diag.u_theta_peak = mean;
+            diag.r_peak       = (b + 0.5f) * dx;
+        }
+    }
+    return diag;
 }
 
 HostField DownloadVorticityNorm(ofm::OFM& solver, cudaStream_t stream)

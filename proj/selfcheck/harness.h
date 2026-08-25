@@ -34,6 +34,24 @@ struct RingSpec {
     float circulation;
 };
 
+// A columnar vortex aligned with +z and uniform in z, carrying the Burgers
+// profile U_theta(r) = (Gamma / 2 pi r)(1 - exp(-r^2 / b_w^2)) (Tohidi et al.
+// 2018, Eq. 7 -- the model the fire whirl literature fits to measured cores).
+struct ColumnVortexSpec {
+    float centre_x;
+    float centre_y;
+    float core;        // b_w
+    float circulation; // Gamma_inf
+};
+
+// Radial diagnostics of a columnar vortex, measured about its axis.
+struct ColumnDiag {
+    float max_vorticity;  // peak |omega|, at the axis
+    float r_peak;         // radius where the azimuthal velocity is largest
+    float u_theta_peak;
+    bool valid;
+};
+
 // Cell-centered scalar field pulled back to the host, in plain x-major order.
 struct HostField {
     int3 dim;
@@ -64,5 +82,12 @@ FieldStats ComputeFieldStats(ofm::OFM& solver, cudaStream_t stream);
 
 // Cell-centered vorticity magnitude, de-tiled into x-major host order.
 HostField DownloadVorticityNorm(ofm::OFM& solver, cudaStream_t stream);
+
+// Superposes a columnar Burgers vortex onto the current velocity state.
+void AddColumnVortexAsync(ofm::OFM& solver, const ColumnVortexSpec& spec, bool project, cudaStream_t stream);
+
+// Peak vorticity and the radius of peak azimuthal velocity, by radial binning
+// about the axis over the whole column.
+ColumnDiag MeasureColumnVortex(ofm::OFM& solver, float centre_x, float centre_y, cudaStream_t stream);
 
 } // namespace selfcheck

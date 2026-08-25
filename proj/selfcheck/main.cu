@@ -315,6 +315,150 @@ int RunLeapfrogRings(int total_steps, int diag_every, const char* csv_path, Ring
 
 } // namespace
 
+struct BurgersParams {
+    float core        = 0.06f;   // b_w at t = 0, ~7.7 cells at 128^3
+    float circulation = 0.05f;
+    float viscosity   = 2.25e-4f;
+};
+
+// Verification of the source-term path integral against an exact solution.
+//
+// A columnar vortex carrying the Burgers profile (Tohidi et al. 2018, Eq. 7)
+// with no imposed axial strain spreads by viscosity alone, and its core obeys
+//
+//     b(t)^2 = b(0)^2 + 4 nu t
+//
+// exactly. Because the peak vorticity of that profile is Gamma / (pi b^2) and
+// circulation is conserved, the core ratio can be read straight off the peak
+// vorticity without needing Gamma at all:
+//
+//     b(t)^2 / b(0)^2 = omega_max(0) / omega_max(t)
+//
+// so the viscosity the solver actually applied comes back as
+//
+//     nu_eff = b(0)^2 (omega_max(0)/omega_max(t) - 1) / (4 t)
+//
+// and the test is whether nu_eff recovers the nu that was asked for. Running the
+// same case at nu = 0 measures the numerical dissipation floor in the same
+// units, which is what nu_eff has to stand clear of for the result to mean
+// anything. The radius of peak azimuthal velocity is reported alongside as an
+// independent estimator, since Burgers puts it at r = 1.12091 b_w.
+int RunBurgersViscous(int total_steps, int diag_every, const char* csv_path, BurgersParams bp,
+                      float dt, int reinit_every, int rk_order, int res_tiles)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim     = { res_tiles, res_tiles, res_tiles }; // res_tiles*8 cubed, unit cube
+    config.len_y        = 1.0f;
+    config.cg_iter      = 15;
+    config.reinit_every = reinit_every;
+    config.rk_order     = rk_order;
+
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+
+    solver.use_source_term_ = true;
+    solver.viscosity_       = bp.viscosity;
+
+    const float dx       = solver.dx_;
+    const float centre_x = 0.5f;
+    const float centre_y = 0.5f;
+
+    const selfcheck::ColumnVortexSpec spec = { centre_x, centre_y, bp.core, bp.circulation };
+    selfcheck::AddColumnVortexAsync(solver, spec, true, stream);
+    cudaStreamSynchronize(stream);
+
+    // Explicit diffusion is applied over the advection interval, which the
+    // leapfrog branch of the cycle stretches to 2*dt. Warn rather than fail: the
+    // run may still be usable, but the number should not be trusted silently.
+    const float diffusion_number = bp.viscosity * 2.0f * dt / (dx * dx);
+    printf("burgers: b0=%.4f (%.1f cells)  Gamma=%.3f  nu=%.3e  dt=%.5f  n=%d  rk=%d\n",
+           bp.core, bp.core / dx, bp.circulation, bp.viscosity, dt, reinit_every, rk_order);
+    printf("         explicit diffusion number nu*2dt/dx^2 = %.4f%s\n",
+           diffusion_number, diffusion_number > 0.16f ? "  [WARNING: above the ~1/6 stability limit]" : "");
+
+    const selfcheck::ColumnDiag d0 = selfcheck::MeasureColumnVortex(solver, centre_x, centre_y, stream);
+    if (!d0.valid || d0.max_vorticity <= 0.0f) {
+        printf("initial measurement failed\n");
+        return 1;
+    }
+    printf("         seeded: max|w|=%.4f  r_peak=%.4f  r_peak/1.12091=%.4f (b0=%.4f)\n\n",
+           d0.max_vorticity, d0.r_peak, d0.r_peak / 1.12091f, bp.core);
+
+    FILE* csv = fopen(csv_path, "w");
+    if (!csv) {
+        printf("cannot open %s\n", csv_path);
+        return 1;
+    }
+    fprintf(csv, "step,time,max_vorticity,r_peak,b_from_vorticity,b_from_r_peak,b_analytic,nu_eff,nu_rel_err\n");
+
+    printf("%6s %8s %10s %10s %10s %10s %12s %10s\n",
+           "step", "t", "max|w|", "b_vor", "b_rpeak", "b_exact", "nu_eff", "err");
+
+    const int cycle_steps = config.reinit_every;
+    int step              = 0;
+    int next_diag         = 0;
+    double last_rel_err   = 0.0;
+    double last_nu_eff    = 0.0;
+
+    while (step < total_steps) {
+        profiler.beginFrame();
+        for (int i = 0; i < cycle_steps; i++)
+            solver.AdvanceAsync(dt, stream);
+        solver.ReinitAsync(dt, stream);
+        cudaStreamSynchronize(stream);
+        step += cycle_steps;
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("CUDA error at step %d: %s\n", step, cudaGetErrorString(err));
+            fclose(csv);
+            return 1;
+        }
+
+        if (step < next_diag)
+            continue;
+        next_diag = step + diag_every;
+
+        const selfcheck::ColumnDiag d = selfcheck::MeasureColumnVortex(solver, centre_x, centre_y, stream);
+        if (!d.valid || d.max_vorticity <= 0.0f) {
+            printf("non-finite field at step %d -- aborting\n", step);
+            fclose(csv);
+            return 1;
+        }
+
+        const double t          = step * static_cast<double>(dt);
+        const double b0_sq      = static_cast<double>(bp.core) * bp.core;
+        const double b_vor_sq   = b0_sq * d0.max_vorticity / d.max_vorticity;
+        const double b_vor      = std::sqrt(b_vor_sq);
+        const double b_rpeak    = d.r_peak / 1.12091;
+        const double b_exact    = std::sqrt(b0_sq + 4.0 * bp.viscosity * t);
+        const double nu_eff     = (b_vor_sq - b0_sq) / (4.0 * t);
+        const double rel_err    = (bp.viscosity > 0.0f) ? (nu_eff / bp.viscosity - 1.0) : 0.0;
+        last_rel_err            = rel_err;
+        last_nu_eff             = nu_eff;
+
+        fprintf(csv, "%d,%.5f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6e,%.6f\n",
+                step, t, d.max_vorticity, d.r_peak, b_vor, b_rpeak, b_exact, nu_eff, rel_err);
+        printf("%6d %8.3f %10.4f %10.5f %10.5f %10.5f %12.4e %9.2f%%\n",
+               step, t, d.max_vorticity, b_vor, b_rpeak, b_exact, nu_eff, 100.0 * rel_err);
+    }
+
+    fclose(csv);
+    printf("\n=== Burgers viscous channel ===\n");
+    if (bp.viscosity > 0.0f) {
+        printf("nu asked for : %.6e\n", bp.viscosity);
+        printf("nu recovered : %.6e   (%.2f%% relative error at the last sample)\n", last_nu_eff, 100.0 * last_rel_err);
+    } else {
+        printf("nu = 0 run: the recovered %.6e is the numerical dissipation floor,\n", last_nu_eff);
+        printf("expressed as an equivalent viscosity. A viscous run is only meaningful\n");
+        printf("well above this number.\n");
+    }
+    printf("csv: %s\n", csv_path);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     std::string test        = "leapfrog3d";
@@ -322,8 +466,11 @@ int main(int argc, char** argv)
     int diag_every          = 10;
     std::string csv_path    = "leapfrog3d.csv";
     RingParams rp;
+    BurgersParams bp;
+    bool dt_set      = false;
     float dt         = 1.0f / 60.0f;
     int reinit_every = 1; // 1 = one-step (OFM); LFM runs its Figure 14 at 10
+    int res_tiles    = 16; // burgers only: 16 tiles per side = 128^3
     int rk_order     = 3; // TVD-RK3, the order OFM shipped with
 
     for (int i = 1; i < argc; i++) {
@@ -338,28 +485,51 @@ int main(int argc, char** argv)
             csv_path = argv[++i];
         else if (arg == "--radius" && i + 1 < argc)
             rp.radius = static_cast<float>(std::atof(argv[++i]));
-        else if (arg == "--core" && i + 1 < argc)
+        else if (arg == "--core" && i + 1 < argc) {
             rp.core = static_cast<float>(std::atof(argv[++i]));
-        else if (arg == "--circulation" && i + 1 < argc)
+            bp.core = rp.core;
+        }
+        else if (arg == "--circulation" && i + 1 < argc) {
             rp.circulation = static_cast<float>(std::atof(argv[++i]));
+            bp.circulation = rp.circulation;
+        }
         else if (arg == "--spacing" && i + 1 < argc)
             rp.spacing = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--reinit-every" && i + 1 < argc)
             reinit_every = std::atoi(argv[++i]);
         else if (arg == "--rk-order" && i + 1 < argc)
             rk_order = std::atoi(argv[++i]);
-        else if (arg == "--dt" && i + 1 < argc)
-            dt = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--res-tiles" && i + 1 < argc)
+            res_tiles = std::atoi(argv[++i]);
+        else if (arg == "--nu" && i + 1 < argc)
+            bp.viscosity = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--dt" && i + 1 < argc) {
+            dt     = static_cast<float>(std::atof(argv[++i]));
+            dt_set = true;
+        }
         else if (arg == "--help") {
             printf("usage: selfcheck [--test leapfrog3d] [--steps N] [--diag-every N] [--csv PATH]\n"
                    "                 [--radius R] [--core S] [--circulation G] [--spacing D]\n"
-                   "                 [--reinit-every N] [--rk-order 2|3|4] [--dt DT]\n");
+                   "                 [--reinit-every N] [--rk-order 2|3|4] [--dt DT]\n"
+                   "       selfcheck --test burgers [--nu NU] [--core B0] [--circulation G]\n"
+                   "                 [--steps N] [--diag-every N] [--reinit-every N] [--rk-order 2|3|4]\n"
+                   "                 [--res-tiles T]  (T tiles per side, 8T cells; default 16 = 128^3)\n");
             return 0;
         }
     }
 
     if (test == "leapfrog3d")
         return RunLeapfrogRings(total_steps, diag_every, csv_path.c_str(), rp, dt, reinit_every, rk_order);
+
+    if (test == "burgers") {
+        // The viscous case needs a finer step than the ring case to keep explicit
+        // diffusion stable; only override when the user did not ask for one.
+        if (!dt_set)
+            dt = 1.0f / 120.0f;
+        if (csv_path == "leapfrog3d.csv")
+            csv_path = "burgers.csv";
+        return RunBurgersViscous(total_steps, diag_every, csv_path.c_str(), bp, dt, reinit_every, rk_order, res_tiles);
+    }
 
     printf("unknown test: %s\n", test.c_str());
     return 1;

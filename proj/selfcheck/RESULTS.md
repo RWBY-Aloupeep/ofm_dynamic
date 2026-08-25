@@ -170,7 +170,111 @@ leap count, and this table is the first measurement of it.
 Raising the leap count, if it is wanted as a published comparison, needs a different ring
 configuration rather than a different scheme. That search is not done here.
 
-## Separate finding: the source-term channel is not wired up
+## D5: the source-term channel, wired and verified
+
+`RKAxisAccumulateForceAsync` having no caller in either upstream repository left
+the baroclinic, drag and buoyancy terms with no way into the solver, so the channel
+was written against LFM's Algorithm 1 and Eq. (8). This section is the verification.
+
+### What was implemented
+
+Algorithm 1 puts the source in two places, and both are needed:
+
+- **`OFM::AdvanceAsync`** (lines 1, 6, 12) adds the source to the velocity being
+  advected, over the same interval it is advected across, evaluated on the velocity
+  that transports it. Those three lines differ only in their interval, which the
+  leapfrog schedule already carries, so they collapse to one expression.
+- **`OFM::ReinitAsync`** (lines 5, 10, 16) accumulates the path integral into the
+  initial-time impulse. This has to happen inside the forward march, before the
+  pullback reads `init_u_`.
+
+Eq. (8) places the quadrature points at step **midpoints**. The upstream kernel
+samples at the *start* of a step and marches a whole step in the same pass, which
+is a left-endpoint rule, so it is not used here; the solver marches the forward map
+in half steps and contracts the source with the forward Jacobian in between. Two
+kernels were added for that: a staggered seven-point Laplacian whose out-of-range
+neighbours clamp onto the centre sample (a free-slip wall, matching what
+`SetWallBc*Kernel` imposes on the tangential components), and a contraction of the
+source with the map Jacobian at a given quadrature point.
+
+`use_source_term_` is off and `viscosity_` is zero by default, so the solver behaves
+exactly as it did before. The leapfrog ring case still measures 1 leap.
+
+### How it is verified
+
+A columnar vortex carrying the Burgers profile with no imposed axial strain spreads
+by viscosity alone and its core obeys `b(t)^2 = b(0)^2 + 4*nu*t` exactly. The Burgers
+profile is the model the fire whirl literature fits to measured cores -- several
+studies report it as the best fit for a quasi-steady on-source fire whirl, its
+normalised profile is self-similar, and its azimuthal velocity peaks at
+`r = 1.12091 b_w` (Tohidi et al. 2018, Eq. 6-7).
+
+The estimator needs no circulation input. Peak vorticity of the profile is
+`Gamma / (pi b^2)` and circulation is conserved, so
+
+    b(t)^2 / b(0)^2 = w_max(0) / w_max(t)
+
+and the viscosity the solver actually applied comes back as
+
+    nu_eff = b(0)^2 * (w_max(0)/w_max(t) - 1) / (4t)
+
+Running the same case at `nu = 0` measures the numerical dissipation floor in the
+same units, which is what `nu_eff` has to stand clear of. The radius of peak
+azimuthal velocity is reported alongside as an independent estimator.
+
+This is **numerical verification** -- whether the code solves the equations it
+claims to -- not physical validation. Tohidi records that some studies dispute the
+Burgers profile as a description of real fire whirls; that bears on physical
+similarity, not on its value as an exact solution of the equations being solved.
+
+### Result: the channel recovers the viscosity it is given
+
+Measured on klone (`gpu-l40s`), unit cube, `b(0) = 0.06`, `Gamma = 0.05`, `n = 1`:
+
+| grid | dt | simulated | `nu = 0` floor | `nu` asked | `nu` recovered | error |
+|---|---|---|---|---|---|---|
+| 128^3 (b0 = 7.7 cells) | 1/480 | 1.0 s | 7.02e-5 | 1e-3 | 1.017e-3 | +1.69% |
+| 256^3 (b0 = 15.4 cells) | 1/960 | 1.0 s | 1.15e-5 | 1e-3 | 9.970e-4 | **-0.30%** |
+
+**The 256^3 run passes the 1% criterion**, and the error is steady across the whole
+run (-0.40% at the first sample, -0.30% at the last) rather than drifting. The second
+estimator agrees there too: `r_peak / 1.12091` tracks the analytic core to about 1%
+(0.06796 vs 0.06785, 0.08189 vs 0.08127).
+
+**The residual is the numerical dissipation floor, not the channel.** The floor is
+7.0% of the imposed `nu` at 128^3 and 1.1% at 256^3, and the error follows it down,
+1.69% to 0.30%. Refining the grid by two cuts the floor by 6.1x.
+
+A coarser earlier sweep at `nu = 2.25e-4` on 128^3 shows the same thing from the
+other side. There the floor is 7.8% of `nu`, and the error is +2.33% at `n = 1` and
+-3.74% at `n = 5`; both drift toward each other as the run proceeds (from +3.72% and
+-5.83%), which is a startup transient rather than a wrong rate. That configuration
+does not pass 1%, and should not be expected to at that ratio of floor to signal.
+
+### A side finding: numerical dissipation scales with reinitialization count
+
+The `nu = 0` runs give a controlled measurement that the leapfrog case could not.
+At the same grid and the same simulated time of 1 s on 128^3, taking 480 steps
+instead of 120 -- four times as many reinitializations -- raises the floor from
+1.98e-5 to 7.02e-5, a factor of 3.55.
+
+So at `n = 1` the numerical dissipation is charged per reinitialization, not per unit
+of simulated time, and **refining the time step makes the solution more diffusive,
+not less**. That explains the earlier observation that halving `dt` changed nothing
+in the leapfrog case, and it is a second reason to raise the reinitialization
+interval rather than lower `dt`.
+
+### Reproducing
+
+```
+./build/selfcheck --test burgers --res-tiles 32 --nu 1e-3 --dt 0.00104167 \
+                  --steps 960 --diag-every 240 --reinit-every 1 --csv burgers.csv
+```
+
+`--nu 0` gives the floor for the same configuration. `--res-tiles T` sets the grid to
+`8T` cells per side.
+
+## The source-term channel: how it was found missing
 
 `RKAxisAccumulateForceAsync` — the path integral that carries external forces and
 viscosity along the flow map, in both RK2 and RK4 variants — is fully implemented

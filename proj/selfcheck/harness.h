@@ -90,4 +90,17 @@ void AddColumnVortexAsync(ofm::OFM& solver, const ColumnVortexSpec& spec, bool p
 // about the axis over the whole column.
 ColumnDiag MeasureColumnVortex(ofm::OFM& solver, float centre_x, float centre_y, cudaStream_t stream);
 
+// Line integral of a staggered vector field around a circle of the given radius,
+// centred on (centre_x, centre_y) in the mid-z plane, traversed counter-clockwise.
+//
+// Applied to the velocity this is the circulation of that loop. Applied to a
+// source channel's accumulator it is that channel's contribution to the loop's
+// circulation over the cycle, because the accumulator holds the same pullback
+// that the impulse itself is built from.
+//
+// Clobbers solver.u_, which the other diagnostics here also use as scratch.
+double CirculationOnCircle(ofm::OFM& solver,
+                           const ofm::DHMemory<float>& field_x, const ofm::DHMemory<float>& field_y, const ofm::DHMemory<float>& field_z,
+                           float centre_x, float centre_y, float radius, int samples, cudaStream_t stream);
+
 } // namespace selfcheck

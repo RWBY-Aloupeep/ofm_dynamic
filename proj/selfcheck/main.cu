@@ -459,6 +459,152 @@ int RunBurgersViscous(int total_steps, int diag_every, const char* csv_path, Bur
     return 0;
 }
 
+// D1: circulation budget and attribution, checked two ways against an exact solution.
+//
+// For a material loop C, the flow-map solution gives the circulation directly:
+//
+//     Gamma(t) = closed_integral_C u.dl = closed_integral_C0 [ m0 + sum_k sum_i dt F^T s_k ] . dX
+//              = Gamma(0) + sum_k dGamma_k
+//
+// because u = m - grad(phi) and the gradient integrates to zero around a loop.
+// So each source channel's accumulator, integrated around the loop's preimage,
+// IS that channel's contribution to the circulation. That separation is what an
+// Eulerian solver cannot do and the flow map gives for free.
+//
+// The test case is the diffusing columnar Burgers vortex again, for which every
+// leg of that identity is known in closed form. Its radial velocity is zero, so a
+// circle of fixed radius is a material loop and stays the loop's own preimage at
+// every cycle start -- which is exactly the frame the accumulators live in.
+//
+//     Gamma(r,t) = Gamma_inf * (1 - exp(-r^2 / b(t)^2)),   b(t)^2 = b0^2 + 4 nu t
+//
+// Three quantities are compared, all as changes since t = 0 so that the
+// discretisation of the seeded field cancels:
+//
+//     direct    measured closed_integral u.dl on the loop
+//     budget    sum over cycles and channels of the accumulator line integrals
+//     analytic  the expression above
+//
+// budget vs direct is the dual-path check; budget vs analytic is the attribution
+// error the plan puts a 1% bound on.
+int RunAttribution(int total_steps, int diag_every, const char* csv_path, BurgersParams bp,
+                   float dt, int reinit_every, int rk_order, int res_tiles, float loop_radius)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim     = { res_tiles, res_tiles, res_tiles };
+    config.len_y        = 1.0f;
+    config.cg_iter      = 15;
+    config.reinit_every = reinit_every;
+    config.rk_order     = rk_order;
+
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+
+    solver.use_source_term_  = true;
+    solver.viscosity_        = bp.viscosity;
+    solver.track_attribution_ = true;
+
+    const float dx       = solver.dx_;
+    const float centre_x = 0.5f;
+    const float centre_y = 0.5f;
+    const float r_loop   = (loop_radius > 0.0f) ? loop_radius : bp.core;
+    const int samples    = 512;
+
+    const selfcheck::ColumnVortexSpec spec = { centre_x, centre_y, bp.core, bp.circulation };
+    selfcheck::AddColumnVortexAsync(solver, spec, true, stream);
+    cudaStreamSynchronize(stream);
+
+    const double b0_sq = static_cast<double>(bp.core) * bp.core;
+    auto gamma_exact = [&](double t) {
+        const double b_sq = b0_sq + 4.0 * bp.viscosity * t;
+        return bp.circulation * (1.0 - std::exp(-static_cast<double>(r_loop) * r_loop / b_sq));
+    };
+
+    const double gamma0 = selfcheck::CirculationOnCircle(
+        solver, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_,
+        centre_x, centre_y, r_loop, samples, stream);
+
+    printf("attribution: grid %d^3  b0=%.4f (%.1f cells)  Gamma=%.4f  nu=%.3e  n=%d\n",
+           res_tiles * 8, bp.core, bp.core / dx, bp.circulation, bp.viscosity, reinit_every);
+    printf("             loop radius %.4f (%.2f b0)   seeded Gamma(loop) = %.6f  (exact %.6f)\n\n",
+           r_loop, r_loop / bp.core, gamma0, gamma_exact(0.0));
+
+    FILE* csv = fopen(csv_path, "w");
+    if (!csv) {
+        printf("cannot open %s\n", csv_path);
+        return 1;
+    }
+    fprintf(csv, "step,time,gamma_direct,gamma_budget,gamma_exact,d_direct,d_budget,d_exact,"
+                 "g_viscous,g_external,dual_path_err,attribution_err\n");
+
+    printf("%6s %8s %11s %11s %11s %11s %11s\n",
+           "step", "t", "dG direct", "dG budget", "dG exact", "dual-path", "attrib");
+
+    double acc_gamma[ofm::kChanNum] = { 0.0, 0.0 };
+    const int cycle_steps = config.reinit_every;
+    int step = 0, next_diag = 0;
+    double last_dual = 0.0, last_attr = 0.0;
+
+    while (step < total_steps) {
+        profiler.beginFrame();
+        for (int i = 0; i < cycle_steps; i++)
+            solver.AdvanceAsync(dt, stream);
+        solver.ReinitAsync(dt, stream);
+        cudaStreamSynchronize(stream);
+        step += cycle_steps;
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("CUDA error at step %d: %s\n", step, cudaGetErrorString(err));
+            fclose(csv);
+            return 1;
+        }
+
+        // The accumulators are cleared at every reinitialization, so their line
+        // integrals have to be taken every cycle, not only on diagnostic steps.
+        for (int k = 0; k < ofm::kChanNum; k++)
+            acc_gamma[k] += selfcheck::CirculationOnCircle(
+                solver, *solver.acc_x_[k], *solver.acc_y_[k], *solver.acc_z_[k],
+                centre_x, centre_y, r_loop, samples, stream);
+
+        if (step < next_diag)
+            continue;
+        next_diag = step + diag_every;
+
+        const double t        = step * static_cast<double>(dt);
+        const double direct   = selfcheck::CirculationOnCircle(
+            solver, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_,
+            centre_x, centre_y, r_loop, samples, stream);
+        const double budget_d = acc_gamma[ofm::kChanViscous] + acc_gamma[ofm::kChanExternal];
+        const double exact_d  = gamma_exact(t) - gamma_exact(0.0);
+
+        const double d_direct = direct - gamma0;
+        const double scale    = std::fabs(exact_d) > 1e-12 ? std::fabs(exact_d) : 1.0;
+        const double dual_err = (budget_d - d_direct) / scale;
+        const double attr_err = (budget_d - exact_d) / scale;
+        last_dual = dual_err;
+        last_attr = attr_err;
+
+        fprintf(csv, "%d,%.5f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.6f,%.6f\n",
+                step, t, direct, gamma0 + budget_d, gamma_exact(t),
+                d_direct, budget_d, exact_d,
+                acc_gamma[ofm::kChanViscous], acc_gamma[ofm::kChanExternal], dual_err, attr_err);
+        printf("%6d %8.3f %11.6f %11.6f %11.6f %10.2f%% %10.2f%%\n",
+               step, t, d_direct, budget_d, exact_d, 100.0 * dual_err, 100.0 * attr_err);
+    }
+
+    fclose(csv);
+    printf("\n=== D1 circulation budget ===\n");
+    printf("channel split at the last sample:  viscous %.8f   external %.8f\n",
+           acc_gamma[ofm::kChanViscous], acc_gamma[ofm::kChanExternal]);
+    printf("dual-path (budget vs direct)    : %.2f%%\n", 100.0 * last_dual);
+    printf("attribution (budget vs analytic): %.2f%%\n", 100.0 * last_attr);
+    printf("csv: %s\n", csv_path);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     std::string test        = "leapfrog3d";
@@ -471,6 +617,7 @@ int main(int argc, char** argv)
     float dt         = 1.0f / 60.0f;
     int reinit_every = 1; // 1 = one-step (OFM); LFM runs its Figure 14 at 10
     int res_tiles    = 16; // burgers only: 16 tiles per side = 128^3
+    float loop_radius = 0.0f; // attribution only: 0 means use the core radius
     int rk_order     = 3; // TVD-RK3, the order OFM shipped with
 
     for (int i = 1; i < argc; i++) {
@@ -501,6 +648,8 @@ int main(int argc, char** argv)
             rk_order = std::atoi(argv[++i]);
         else if (arg == "--res-tiles" && i + 1 < argc)
             res_tiles = std::atoi(argv[++i]);
+        else if (arg == "--loop-radius" && i + 1 < argc)
+            loop_radius = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--nu" && i + 1 < argc)
             bp.viscosity = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--dt" && i + 1 < argc) {
@@ -513,13 +662,23 @@ int main(int argc, char** argv)
                    "                 [--reinit-every N] [--rk-order 2|3|4] [--dt DT]\n"
                    "       selfcheck --test burgers [--nu NU] [--core B0] [--circulation G]\n"
                    "                 [--steps N] [--diag-every N] [--reinit-every N] [--rk-order 2|3|4]\n"
-                   "                 [--res-tiles T]  (T tiles per side, 8T cells; default 16 = 128^3)\n");
+                   "                 [--res-tiles T]  (T tiles per side, 8T cells; default 16 = 128^3)\n"
+                   "       selfcheck --test attribution [--nu NU] [--loop-radius R] [--reinit-every N]\n"
+                   "                 [--res-tiles T] [--steps N] [--diag-every N]\n");
             return 0;
         }
     }
 
     if (test == "leapfrog3d")
         return RunLeapfrogRings(total_steps, diag_every, csv_path.c_str(), rp, dt, reinit_every, rk_order);
+
+    if (test == "attribution") {
+        if (!dt_set)
+            dt = 1.0f / 120.0f;
+        if (csv_path == "leapfrog3d.csv")
+            csv_path = "attribution.csv";
+        return RunAttribution(total_steps, diag_every, csv_path.c_str(), bp, dt, reinit_every, rk_order, res_tiles, loop_radius);
+    }
 
     if (test == "burgers") {
         // The viscous case needs a finer step than the ring case to keep explicit

@@ -6,6 +6,16 @@
 #include <vector>
 
 namespace ofm {
+
+// Source channels. They are integrated together for the physics, but kept apart
+// so that the circulation budget can say how much of Gamma each one contributed.
+// Adding a channel means adding an entry here and a case in ComputeSourceChannelAsync.
+enum SourceChannel : int {
+    kChanViscous  = 0, // nu * lap(u), built from the velocity
+    kChanExternal = 1, // f_{x,y,z}_, written by the caller
+    kChanNum      = 2
+};
+
 class OFM {
 public:
     // domain
@@ -98,6 +108,16 @@ public:
     std::shared_ptr<DHMemory<float>> s_axis_y_;
     std::shared_ptr<DHMemory<float>> s_axis_z_;
 
+    // Circulation attribution (D1). When on, each source channel's contribution to
+    // the impulse is accumulated separately over the cycle, in the frame of the
+    // cycle's start. A line integral of acc_[k] around a material loop's preimage
+    // is that channel's contribution to the loop's circulation over the cycle.
+    // Reset at the start of every cycle; the physics is unaffected either way.
+    bool track_attribution_ = false;
+    std::vector<std::shared_ptr<DHMemory<float>>> acc_x_;
+    std::vector<std::shared_ptr<DHMemory<float>>> acc_y_;
+    std::vector<std::shared_ptr<DHMemory<float>>> acc_z_;
+
     // bfecc clamp
     bool use_bfecc_clamp_;
 
@@ -122,5 +142,7 @@ public:
     void ProjectAsync(cudaStream_t _stream);
     // Fills src_{x,y,z}_ with nu*lap(u) + f for the velocity passed in.
     void ComputeSourceAsync(const DHMemory<float>& _u_x, const DHMemory<float>& _u_y, const DHMemory<float>& _u_z, cudaStream_t _stream);
+    // Fills src_{x,y,z}_ with a single channel's contribution to the source.
+    void ComputeSourceChannelAsync(int _channel, const DHMemory<float>& _u_x, const DHMemory<float>& _u_y, const DHMemory<float>& _u_z, cudaStream_t _stream);
 };
 }

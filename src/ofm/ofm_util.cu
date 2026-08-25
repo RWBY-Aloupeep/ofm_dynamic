@@ -882,7 +882,7 @@ void RKAxisAccumulateForceAsync(int _rk_order, DHMemory<float3>& _psi_axis, DHMe
 // neighbours are clamped onto the centre sample, so their contribution
 // vanishes -- a zero-gradient (free-slip) wall, which is what the wall boundary
 // condition in SetWallBc*Kernel imposes on the tangential components.
-__global__ void LaplacianAxisKernel(float* _lap_axis, int3 _axis_tile_dim, int3 _max_ijk, const float* _u_axis, float _inv_dx_sqr)
+__global__ void LaplacianAxisKernel(float* _lap_axis, int3 _axis_tile_dim, int3 _max_ijk, const float* _u_axis, float _scaled_inv_dx_sqr)
 {
     int tile_idx  = blockIdx.x;
     int3 tile_ijk = TileIdxToIjk(_axis_tile_dim, tile_idx);
@@ -914,17 +914,19 @@ __global__ void LaplacianAxisKernel(float* _lap_axis, int3 _axis_tile_dim, int3 
                 nb.z = nb.z < 0 ? 0 : (nb.z > _max_ijk.z ? _max_ijk.z : nb.z);
                 lap += _u_axis[IjkToIdx(_axis_tile_dim, nb)] - centre;
             }
-        _lap_axis[idx] = lap * _inv_dx_sqr;
+        _lap_axis[idx] = lap * _scaled_inv_dx_sqr;
     }
 }
 
-void LaplacianAxisAsync(DHMemory<float>& _lap_axis, int3 _axis_tile_dim, int3 _max_ijk, const DHMemory<float>& _u_axis, float _dx, cudaStream_t _stream)
+// _scale multiplies the result, so passing the kinematic viscosity gives nu*lap(u)
+// in one pass instead of a separate scaling kernel.
+void LaplacianAxisAsync(DHMemory<float>& _lap_axis, int3 _axis_tile_dim, int3 _max_ijk, const DHMemory<float>& _u_axis, float _dx, float _scale, cudaStream_t _stream)
 {
     float* lap_axis     = _lap_axis.dev_ptr_;
     const float* u_axis = _u_axis.dev_ptr_;
     int axis_tile_num   = Prod(_axis_tile_dim);
-    float inv_dx_sqr    = 1.0f / (_dx * _dx);
-    LaplacianAxisKernel<<<axis_tile_num, 128, 0, _stream>>>(lap_axis, _axis_tile_dim, _max_ijk, u_axis, inv_dx_sqr);
+    float scaled        = _scale / (_dx * _dx);
+    LaplacianAxisKernel<<<axis_tile_num, 128, 0, _stream>>>(lap_axis, _axis_tile_dim, _max_ijk, u_axis, scaled);
 }
 
 // One quadrature sample of the Eq. (8) path integral: evaluate the source field

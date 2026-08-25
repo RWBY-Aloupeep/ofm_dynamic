@@ -81,6 +81,14 @@ void OFM::Alloc(int3 _tile_dim, int _reinit_every)
     s_axis_x_ = std::make_shared<DHMemory<float>>(x_voxel_num);
     s_axis_y_ = std::make_shared<DHMemory<float>>(y_voxel_num);
     s_axis_z_ = std::make_shared<DHMemory<float>>(z_voxel_num);
+    acc_x_.resize(kChanNum);
+    acc_y_.resize(kChanNum);
+    acc_z_.resize(kChanNum);
+    for (int k = 0; k < kChanNum; k++) {
+        acc_x_[k] = std::make_shared<DHMemory<float>>(x_voxel_num);
+        acc_y_[k] = std::make_shared<DHMemory<float>>(y_voxel_num);
+        acc_z_[k] = std::make_shared<DHMemory<float>>(z_voxel_num);
+    }
     // The force field is read every step once source terms are on, so it must
     // start at zero rather than at whatever the allocation happened to contain.
     cudaMemset(f_x_->dev_ptr_, 0, x_voxel_num * sizeof(float));
@@ -208,6 +216,16 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
     ResetForwardFlowMapAsync(_stream);
     ResetBackwardFlowMapAsync(_stream);
 
+    // The accumulators live in the frame of this cycle's start, so they reset with
+    // the map. Their running total across cycles is the caller's to keep: it is a
+    // scalar per material loop, not a field.
+    if (use_source_term_ && track_attribution_)
+        for (int k = 0; k < kChanNum; k++) {
+            acc_x_[k]->ClearDevAsync(_stream);
+            acc_y_[k]->ClearDevAsync(_stream);
+            acc_z_[k]->ClearDevAsync(_stream);
+        }
+
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Backward flowmap");
         // Walk the cycle's velocity history backwards in time.
@@ -241,15 +259,31 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
             RKAxisAsync(rk_order_, *phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
             RKAxisAsync(rk_order_, *phi_z_, *F_z_, tile_dim_, z_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
 
-            ComputeSourceAsync(*mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], _stream);
+            // Without attribution the channels are summed once and contracted once.
+            // With it, each channel is contracted on its own so that its share of the
+            // impulse -- and so of the circulation -- can be read off separately. The
+            // sum reaching init_u_ is identical either way.
+            const int channel_num = track_attribution_ ? kChanNum : 1;
+            for (int k = 0; k < channel_num; k++) {
+                if (track_attribution_)
+                    ComputeSourceChannelAsync(k, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], _stream);
+                else
+                    ComputeSourceAsync(*mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], _stream);
 
-            ContractSourceAxisAsync(*s_axis_x_, tile_dim_, x_tile_dim, *phi_x_, *F_x_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
-            ContractSourceAxisAsync(*s_axis_y_, tile_dim_, y_tile_dim, *phi_y_, *F_y_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
-            ContractSourceAxisAsync(*s_axis_z_, tile_dim_, z_tile_dim, *phi_z_, *F_z_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
+                ContractSourceAxisAsync(*s_axis_x_, tile_dim_, x_tile_dim, *phi_x_, *F_x_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
+                ContractSourceAxisAsync(*s_axis_y_, tile_dim_, y_tile_dim, *phi_y_, *F_y_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
+                ContractSourceAxisAsync(*s_axis_z_, tile_dim_, z_tile_dim, *phi_z_, *F_z_, *src_x_, *src_y_, *src_z_, grid_origin_, dx_, _stream);
 
-            AddFieldsAsync(*init_u_x_, x_tile_dim, *init_u_x_, *s_axis_x_, _dt, _stream);
-            AddFieldsAsync(*init_u_y_, y_tile_dim, *init_u_y_, *s_axis_y_, _dt, _stream);
-            AddFieldsAsync(*init_u_z_, z_tile_dim, *init_u_z_, *s_axis_z_, _dt, _stream);
+                AddFieldsAsync(*init_u_x_, x_tile_dim, *init_u_x_, *s_axis_x_, _dt, _stream);
+                AddFieldsAsync(*init_u_y_, y_tile_dim, *init_u_y_, *s_axis_y_, _dt, _stream);
+                AddFieldsAsync(*init_u_z_, z_tile_dim, *init_u_z_, *s_axis_z_, _dt, _stream);
+
+                if (track_attribution_) {
+                    AddFieldsAsync(*acc_x_[k], x_tile_dim, *acc_x_[k], *s_axis_x_, _dt, _stream);
+                    AddFieldsAsync(*acc_y_[k], y_tile_dim, *acc_y_[k], *s_axis_y_, _dt, _stream);
+                    AddFieldsAsync(*acc_z_[k], z_tile_dim, *acc_z_[k], *s_axis_z_, _dt, _stream);
+                }
+            }
 
             RKAxisAsync(rk_order_, *phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
             RKAxisAsync(rk_order_, *phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -half_dt, _stream);
@@ -327,15 +361,37 @@ void OFM::ComputeSourceAsync(const DHMemory<float>& _u_x, const DHMemory<float>&
     int3 y_max_ijk  = { tile_dim_.x * 8 - 1, tile_dim_.y * 8, tile_dim_.z * 8 - 1 };
     int3 z_max_ijk  = { tile_dim_.x * 8 - 1, tile_dim_.y * 8 - 1, tile_dim_.z * 8 };
 
-    LaplacianAxisAsync(*src_x_, x_tile_dim, x_max_ijk, _u_x, dx_, _stream);
-    LaplacianAxisAsync(*src_y_, y_tile_dim, y_max_ijk, _u_y, dx_, _stream);
-    LaplacianAxisAsync(*src_z_, z_tile_dim, z_max_ijk, _u_z, dx_, _stream);
+    LaplacianAxisAsync(*src_x_, x_tile_dim, x_max_ijk, _u_x, dx_, viscosity_, _stream);
+    LaplacianAxisAsync(*src_y_, y_tile_dim, y_max_ijk, _u_y, dx_, viscosity_, _stream);
+    LaplacianAxisAsync(*src_z_, z_tile_dim, z_max_ijk, _u_z, dx_, viscosity_, _stream);
 
     // src = f + nu * lap(u). Writing back into src_ is safe: AddFieldsKernel
     // reads and writes the same index.
-    AddFieldsAsync(*src_x_, x_tile_dim, *f_x_, *src_x_, viscosity_, _stream);
-    AddFieldsAsync(*src_y_, y_tile_dim, *f_y_, *src_y_, viscosity_, _stream);
-    AddFieldsAsync(*src_z_, z_tile_dim, *f_z_, *src_z_, viscosity_, _stream);
+    AddFieldsAsync(*src_x_, x_tile_dim, *f_x_, *src_x_, 1.0f, _stream);
+    AddFieldsAsync(*src_y_, y_tile_dim, *f_y_, *src_y_, 1.0f, _stream);
+    AddFieldsAsync(*src_z_, z_tile_dim, *f_z_, *src_z_, 1.0f, _stream);
+}
+
+void OFM::ComputeSourceChannelAsync(int _channel, const DHMemory<float>& _u_x, const DHMemory<float>& _u_y, const DHMemory<float>& _u_z, cudaStream_t _stream)
+{
+    int3 x_tile_dim = { tile_dim_.x + 1, tile_dim_.y, tile_dim_.z };
+    int3 y_tile_dim = { tile_dim_.x, tile_dim_.y + 1, tile_dim_.z };
+    int3 z_tile_dim = { tile_dim_.x, tile_dim_.y, tile_dim_.z + 1 };
+    int3 x_max_ijk  = { tile_dim_.x * 8, tile_dim_.y * 8 - 1, tile_dim_.z * 8 - 1 };
+    int3 y_max_ijk  = { tile_dim_.x * 8 - 1, tile_dim_.y * 8, tile_dim_.z * 8 - 1 };
+    int3 z_max_ijk  = { tile_dim_.x * 8 - 1, tile_dim_.y * 8 - 1, tile_dim_.z * 8 };
+
+    if (_channel == kChanViscous) {
+        LaplacianAxisAsync(*src_x_, x_tile_dim, x_max_ijk, _u_x, dx_, viscosity_, _stream);
+        LaplacianAxisAsync(*src_y_, y_tile_dim, y_max_ijk, _u_y, dx_, viscosity_, _stream);
+        LaplacianAxisAsync(*src_z_, z_tile_dim, z_max_ijk, _u_z, dx_, viscosity_, _stream);
+    } else {
+        // The external force is already the source; copy it so that the caller can
+        // contract src_ whichever channel it asked for.
+        cudaMemcpyAsync(src_x_->dev_ptr_, f_x_->dev_ptr_, Prod(x_tile_dim) * 512 * sizeof(float), cudaMemcpyDeviceToDevice, _stream);
+        cudaMemcpyAsync(src_y_->dev_ptr_, f_y_->dev_ptr_, Prod(y_tile_dim) * 512 * sizeof(float), cudaMemcpyDeviceToDevice, _stream);
+        cudaMemcpyAsync(src_z_->dev_ptr_, f_z_->dev_ptr_, Prod(z_tile_dim) * 512 * sizeof(float), cudaMemcpyDeviceToDevice, _stream);
+    }
 }
 
 void OFM::ProjectAsync(cudaStream_t _stream)

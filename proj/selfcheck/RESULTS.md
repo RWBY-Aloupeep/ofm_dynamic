@@ -274,6 +274,112 @@ interval rather than lower `dt`.
 `--nu 0` gives the floor for the same configuration. `--res-tiles T` sets the grid to
 `8T` cells per side.
 
+## D1: the circulation budget, and what it says the residual is
+
+With the source channel in place, the circulation attribution follows from the
+flow-map solution rather than needing a separate mechanism. For a material loop C
+whose preimage at the start of a cycle is C0,
+
+    Gamma(t) = closed_integral_C u.dl = closed_integral_C0 [ m0 + sum_k sum_i dt F^T s_k ] . dX
+             = Gamma(0) + sum_k dGamma_k
+
+because `u = m - grad(phi)` and a gradient integrates to zero around a closed loop.
+So **each source channel's accumulator, integrated around the loop's preimage, is
+that channel's contribution to the circulation**. Nothing else is needed: the
+separation the wildfire literature has never been able to make is a line integral
+of a field the solver already builds.
+
+### What was added
+
+`SourceChannel` splits the source into channels (currently viscous and external
+force; baroclinic and drag get their own once there is a density field). Each
+channel accumulates its own `sum_i dt F^T s_k` into `acc_[k]` over the cycle.
+
+Two properties matter and are enforced by construction:
+
+- **Attribution does not perturb the physics.** Every channel's contribution still
+  lands in `init_u_`; splitting only changes how many times the contraction runs.
+  With `track_attribution_` off the code takes the original combined path.
+- **The accumulators reset with the map.** They live in the frame of the cycle's
+  start, so they are cleared at every reinitialization. The running total across
+  cycles is a *scalar per loop*, not a field, and is the caller's to keep — this is
+  the cross-reinitialization accumulator the plan identifies as this project's own
+  contribution. It also means the line integrals have to be taken every cycle, not
+  only on diagnostic steps.
+
+`CirculationOnCircle` in the harness integrates a staggered field around a circle
+by trilinear interpolation of the cell-centred form. Applied to the velocity it
+gives the loop's circulation; applied to `acc_[k]` it gives that channel's share.
+
+### The test case, and why the loop is legitimate
+
+The diffusing columnar Burgers vortex again, because every leg of the identity is
+known in closed form. Its radial velocity is zero, so **a circle of fixed radius is
+a material loop**, and it is still its own preimage at every cycle start — exactly
+the frame the accumulators live in. The loop is taken at `r = b0`.
+
+    Gamma(r,t) = Gamma_inf (1 - exp(-r^2 / b(t)^2)),   b(t)^2 = b0^2 + 4 nu t
+
+Three quantities are compared, all as changes since t = 0 so the discretisation of
+the seeded field cancels: **direct** (measured line integral of the velocity),
+**budget** (summed accumulator line integrals), **analytic**.
+
+### Result
+
+| grid | n | budget vs analytic | budget vs direct |
+|---|---|---|---|
+| 128^3 (b0 = 7.7 cells) | 1 | 4.04% | 6.39% |
+| 128^3 | 5 | 2.68% | 1.39% |
+| 256^3 (b0 = 15.4 cells) | 5 | **0.58%** | **0.11%** |
+
+**The 256^3 run passes both halves of the criterion** — attribution error under 1%,
+and the dual paths agreeing to 0.11%, steady across the entire run with no drift.
+
+The channel split is correct in the way that matters: with only viscosity active,
+the budget assigns **all** of the circulation change to the viscous channel and
+**exactly zero** to the external one.
+
+### The dual-path gap is the residual, not just a consistency check
+
+The two error columns measure different things, and separating them is the useful
+part:
+
+- **budget vs analytic** is the discretisation error of `nu*lap(u)` itself. At
+  7.7 cells across the core the discrete Laplacian underestimates the true one, so
+  the budget falls short of the exact answer; refining the grid fixes it.
+- **budget vs direct** is the part of the measured circulation change that **no
+  modelled source accounts for**. The velocity field really did lose more
+  circulation than the physics asked for, and the excess is numerical dissipation.
+
+That second column is the number this project actually lives or dies by. An
+attribution result of the form "X% from tilting, Y% from baroclinic" only means
+something if the unattributed remainder is small next to the terms being compared.
+Here it is 6.39% at `n = 1`, 1.39% at `n = 5`, and 0.11% at 256^3 — so the
+reinitialization interval buys attribution credibility, not just speed, which is a
+third independent argument for the default of 5.
+
+### Regression
+
+With source terms off, the D5 Burgers case recovers `nu = 1.018662e-03` — bit for
+bit what it returned before the channel split. The refactor is numerically neutral
+when attribution is not asked for.
+
+### Reproducing
+
+```
+./build/selfcheck --test attribution --res-tiles 32 --nu 2.25e-4 --dt 0.00416667 \
+                  --steps 960 --diag-every 120 --reinit-every 5 --rk-order 4
+```
+
+`--loop-radius` overrides the loop radius, which defaults to the seeded core.
+
+### Still open in D1
+
+The plan also requires **stretching and tilting reported separately**
+(`w_z d_z w` against `w_x d_x w + w_y d_y w`), which is a pointwise diagnostic of
+the vorticity equation rather than part of the circulation budget. That half is not
+done here.
+
 ## The source-term channel: how it was found missing
 
 `RKAxisAccumulateForceAsync` — the path integral that carries external forces and

@@ -149,6 +149,36 @@ __global__ void AddColumnVelocityKernel(float* u_axis, int3 axis_tile_dim, int c
     }
 }
 
+// Trilinear sample of a cell-centred, tile-ordered field. Cell (i,j,k) is centred
+// at grid_origin + (i+0.5)*dx, so the fractional index is offset by half a cell.
+float3 SampleCentred(const float3* data, int3 td, float3 grid_origin, float dx, double px, double py, double pz)
+{
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const double fx = (px - grid_origin.x) / dx - 0.5;
+    const double fy = (py - grid_origin.y) / dx - 0.5;
+    const double fz = (pz - grid_origin.z) / dx - 0.5;
+
+    const int i0 = static_cast<int>(std::floor(fx));
+    const int j0 = static_cast<int>(std::floor(fy));
+    const int k0 = static_cast<int>(std::floor(fz));
+    const double wx = fx - i0, wy = fy - j0, wz = fz - k0;
+
+    auto clamp = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+
+    float3 acc = { 0.0f, 0.0f, 0.0f };
+    for (int a = 0; a < 2; a++)
+        for (int b = 0; b < 2; b++)
+            for (int c = 0; c < 2; c++) {
+                const double w = (a ? wx : 1.0 - wx) * (b ? wy : 1.0 - wy) * (c ? wz : 1.0 - wz);
+                const int3 ijk = { clamp(i0 + a, nx - 1), clamp(j0 + b, ny - 1), clamp(k0 + c, nz - 1) };
+                const float3 v = data[IjkToIdx(td, ijk)];
+                acc.x += static_cast<float>(w * v.x);
+                acc.y += static_cast<float>(w * v.y);
+                acc.z += static_cast<float>(w * v.z);
+            }
+    return acc;
+}
+
 } // namespace
 
 void SetupSolver(ofm::OFM& solver, const SolverConfig& config, GPUTimer& profiler, cudaStream_t stream)
@@ -348,6 +378,33 @@ ColumnDiag MeasureColumnVortex(ofm::OFM& solver, float centre_x, float centre_y,
         }
     }
     return diag;
+}
+
+double CirculationOnCircle(ofm::OFM& solver,
+                           const ofm::DHMemory<float>& field_x, const ofm::DHMemory<float>& field_y, const ofm::DHMemory<float>& field_z,
+                           float centre_x, float centre_y, float radius, int samples, cudaStream_t stream)
+{
+    const int3 td = solver.tile_dim_;
+    ofm::GetCenteralVecAsync(*(solver.u_), td, field_x, field_y, field_z, stream);
+    solver.u_->DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+
+    const float dx  = solver.dx_;
+    const double cz = solver.grid_origin_.z + 0.5 * (td.z * 8) * dx;
+    const double pi = 3.14159265358979323846;
+    const double dtheta = 2.0 * pi / samples;
+
+    // Midpoint rule around the circle. The tangent of a counter-clockwise
+    // traversal at angle theta is (-sin theta, cos theta, 0).
+    double total = 0.0;
+    for (int s = 0; s < samples; s++) {
+        const double th = (s + 0.5) * dtheta;
+        const double px = centre_x + radius * std::cos(th);
+        const double py = centre_y + radius * std::sin(th);
+        const float3 v  = SampleCentred(solver.u_->host_ptr_, td, solver.grid_origin_, dx, px, py, cz);
+        total += (-v.x * std::sin(th) + v.y * std::cos(th)) * radius * dtheta;
+    }
+    return total;
 }
 
 HostField DownloadVorticityNorm(ofm::OFM& solver, cudaStream_t stream)

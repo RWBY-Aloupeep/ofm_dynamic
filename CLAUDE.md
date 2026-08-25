@@ -29,16 +29,45 @@ AMGPCG solver and leapfrog integrator come from the LFM authors, and the repo in
 LICENSE. Keep the Acknowledgments section of README.md accurate as the code diverges, keep the
 LICENSE file intact, and don't present upstream code as this project's contribution.
 
-The full research plan (literature audit of 24 papers, the three concrete gaps it identifies, the
-Stage 0–D implementation roadmap, and open risks) is **not duplicated in this repo** — it lives in
-the "Fire-Whirl Flow Maps" Artifact (owned by the project's author) and is mirrored into this
-session's persistent memory. Read that before planning any new implementation work; it is versioned
-and gets updated independently of this repo's code.
+### The plan comes from the Artifact, not from this repo and not from you
 
-**Literature access:** all source papers are tagged `proj:wildfire` in a personal Zotero library,
-reachable via the Zotero Web API (credentials in persistent memory, not in this repo). When a task
-needs a specific paper's claim, fetch and read the actual PDF via that API rather than answering
-from general recall — citation-level precision is load-bearing for this project's methodology.
+The full research plan (literature audit, the three concrete gaps it identifies, the Stage 0–D
+roadmap, per-stage pass criteria, and open risks) is **not duplicated in this repo**. It lives in
+the "Fire-Whirl Flow Maps" Artifact, owned by the project's author, and is mirrored into persistent
+memory. It is versioned (v1.3 as of 2026-08-25) and is updated independently of this code.
+
+**It is authoritative.** Read it (`Artifact action:"read"`) before planning any implementation work,
+and take the objective, the stage ordering, and the pass criteria from it rather than proposing your
+own. Where the Artifact and the memory mirror disagree, the Artifact wins — the mirror can be stale.
+Where the Artifact and your own judgment disagree, say so explicitly and let the author decide; do
+not quietly substitute a different plan, a different stage order, or a different pass criterion.
+
+When work shows something in the Artifact to be wrong, that is a finding to report, and the fix is
+to update the Artifact — it carries an errata appendix ("Corrections") for exactly this, newest
+version first. Do not leave the repo and the Artifact disagreeing.
+
+### Literature is closed to the Zotero tag
+
+All source papers are tagged `proj:wildfire` in the author's personal Zotero library, reachable via
+the Zotero Web API (credentials in persistent memory, not in this repo). Two rules, both
+load-bearing:
+
+**Read, don't recall.** When a task needs a specific paper's claim, fetch and read the actual PDF
+through the API. Citation-level precision is load-bearing for this project's methodology, and a
+half-remembered number is worse than no number.
+
+**Do not go outside the tag.** The corpus is deliberately bounded. Benchmarks, validation cases,
+pass criteria, and cited claims must come from papers under `proj:wildfire` (plus the small,
+individually documented out-of-library set the Artifact lists in its §2 H group). This rules out
+reaching for standard CFD material that is not in the library — a textbook test case, a canonical
+correlation, a benchmark "everyone uses". If the library genuinely lacks what a task needs, say so
+and ask; adding a paper to the corpus is the author's call, and anything admitted gets recorded in
+the Artifact with its acquisition status. Do not introduce an outside source and then justify it
+after the fact.
+
+A related consequence, stated because it has already been decided: **purely qualitative pass
+criteria are not accepted.** "Reproduces the phenomenon" is not a criterion; a relative error, a
+percentage, or a measured quantity against an analytic or published value is.
 
 ## Compute environment (UW Hyak klone)
 

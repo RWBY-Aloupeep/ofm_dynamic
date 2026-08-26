@@ -945,6 +945,128 @@ int RunDamkohler(int res_tiles, float core, float circulation, const char* csv_p
     return pass ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// Stage A: buoyant plume from a surface heat source in a sheared cross flow,
+// after Cunningham et al. 2005. See harness.h for what the Boussinesq reduction
+// of their compressible model drops, and RESULTS.md for the boundary-condition
+// deviation. This is the first cut: it establishes whether the counter-rotating
+// vortex pair forms at all and how the split width moves with z0 and Q0.
+struct PlumeRun {
+    int3 tiles       = { 23, 15, 19 }; // 184 x 120 x 152 cells; dx = 10 m
+    float len_y      = 1200.0f;        // m, fixes dx = len_y / (8*tiles.y)
+    float z0         = 100.0f;         // m
+    float q0         = 1000.0f;        // W/m^3
+    float mu         = 4.0f;           // kg/(m s); nu = mu/rho
+    float dt         = 0.25f;          // s
+    int steps        = 2400;           // 600 s, the paper's quasi-steady time
+    int diag_every   = 240;
+    float plane_x    = 1750.0f;        // m, the paper's cross-section plane
+    float cvp_z      = 25.0f;          // m, height at which the CVP is measured
+    int reinit_every = 1;
+    int rk_order     = 3;
+};
+
+int RunPlume(const PlumeRun& run, const char* csv_path)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim     = run.tiles;
+    config.len_y        = run.len_y;
+    config.cg_iter      = 15;
+    config.reinit_every = run.reinit_every;
+    config.rk_order     = run.rk_order;
+
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+
+    selfcheck::PlumeSpec spec;
+    spec.z0 = run.z0;
+    spec.q0 = run.q0;
+
+    solver.use_source_term_ = true;
+    solver.viscosity_       = run.mu / spec.rho;
+
+    const float dx = solver.dx_;
+    const int3 td  = solver.tile_dim_;
+    const float lx = td.x * 8 * dx, ly = td.y * 8 * dx, lz = td.z * 8 * dx;
+
+    printf("plume: %d x %d x %d cells, dx = %.2f m, domain %.0f x %.0f x %.0f m\n",
+           td.x * 8, td.y * 8, td.z * 8, dx, lx, ly, lz);
+    printf("       U0 = %.2f m/s, z0 = %.0f m, Q0 = %.0f W/m^3, mu = %.4f kg/(m s) -> nu = %.4f m^2/s\n",
+           spec.u0, spec.z0, spec.q0, run.mu, solver.viscosity_);
+    printf("       dt = %.3f s, %d steps = %.0f s, n = %d\n",
+           run.dt, run.steps, run.steps * run.dt, run.reinit_every);
+    const float diffusion_number = solver.viscosity_ * 2.0f * run.dt / (dx * dx);
+    const float cfl              = spec.u0 * run.dt / dx;
+    printf("       explicit diffusion number = %.4f%s, cross-flow CFL = %.3f\n",
+           diffusion_number, diffusion_number > 0.16f ? "  [WARNING: above the ~1/6 limit]" : "", cfl);
+    if (run.reinit_every != 1)
+        printf("       [WARNING: the buoyancy and the theta advection both read init_u_, which is\n"
+               "        only current at a cycle boundary. n != 1 needs them wired to mid_u_.]\n");
+
+    selfcheck::SetPlumeInitialVelocityAsync(solver, spec, stream);
+    selfcheck::SetPlumeBcAsync(solver, spec, stream);
+    selfcheck::ProjectCurrentVelocityAsync(solver, stream);
+    cudaStreamSynchronize(stream);
+
+    const int cell_num = ofm::Prod(td) * 512;
+    ofm::DHMemory<float> theta_a(cell_num);
+    ofm::DHMemory<float> theta_b(cell_num);
+    theta_a.ClearDevAsync(stream);
+    theta_b.ClearDevAsync(stream);
+    cudaStreamSynchronize(stream);
+    ofm::DHMemory<float>* theta = &theta_a;
+    ofm::DHMemory<float>* next  = &theta_b;
+
+    FILE* csv = fopen(csv_path, "w");
+    if (!csv) {
+        printf("cannot open %s\n", csv_path);
+        return 1;
+    }
+    fprintf(csv, "step,time,max_theta,plume_top,w_max,u_max,plane_theta,omega_pos,omega_neg,y_pos,y_neg,split_width,best_x,best_omega,best_split\n");
+    printf("\n%6s %8s %10s %10s %8s %8s %10s %10s %12s\n",
+           "step", "t", "max_dT", "top", "w_max", "u_max", "w_z(+)", "w_z(-)", "split");
+
+    selfcheck::PlumeDiag last;
+    last.valid = false;
+    for (int step = 0; step < run.steps; step++) {
+        const float t = step * run.dt;
+        selfcheck::AddPlumeHeatAsync(*theta, td, solver.grid_origin_, dx, spec, t, run.dt, stream);
+        selfcheck::SetBuoyancyAndDragAsync(solver, *theta, spec, stream);
+        solver.AdvanceAsync(run.dt, stream);
+        solver.ReinitAsync(run.dt, stream);
+        ofm::AdvectN2CAsync(*next, td, *theta, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_,
+                            dx, run.dt, stream);
+        std::swap(theta, next);
+
+        if ((step + 1) % run.diag_every == 0 || step + 1 == run.steps) {
+            const selfcheck::PlumeDiag d = selfcheck::MeasurePlume(solver, *theta, run.plane_x, run.cvp_z, stream);
+            printf("%6d %8.1f %10.3f %10.1f %8.2f %8.2f %10.4f %10.4f %12.1f | best x=%6.0f |w|=%.4f split=%6.1f%s\n",
+                   step + 1, (step + 1) * run.dt, d.max_theta, d.plume_top, d.w_max, d.u_max,
+                   d.omega_pos, d.omega_neg, d.split_width,
+                   d.best_x, d.best_omega, d.best_split, d.valid ? "" : "  [no CVP on plane]");
+            fprintf(csv, "%d,%.3f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e,%.3f,%.3f,%.3f,%.3f,%.6e,%.3f\n",
+                    step + 1, (step + 1) * run.dt, d.max_theta, d.plume_top, d.w_max, d.u_max, d.plane_theta,
+                    d.omega_pos, d.omega_neg, d.y_pos, d.y_neg, d.split_width,
+                    d.best_x, d.best_omega, d.best_split);
+            fflush(csv);
+            last = d;
+        }
+    }
+    fclose(csv);
+
+    printf("\nwrote %s\n", csv_path);
+    if (!last.valid) {
+        printf("FAIL: no counter-rotating pair on the x = %.0f m plane at z = %.0f m\n", run.plane_x, run.cvp_z);
+        return 1;
+    }
+    printf("PASS: counter-rotating pair present, split width %.1f m "
+           "(w_z = %+.4f at y = %.0f m, %+.4f at y = %.0f m)\n",
+           last.split_width, last.omega_pos, last.y_pos, last.omega_neg, last.y_neg);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     std::string test        = "leapfrog3d";
@@ -959,6 +1081,7 @@ int main(int argc, char** argv)
     int res_tiles    = 16; // burgers only: 16 tiles per side = 128^3
     float loop_radius = 0.0f; // attribution only: 0 means use the core radius
     int rk_order     = 3; // TVD-RK3, the order OFM shipped with
+    PlumeRun plume;       // stage A only
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -990,6 +1113,21 @@ int main(int argc, char** argv)
             res_tiles = std::atoi(argv[++i]);
         else if (arg == "--loop-radius" && i + 1 < argc)
             loop_radius = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--z0" && i + 1 < argc)
+            plume.z0 = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--q0" && i + 1 < argc)
+            plume.q0 = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--mu" && i + 1 < argc)
+            plume.mu = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--plane-x" && i + 1 < argc)
+            plume.plane_x = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--cvp-z" && i + 1 < argc)
+            plume.cvp_z = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--tiles" && i + 3 < argc) {
+            plume.tiles.x = std::atoi(argv[++i]);
+            plume.tiles.y = std::atoi(argv[++i]);
+            plume.tiles.z = std::atoi(argv[++i]);
+        }
         else if (arg == "--nu" && i + 1 < argc)
             bp.viscosity = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--dt" && i + 1 < argc) {
@@ -1007,7 +1145,9 @@ int main(int argc, char** argv)
                    "                 [--res-tiles T] [--steps N] [--diag-every N]\n"
                    "       selfcheck --test tilting [--res-tiles T]\n"
                    "       selfcheck --test coreradii [--res-tiles T] [--core B0] [--circulation G]\n"
-                   "       selfcheck --test damkohler [--res-tiles T] [--core B0] [--circulation G]\n");
+                   "       selfcheck --test damkohler [--res-tiles T] [--core B0] [--circulation G]\n"
+                   "       selfcheck --test plume [--z0 Z] [--q0 Q] [--mu MU] [--dt DT] [--steps N]\n"
+                   "                 [--diag-every N] [--plane-x X] [--cvp-z Z] [--tiles TX TY TZ]\n");
             return 0;
         }
     }
@@ -1036,6 +1176,20 @@ int main(int argc, char** argv)
         if (csv_path == "leapfrog3d.csv")
             csv_path = "attribution.csv";
         return RunAttribution(total_steps, diag_every, csv_path.c_str(), bp, dt, reinit_every, rk_order, res_tiles, loop_radius);
+    }
+
+    if (test == "plume") {
+        if (csv_path == "leapfrog3d.csv")
+            csv_path = "plume.csv";
+        if (dt_set)
+            plume.dt = dt;
+        if (total_steps != 2000)
+            plume.steps = total_steps;
+        if (diag_every != 10)
+            plume.diag_every = diag_every;
+        plume.reinit_every = reinit_every;
+        plume.rk_order     = rk_order;
+        return RunPlume(plume, csv_path.c_str());
     }
 
     if (test == "burgers") {

@@ -679,3 +679,155 @@ attribution` and `--test tilting` (D2), and `--test coreradii` and `--test
 damkohler` (D3 and D4). Each section above gives its own command line. Every case
 returns a non-zero exit code when it misses its criterion, so a batch script can
 gate on them.
+
+## Stage A: a buoyant plume in a sheared cross flow, first cut
+
+The configuration is Cunningham, Goodrick, Hussaini & Linn 2005 (Int. J. Wildland
+Fire 14, 61-75). The numbers below were read from the paper, not from the plan
+Artifact, and three of them differ from what the plan carried.
+
+| | Paper |
+|---|---|
+| Governing equations | three-dimensional **compressible** flow in a density-stratified atmosphere, forced by a prescribed volumetric heat source; solved with WRF (split-explicit, RK3 advection, fifth-order upwind) |
+| Base state | ambient potential temperature **uniform at 300 K** -- neutral |
+| Cross flow | `U(z) = U0 tanh(z/z0)`, `U0 = 4.5 m/s`, `z0` in {50, 100, 150} m |
+| Heat source | `Q = Q0 tanh(t/t0) exp(-z/h) * shape`, `t0 = 10 s`, `h = 25 m` (a vertical decay scale, not a height) |
+| Circular source | smoothed top-hat, `R1 = 75 m`, `R2 = 150 m`, `d = 12.5 m`, centred at `(450, 600) m`; `Q0 = 1 kW/m^3` gives 1000 MW |
+| Elliptical source | `A = 200 m`, `B = 100 m`; `Q0 = 1 kW/m^3` gives 1700 MW |
+| Canopy drag | `D_i = rho Cd a V u_i`, `Cd = 0.1`, `a = 0.25 1/m`, **lowest grid level only** |
+| Direct runs | `mu` = 4, 1, 0.15, 0.0015 kg/(m s), `Pr = 0.7` |
+| LES | `Ck = 0.1`, `Ce = 0.93`, turbulent `Pr = 1/3` |
+| Domain | 1800 x 1200 x 1500 m, uniform 10 m spacing |
+| Boundaries | lateral and downstream **non-reflecting outflow** (Orlanski 1976); top and bottom solid-wall **free-slip**; damping layer under the lid |
+| Timing | quasi-steady after ~600 s; wake shedding period ~200 s |
+| Strouhal | `St = n D / U0` with **`D = 2 R_c`**, `R_c = (R1+R2)/2 = 112.5 m`, so `D = 225 m`; a 200 s period gives `St = 0.25` |
+| Cross-sections | potential temperature on the y-z plane at **x = 1750 m** |
+| Results | larger `z0` gives a wider bifurcation; for a given cross flow the **weaker** source gives a wider bifurcation; the cross-section is not self-similar Gaussian in any run |
+
+Three corrections to what the plan carried: the base state is neutral (the plan
+did not say, and it is what makes a Boussinesq reduction defensible at all);
+`h = 25 m` is the vertical decay scale of `Q`, not a source height; and `St` is
+built on `D = 2 R_c`, not `2 R2` -- using `2 R2` turns 0.25 into 0.33 and would
+fail a correct run.
+
+### Two gaps between that configuration and this solver
+
+**Boundary conditions.** `SetWallBcAsync` prescribes the normal velocity on all
+six faces. The solver has no outflow condition and no damping layer, so this
+case prescribes `U(z)` on both x faces -- inflow and outflow carry the same
+mass -- and leaves the lateral and top faces as free-slip walls. That is not
+Orlanski. The paper's measurement plane at `x = 1750 m` sits 50 m from the
+outflow, well inside the influence of a prescribed-profile face, so a split
+width measured there is contaminated. Either move the plane upstream, lengthen
+the box, or add an outflow condition; the last is the real fix and needs its own
+verification case before it can be trusted.
+
+**Thermal expansion.** The solver is incompressible and constant density.
+Buoyancy enters as `g theta' / theta0` written into `f_z_` and carried by the
+source-term path integral, which is what that field was built for. The neutral
+base state makes the Boussinesq reduction reasonable in the far field, but at
+`Q0 = 1 kW/m^3` the parcel-following anomaly reaches tens of K, so `dT/T0` is
+O(0.1) near the source and the expansion term `Q/(rho cp T)` is not negligible
+there. Plume structure should survive that; absolute widths should not be
+quoted against the paper until the low-Mach extension lands.
+
+Neither gap blocks the run. Whether a counter-rotating pair forms, and which way
+its width moves with `z0` and `Q0`, is a vorticity-dynamics question that the
+present solver can answer. Both gaps bound what the numbers mean.
+
+### What was implemented
+
+`--test plume` in `proj/selfcheck`, with the physics in the harness rather than
+in `ofm::OFM`, since `f_{x,y,z}_` exists precisely so a caller can add buoyancy
+and drag:
+
+- `PlumeSpec` carries the paper's parameters.
+- `SetPlumeBcAsync` starts from closed free-slip walls and overwrites the x
+  faces with `U(z)`, then rebuilds the Poisson coefficients.
+- `AddPlumeHeatAsync` integrates `theta += Q/(rho cp) dt` on the cell centres.
+- `SetBuoyancyAndDragAsync` writes `f_z = g theta/theta0` on the z faces and
+  `-Cd a |u_h| u_i` on the lowest cell level, zero elsewhere.
+- `theta` is advected with `AdvectN2CAsync`, the cell-centred advection kernel
+  that shipped with the solver and, like `RKAxisAccumulateForceAsync` before it,
+  had no caller anywhere.
+- `MeasurePlume` reports the peak anomaly, plume top, `w_max`, and the two
+  extrema of `omega_z` on the measurement plane with the distance between them.
+
+The buoyancy and the `theta` advection both read `init_u_`, which is only
+current at a cycle boundary, so this first cut runs at `reinit_every = 1` and
+warns otherwise. Wiring them to `mid_u_[i]` is what `n = 5` needs, and `n = 5`
+is what the D2 residual argues for; that is the next change, not this one.
+
+Building it also turned up a latent break: `src/ofm/ofm_util.h` uses `uint8_t`
+without including `<cstdint>`. It only surfaced when a comment edit invalidated
+the `src/ofm` build cache and forced a full rebuild.
+
+### A third gap, found by running it: the inlet is hard-coded uniform
+
+The first run held a cross-flow of at most 2.7 m/s where the profile asks for
+4.5 m/s, and the plume went nearly straight up. `AdvanceAsync` calls
+
+    SetInletAsync(*bc_val_x_, *bc_val_y_, tile_dim_, inlet_norm_, inlet_angle_, stream);
+
+on **every step**, which rewrites the inlet and outlet planes of `bc_val_{x,y}_`
+from a single scalar speed and angle. A sheared `U(z)` written before the first
+step is erased by it. Nothing upstream of Stage A noticed, because D1 to D4 all
+run closed boxes with `inlet_norm_ = 0`, where overwriting the planes with zero
+is what those cases want anyway.
+
+Fixed with `use_uniform_inlet_`, default `true`: when it is false `AdvanceAsync`
+leaves `bc_val_{x,y}_` alone and the caller owns them. The default keeps every
+existing case bit-identical, which the D1 Burgers regression confirms.
+
+So the solver as it stands assumes the inflow is uniform, the box is closed, and
+the fluid has one density. Stage A needs all three relaxed; two are now optional
+flags and the third -- an outflow condition -- is still missing.
+
+### First run, before the inlet fix
+
+Coarse grid, 96 x 64 x 80 cells at dx = 18.75 m over the paper's exact
+1800 x 1200 x 1500 m domain, `z0 = 100 m`, `Q0 = 1 kW/m^3`, `mu = 4 kg/(m s)`,
+`dt = 0.5 s`, 600 s. This is the run that exposed the inlet problem: the plume
+rose nearly vertically, hit the 1500 m lid at `t ~ 360 s`, and the only
+counter-rotating pair sat at `x ~ 350 m`, on the source itself. The plane at
+`x = 1750 m` carried nothing at all.
+
+### The same run with the inlet fixed
+
+Coarse grid, 96 x 64 x 80 cells at dx = 18.75 m over the paper's exact
+1800 x 1200 x 1500 m domain, `z0 = 100 m`, `Q0 = 1 kW/m^3`, `mu = 4 kg/(m s)`,
+`dt = 0.5 s`, 600 s:
+
+| t (s) | max dT (K) | top (m) | w_max | u_max | omega_z(+) at x=1750 | omega_z(-) | split (m) | strongest plane |
+|---|---|---|---|---|---|---|---|---|
+| 100 | 7.79 | 272 | 2.72 | 4.79 | ~0 | ~0 | -- | x = 609 m, 0.011 1/s |
+| 200 | 7.68 | 441 | 3.94 | 5.33 | ~0 | ~0 | -- | x = 666 m, 0.033 |
+| 300 | 7.48 | 591 | 3.68 | 5.96 | +0.0005 | -0.0005 | -- | x = 741 m, 0.031 |
+| 400 | 7.42 | 703 | 4.11 | 6.16 | +0.0009 | -0.0009 | -- | x = 816 m, 0.025 |
+| 500 | 7.39 | 816 | 4.59 | 6.07 | +0.0044 | -0.0045 | 281 | x = 722 m, 0.022 |
+| 600 | 7.40 | 759 | 4.84 | 5.85 | +0.0075 | -0.0076 | 206 | x = 703 m, 0.022 |
+
+Three things this establishes, and one it does not.
+
+- **The cross flow is there.** `u_max` sits at 4.8 to 6.2 m/s against the 4.5 m/s
+  the profile asks for above the shear layer, the excess being the plume-induced
+  acceleration.
+- **The plume bends over instead of standing up.** The top climbs to about 815 m
+  at 500 s and settles near 760 m, well clear of the 1500 m lid, so neither the
+  lid nor the missing damping layer is setting the trajectory any more.
+- **A counter-rotating pair forms, and its handedness matches the paper.** At
+  `x = 1750 m` the positive `omega_z` sits at `y = 497 m` and the negative at
+  `y = 703 m`, either side of the source axis at `y = 600 m`. With x streamwise
+  and z up that is positive on the right-hand side looking downstream and
+  negative on the left, which is what Cunningham report and attribute to the
+  tilting of ambient cross-flow vorticity.
+- **The split width is not yet a number to quote.** 206 m at the last sample, but
+  the plane it is measured on is 50 m from a prescribed-profile outflow, and the
+  value is still moving between samples. The ordering across `z0` and `Q0` is the
+  criterion worth testing first: an ordering survives a boundary offset that an
+  absolute width does not.
+
+Running the sweep also needs `module load cuda/12.6.3 gcc/11.2.0` and a login
+shell. `gcc/11.2.0` is what supplies the `GLIBCXX_3.4.29` the binary links
+against; the cuda module only adds its own `lib64`, and `module` itself is a
+shell function that a non-login `sbatch` shell does not have.

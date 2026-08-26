@@ -37,6 +37,11 @@ public:
     // boundary
     float inlet_norm_;
     float inlet_angle_;
+    // AdvanceAsync rewrites the inlet and outlet planes of bc_val_{x,y}_ from
+    // inlet_norm_/inlet_angle_ on every step, which only expresses a uniform
+    // inflow. Set this false to keep whatever the caller wrote there instead --
+    // a sheared profile, say. Default true, so existing cases are unchanged.
+    bool use_uniform_inlet_ = true;
     std::shared_ptr<DHMemory<uint8_t>> is_bc_x_;
     std::shared_ptr<DHMemory<uint8_t>> is_bc_y_;
     std::shared_ptr<DHMemory<uint8_t>> is_bc_z_;

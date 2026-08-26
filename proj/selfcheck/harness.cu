@@ -932,4 +932,321 @@ HostField DownloadVorticityNorm(ofm::OFM& solver, cudaStream_t stream)
     return field;
 }
 
+// ---------------------------------------------------------------------------
+// Stage A: buoyant plume in a sheared cross flow (Cunningham et al. 2005).
+
+namespace {
+
+__host__ __device__ inline float PlumeInletU(float z, float u0, float z0)
+{
+    return u0 * tanhf(z / z0);
+}
+
+// Eq. (10): uniform inside r1, smoothly tapered to zero by r2, decaying with
+// height as exp(-z/h) and ramped in time as tanh(t/t_ramp).
+__host__ __device__ inline float PlumeHeatShape(float px, float py, const selfcheck::PlumeSpec& s)
+{
+    const float ddx = px - s.src_x;
+    const float ddy = py - s.src_y;
+    const float r   = sqrtf(ddx * ddx + ddy * ddy);
+    if (r <= s.r1)
+        return 1.0f;
+    if (r >= s.r2)
+        return 0.0f;
+    const float rc = 0.5f * (s.r1 + s.r2);
+    return 0.5f * (1.0f - tanhf((r - rc) / s.dwidth));
+}
+
+__global__ void SetPlumeInletXKernel(uint8_t* is_bc_x, float* bc_val_x, int3 x_tile_dim,
+                                     float3 origin, float dx, selfcheck::PlumeSpec spec)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(x_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    const int3 grid_dim = { (x_tile_dim.x - 1) * 8, x_tile_dim.y * 8, x_tile_dim.z * 8 };
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (ijk.x == 0 || ijk.x >= grid_dim.x) {
+            const float pz = origin.z + (ijk.z + 0.5f) * dx;
+            is_bc_x[idx]   = 1;
+            bc_val_x[idx]  = PlumeInletU(pz, spec.u0, spec.z0);
+        } else {
+            is_bc_x[idx] = 0;
+        }
+    }
+}
+
+__global__ void SetPlumeVelocityKernel(float* u_axis, int3 axis_tile_dim, int component,
+                                       float3 origin, float dx, selfcheck::PlumeSpec spec)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(axis_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (component != 0) {
+            u_axis[idx] = 0.0f;
+            continue;
+        }
+        const float pz = origin.z + (ijk.z + 0.5f) * dx; // x faces sit at cell-centre height
+        u_axis[idx]    = PlumeInletU(pz, spec.u0, spec.z0);
+    }
+}
+
+__global__ void AddPlumeHeatKernel(float* theta, int3 tile_dim, float3 origin, float dx,
+                                   selfcheck::PlumeSpec spec, float t, float dt)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    const float ramp    = tanhf(t / spec.t_ramp);
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        const float px = origin.x + (ijk.x + 0.5f) * dx;
+        const float py = origin.y + (ijk.y + 0.5f) * dx;
+        const float pz = origin.z + (ijk.z + 0.5f) * dx;
+        const float shape = PlumeHeatShape(px, py, spec);
+        if (shape <= 0.0f)
+            continue;
+        const float q = spec.q0 * ramp * expf(-pz / spec.h) * shape;
+        theta[idx] += q / (spec.rho * spec.cp) * dt;
+    }
+}
+
+__global__ void BuoyancyZKernel(float* f_z, int3 z_tile_dim, int3 tile_dim, const float* theta,
+                                float g_over_theta0)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(z_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    const int3 grid_dim = { z_tile_dim.x * 8, z_tile_dim.y * 8, (z_tile_dim.z - 1) * 8 };
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (ijk.z == 0 || ijk.z >= grid_dim.z) {
+            f_z[idx] = 0.0f; // the wall faces are Dirichlet anyway
+            continue;
+        }
+        const int3 below = { ijk.x, ijk.y, ijk.z - 1 };
+        const int3 above = { ijk.x, ijk.y, ijk.z };
+        f_z[idx] = g_over_theta0 * 0.5f * (theta[IjkToIdx(tile_dim, below)] + theta[IjkToIdx(tile_dim, above)]);
+    }
+}
+
+// Eq. (6) with the canopy confined to the lowest cell level, as in the paper.
+// The speed is the horizontal one, taken from the cell-centred velocity either
+// side of the face.
+__global__ void CanopyDragKernel(float* f_axis, int3 axis_tile_dim, int component,
+                                 const float3* u_c, int3 tile_dim, const float* u_axis, float cd_a)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(axis_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    const int3 cell_dim = { tile_dim.x * 8, tile_dim.y * 8, tile_dim.z * 8 };
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (ijk.z != 0 || ijk.x >= cell_dim.x + (component == 0 ? 1 : 0) || ijk.y >= cell_dim.y + (component == 1 ? 1 : 0)) {
+            f_axis[idx] = 0.0f;
+            continue;
+        }
+        int3 a = ijk, b = ijk;
+        if (component == 0) {
+            a.x = ijk.x - 1;
+        } else {
+            a.y = ijk.y - 1;
+        }
+        a.x = a.x < 0 ? 0 : (a.x > cell_dim.x - 1 ? cell_dim.x - 1 : a.x);
+        a.y = a.y < 0 ? 0 : (a.y > cell_dim.y - 1 ? cell_dim.y - 1 : a.y);
+        b.x = b.x > cell_dim.x - 1 ? cell_dim.x - 1 : b.x;
+        b.y = b.y > cell_dim.y - 1 ? cell_dim.y - 1 : b.y;
+        const float3 ua = u_c[IjkToIdx(tile_dim, a)];
+        const float3 ub = u_c[IjkToIdx(tile_dim, b)];
+        const float va  = sqrtf(ua.x * ua.x + ua.y * ua.y);
+        const float vb  = sqrtf(ub.x * ub.x + ub.y * ub.y);
+        f_axis[idx]     = -cd_a * 0.5f * (va + vb) * u_axis[idx];
+    }
+}
+
+} // namespace
+
+void SetPlumeBcAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    // Start from closed free-slip walls everywhere, then overwrite the x faces
+    // with the shear profile so that the inflow and outflow carry the same mass.
+    const float3 zero = { 0.0f, 0.0f, 0.0f };
+    ofm::SetWallBcAsync(*solver.is_bc_x_, *solver.is_bc_y_, *solver.is_bc_z_,
+                        *solver.bc_val_x_, *solver.bc_val_y_, *solver.bc_val_z_,
+                        td, zero, zero, stream);
+    // AdvanceAsync would otherwise overwrite these planes with a uniform inflow.
+    solver.use_uniform_inlet_ = false;
+    SetPlumeInletXKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+        solver.is_bc_x_->dev_ptr_, solver.bc_val_x_->dev_ptr_, x_tile_dim,
+        solver.grid_origin_, solver.dx_, spec);
+
+    ofm::SetCoefByIsBcAsync(*(solver.amgpcg_.poisson_vector_[0].is_dof_),
+                            *(solver.amgpcg_.poisson_vector_[0].a_diag_),
+                            *(solver.amgpcg_.poisson_vector_[0].a_x_),
+                            *(solver.amgpcg_.poisson_vector_[0].a_y_),
+                            *(solver.amgpcg_.poisson_vector_[0].a_z_),
+                            td, *solver.is_bc_x_, *solver.is_bc_y_, *solver.is_bc_z_, stream);
+    solver.amgpcg_.BuildAsync(6.0f, -1.0f, stream);
+}
+
+void SetPlumeInitialVelocityAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const int3 y_tile_dim = { td.x, td.y + 1, td.z };
+    const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
+    SetPlumeVelocityKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+        solver.init_u_x_->dev_ptr_, x_tile_dim, 0, solver.grid_origin_, solver.dx_, spec);
+    SetPlumeVelocityKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
+        solver.init_u_y_->dev_ptr_, y_tile_dim, 1, solver.grid_origin_, solver.dx_, spec);
+    SetPlumeVelocityKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(
+        solver.init_u_z_->dev_ptr_, z_tile_dim, 2, solver.grid_origin_, solver.dx_, spec);
+}
+
+void AddPlumeHeatAsync(ofm::DHMemory<float>& theta, int3 tile_dim, float3 grid_origin, float dx,
+                       const PlumeSpec& spec, float t, float dt, cudaStream_t stream)
+{
+    AddPlumeHeatKernel<<<Prod(tile_dim), 128, 0, stream>>>(
+        theta.dev_ptr_, tile_dim, grid_origin, dx, spec, t, dt);
+}
+
+void SetBuoyancyAndDragAsync(ofm::OFM& solver, const ofm::DHMemory<float>& theta,
+                             const PlumeSpec& spec, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const int3 y_tile_dim = { td.x, td.y + 1, td.z };
+    const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
+
+    ofm::GetCenteralVecAsync(*solver.u_, td, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_, stream);
+
+    BuoyancyZKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(
+        solver.f_z_->dev_ptr_, z_tile_dim, td, theta.dev_ptr_, spec.g / spec.theta0);
+    CanopyDragKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+        solver.f_x_->dev_ptr_, x_tile_dim, 0, solver.u_->dev_ptr_, td, solver.init_u_x_->dev_ptr_, spec.cd_a);
+    CanopyDragKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
+        solver.f_y_->dev_ptr_, y_tile_dim, 1, solver.u_->dev_ptr_, td, solver.init_u_y_->dev_ptr_, spec.cd_a);
+}
+
+PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
+                       float plane_x, float cvp_z, cudaStream_t stream)
+{
+    const int3 td = solver.tile_dim_;
+    ofm::GetCenteralVecAsync(*(solver.u_), td, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_, stream);
+    solver.u_->DevToHostAsync(stream);
+    theta.DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+
+    const float dx    = solver.dx_;
+    const float3 org  = solver.grid_origin_;
+    const int nx      = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const float* th   = theta.host_ptr_;
+    const float3* uc  = solver.u_->host_ptr_;
+    auto at = [&](int i, int j, int k) { const int3 ijk = { i, j, k }; return IjkToIdx(td, ijk); };
+
+    PlumeDiag d;
+    d.max_theta = 0.0;
+    d.w_max     = 0.0;
+    d.plume_top = 0.0;
+    d.omega_pos = -1.0e30;
+    d.omega_neg = 1.0e30;
+    d.y_pos = d.y_neg = 0.0;
+    d.split_width = 0.0;
+    d.best_x = d.best_omega = d.best_split = 0.0;
+    d.plane_theta = 0.0;
+    d.u_max       = 0.0;
+    d.valid       = false;
+
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++)
+            for (int k = 0; k < nz; k++) {
+                const int id  = at(i, j, k);
+                const double t = th[id];
+                if (t > d.max_theta)
+                    d.max_theta = t;
+                const double w = uc[id].z;
+                if (w > d.w_max)
+                    d.w_max = w;
+                if (t > 0.25) {
+                    const double pz = org.z + (k + 0.5) * dx;
+                    if (pz > d.plume_top)
+                        d.plume_top = pz;
+                }
+            }
+
+    auto clampi = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    const int ip = clampi(static_cast<int>(std::floor((plane_x - org.x) / dx - 0.5)), 1, nx - 2);
+    const int kp = clampi(static_cast<int>(std::floor((cvp_z - org.z) / dx - 0.5)), 1, nz - 2);
+
+    d.u_max = 0.0;
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++)
+            for (int k = 0; k < nz; k++) {
+                const float3 v = uc[at(i, j, k)];
+                const double sp = std::sqrt(static_cast<double>(v.x) * v.x + static_cast<double>(v.y) * v.y);
+                if (sp > d.u_max)
+                    d.u_max = sp;
+            }
+
+    // Vertical vorticity from central differences on the cell-centred velocity,
+    // on every x plane at the same height. The requested plane is reported as
+    // asked for; the strongest plane says where the pair actually is.
+    d.best_x = d.best_omega = d.best_split = 0.0;
+    d.plane_theta = 0.0;
+    for (int i = 1; i < nx - 1; i++) {
+        double wp = -1.0e30, wn = 1.0e30, yp = 0.0, yn = 0.0, th_max = 0.0;
+        for (int j = 1; j < ny - 1; j++) {
+            const double dvdx = (uc[at(i + 1, j, kp)].y - uc[at(i - 1, j, kp)].y) / (2.0 * dx);
+            const double dudy = (uc[at(i, j + 1, kp)].x - uc[at(i, j - 1, kp)].x) / (2.0 * dx);
+            const double wz   = dvdx - dudy;
+            const double py   = org.y + (j + 0.5) * dx;
+            if (wz > wp) { wp = wz; yp = py; }
+            if (wz < wn) { wn = wz; yn = py; }
+            for (int k = 0; k < nz; k++) {
+                const double t = th[at(i, j, k)];
+                if (t > th_max)
+                    th_max = t;
+            }
+        }
+        const double strength = wp > -wn ? wp : -wn;
+        if (wp > 0.0 && wn < 0.0 && strength > d.best_omega) {
+            d.best_omega = strength;
+            d.best_x     = org.x + (i + 0.5) * dx;
+            d.best_split = std::fabs(yp - yn);
+        }
+        if (i == ip) {
+            d.omega_pos   = wp;
+            d.omega_neg   = wn;
+            d.y_pos       = yp;
+            d.y_neg       = yn;
+            d.plane_theta = th_max;
+        }
+    }
+    d.split_width = std::fabs(d.y_pos - d.y_neg);
+    // A counter-rotating pair needs one sign on each side and enough amplitude to
+    // be a structure rather than round-off: the ambient flow carries no omega_z
+    // at all, so 1e-3 1/s is already well clear of the noise.
+    d.valid = d.omega_pos > 1.0e-3 && d.omega_neg < -1.0e-3;
+    return d;
+}
+
 } // namespace selfcheck

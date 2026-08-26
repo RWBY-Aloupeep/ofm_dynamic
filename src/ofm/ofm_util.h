@@ -2,6 +2,8 @@
 
 #include "mem.h"
 
+#include <cstdint>
+
 namespace ofm {
 void GetCenteralVecAsync(DHMemory<float3>& _vec, int3 _tile_dim, const DHMemory<float>& _vec_x, const DHMemory<float>& _vec_y, const DHMemory<float>& _vec_z, cudaStream_t _stream);
 

@@ -245,4 +245,80 @@ double BurgersDamkohlerContour(double gamma_inf, double b_w, double a_extinction
 // The extinction strain rate that places the analytic contour at r = b_w*sqrt(x).
 double ExtinctionRateForContour(double gamma_inf, double b_w, double x);
 
+// ---------------------------------------------------------------------------
+// Stage A: a buoyant plume from a surface heat source in a sheared cross flow,
+// after Cunningham, Goodrick, Hussaini & Linn 2005 (Int. J. Wildland Fire 14,
+// 61-75).
+//
+// Their model solves the compressible equations in a density-stratified
+// atmosphere; this is the solver's incompressible Boussinesq reduction of it.
+// Their base state is neutral -- ambient potential temperature uniform at
+// 300 K -- which is what makes the reduction defensible at all. What it drops
+// is the volume expansion of the heated air, and near the source that is not
+// small: at Q0 = 1 kW/m^3 the parcel-following temperature anomaly reaches
+// several tens of K, so dT/T0 is O(0.1) rather than O(0.01). Treat the plume
+// structure as reproduced and the absolute widths as approximate until the
+// low-Mach extension lands.
+struct PlumeSpec {
+    float u0     = 4.5f;    // m/s, cross-flow speed well above the shear layer
+    float z0     = 100.0f;  // m, shear-layer depth in U(z) = u0*tanh(z/z0)
+    float q0     = 1000.0f; // W/m^3, peak volumetric heating
+    float src_x  = 450.0f;  // m, heat-source centre
+    float src_y  = 600.0f;  // m
+    float r1     = 75.0f;   // m, uniformly heated radius
+    float r2     = 150.0f;  // m, outer radius of the heated area
+    float dwidth = 12.5f;   // m, scale width of the smoothed edge
+    float h      = 25.0f;   // m, vertical decay scale in Q ~ exp(-z/h)
+    float t_ramp = 10.0f;   // s, ramp-up in Q ~ tanh(t/t_ramp)
+    float theta0 = 300.0f;  // K, ambient potential temperature
+    float rho    = 1.177f;  // kg/m^3 at 300 K, 1000 hPa
+    float cp     = 1005.0f; // J/(kg K)
+    float g      = 9.81f;   // m/s^2
+    float cd_a   = 0.025f;  // Cd*a = 0.1 * 0.25 1/m, lowest cell level only
+};
+
+// Inflow and outflow both carry U(z), so mass balances exactly; the lateral and
+// top faces are free-slip walls. This is NOT what Cunningham used -- they put a
+// non-reflecting Orlanski outflow on the lateral and downstream faces and a
+// damping layer under the lid. The solver has no outflow condition, so the
+// downstream face is a prescribed profile instead. Keep the measurement plane
+// well clear of it.
+void SetPlumeBcAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t stream);
+void SetPlumeInitialVelocityAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t stream);
+
+// theta is the potential-temperature anomaly, cell centred, Prod(tile_dim)*512.
+void AddPlumeHeatAsync(ofm::DHMemory<float>& theta, int3 tile_dim, float3 grid_origin, float dx,
+                       const PlumeSpec& spec, float t, float dt, cudaStream_t stream);
+
+// Writes the whole external-force field: f_z = g*theta/theta0 on the z faces,
+// and the canopy drag -Cd*a*|u_h|*u_i on the lowest cell level, zero elsewhere.
+void SetBuoyancyAndDragAsync(ofm::OFM& solver, const ofm::DHMemory<float>& theta,
+                             const PlumeSpec& spec, cudaStream_t stream);
+
+struct PlumeDiag {
+    double max_theta;   // K, over the whole field
+    double plume_top;   // m, highest cell centre with theta > 0.25 K
+    double w_max;       // m/s, over the whole field
+    double omega_pos;   // 1/s, strongest cyclonic vertical vorticity on the plane
+    double omega_neg;   // 1/s, strongest anticyclonic
+    double y_pos;       // m, where omega_pos sits
+    double y_neg;       // m
+    double split_width; // m, |y_pos - y_neg|
+    // Where the pair is actually strongest, found by scanning every x plane at
+    // the same height. A plume that never bends over leaves the requested plane
+    // empty, and then these are the only numbers that say anything.
+    double best_x;      // m
+    double best_omega;  // 1/s, max |omega_z| on that plane
+    double best_split;  // m
+    double plane_theta; // K, peak anomaly on the requested plane
+    double u_max;       // m/s, peak horizontal speed in the domain
+    bool   valid;
+};
+
+// Measured on the y-z plane nearest plane_x, at the height nearest cvp_z, from
+// the cell-centred velocity. Cunningham report positive vertical vorticity on
+// the right-hand side looking downstream and negative on the left.
+PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
+                       float plane_x, float cvp_z, cudaStream_t stream);
+
 } // namespace selfcheck

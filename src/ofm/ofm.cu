@@ -193,7 +193,8 @@ void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
         AdvectN2ZAsync(*tmp_u_z_, tile_dim_, *src_u_z, *last_proj_u_x, *last_proj_u_y, *last_proj_u_z, dx_, mid_dt, _stream);
     }
 
-    SetInletAsync(*bc_val_x_, *bc_val_y_, tile_dim_, inlet_norm_, inlet_angle_, _stream);
+    if (use_uniform_inlet_)
+        SetInletAsync(*bc_val_x_, *bc_val_y_, tile_dim_, inlet_norm_, inlet_angle_, _stream);
 
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Projection 1");

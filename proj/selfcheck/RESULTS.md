@@ -1,4 +1,10 @@
-# D5 baseline: vortex preservation of the solver as shipped
+# D1 baseline: vortex preservation of the solver as shipped
+
+> **Numbering note (2026-08-26).** The Stage 0 diagnostics were renumbered so that the
+> number is the execution order. Old -> new: D5 -> D1 (source-term path integral),
+> D1 -> D2 (circulation attribution), D2 -> D3 (core-radius fitter), D4 unchanged.
+> The curvilinear-grid vorticity operator, withdrawn together with Stage C, no longer
+> holds a number. Commit messages written before this date use the old numbers.
 
 Measured 2026-08-24 on klone (`gpu-l40s`, NVIDIA L40S, CUDA 12.6.3), against the
 unmodified OFM solver in `src/ofm`. These numbers are the regression baseline the
@@ -170,7 +176,7 @@ leap count, and this table is the first measurement of it.
 Raising the leap count, if it is wanted as a published comparison, needs a different ring
 configuration rather than a different scheme. That search is not done here.
 
-## D5: the source-term channel, wired and verified
+## D1: the source-term channel, wired and verified
 
 `RKAxisAccumulateForceAsync` having no caller in either upstream repository left
 the baroclinic, drag and buoyancy terms with no way into the solver, so the channel
@@ -274,7 +280,7 @@ interval rather than lower `dt`.
 `--nu 0` gives the floor for the same configuration. `--res-tiles T` sets the grid to
 `8T` cells per side.
 
-## D1: the circulation budget, and what it says the residual is
+## D2: the circulation budget, and what it says the residual is
 
 With the source channel in place, the circulation attribution follows from the
 flow-map solution rather than needing a separate mechanism. For a material loop C
@@ -360,7 +366,7 @@ third independent argument for the default of 5.
 
 ### Regression
 
-With source terms off, the D5 Burgers case recovers `nu = 1.018662e-03` — bit for
+With source terms off, the D1 Burgers case recovers `nu = 1.018662e-03` — bit for
 bit what it returned before the channel split. The refactor is numerically neutral
 when attribution is not asked for.
 
@@ -375,7 +381,7 @@ when attribution is not asked for.
 
 ### Stretching and tilting, reported separately
 
-The other half of D1. The fire whirl and VLS literature argues that vertical
+The other half of D2. The fire whirl and VLS literature argues that vertical
 vorticity comes from tilting ambient horizontal vorticity rather than from
 stretching, but no paper in the corpus measures the two against each other:
 
@@ -408,7 +414,7 @@ and both terms must vanish: mean `|tilting|` comes back at 2e-15 and mean
 ./build/selfcheck --test tilting --res-tiles 16
 ```
 
-## D2: the Burgers core-radius fitter, and the three-radius ordering
+## D3: the Burgers core-radius fitter, and the three-radius ordering
 
 Tohidi et al. 2018 report that the Burgers model is the best fit for a
 quasi-steady on-source fire whirl, that its azimuthal velocity peaks at
@@ -488,7 +494,7 @@ fit the azimuthal profile measured back off the grid.
 | 64^3 | 3.8 | -1.9e-02 | -9.8e-03 | 1.13817 | +1.54% |
 
 **256^3 and 128^3 pass the 1% criterion; 64^3 does not**, at 3.8 cells across the
-core. This is the same resolution binding the D5 result has, and for the same
+core. This is the same resolution binding the D1 result has, and for the same
 reason.
 
 **Case 3, the ordering.** A Gaussian axial jet of scale `2.6 b_w` supplies `U_z`,
@@ -561,7 +567,7 @@ radius. Evaluating the same expression with the circulation enclosed at radius
 
     A_Gamma(r) = Gamma(r) / (2 r^2),   Da_Gamma(r) = A_e / A_Gamma(r)
 
-`Gamma(r)` is the D1 line integral, so the two diagnostics share their
+`Gamma(r)` is the D2 line integral, so the two diagnostics share their
 measurement of circulation. `CirculationRadialSweep` was added because placing a
 contour needs hundreds of loops and `CirculationOnCircle` pulls the whole field
 back to the host on each call — at 256^3 that is minutes of transfer per contour.
@@ -668,8 +674,8 @@ the simulated time is the same for every interval. The CSV carries per-sample ki
 both ring positions in the (axial, radial) plane, their separation and the running
 leap count.
 
-The other cases are `--test burgers` (D5, the source-term channel), `--test
-attribution` and `--test tilting` (D1), and `--test coreradii` and `--test
-damkohler` (D2 and D4). Each section above gives its own command line. Every case
+The other cases are `--test burgers` (D1, the source-term channel), `--test
+attribution` and `--test tilting` (D2), and `--test coreradii` and `--test
+damkohler` (D3 and D4). Each section above gives its own command line. Every case
 returns a non-zero exit code when it misses its criterion, so a batch script can
 gate on them.

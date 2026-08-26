@@ -108,7 +108,7 @@ public:
     std::shared_ptr<DHMemory<float>> s_axis_y_;
     std::shared_ptr<DHMemory<float>> s_axis_z_;
 
-    // Circulation attribution (D1). When on, each source channel's contribution to
+    // Circulation attribution (D2). When on, each source channel's contribution to
     // the impulse is accumulated separately over the cycle, in the frame of the
     // cycle's start. A line integral of acc_[k] around a material loop's preimage
     // is that channel's contribution to the loop's circulation over the cycle.

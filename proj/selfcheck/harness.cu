@@ -581,7 +581,7 @@ std::vector<double> CirculationRadialSweep(ofm::OFM& solver,
 }
 
 // ---------------------------------------------------------------------------
-// D2: core radii
+// D3: core radii
 // ---------------------------------------------------------------------------
 
 RadialProfile MeasureRadialProfile(ofm::OFM& solver, int kind, float centre_x, float centre_y, float r_max, cudaStream_t stream)

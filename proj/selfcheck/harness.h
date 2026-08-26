@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared setup and measurement helpers for the D5 solver self-check cases.
+// Shared setup and measurement helpers for the D1 solver self-check cases.
 
 #include "ofm.h"
 #include "timer.h"
@@ -147,7 +147,7 @@ std::vector<double> CirculationRadialSweep(ofm::OFM& solver,
                                            float centre_x, float centre_y, const std::vector<double>& radii, int samples, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// D2: core radii
+// D3: core radii
 // ---------------------------------------------------------------------------
 
 // An azimuthally and axially averaged radial profile, binned at the grid

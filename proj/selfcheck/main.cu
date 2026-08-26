@@ -1,4 +1,4 @@
-// D5 solver self-check suite.
+// D1 solver self-check suite.
 //
 // Establishes quantitative baselines for the shipped OFM solver on the vortex
 // preservation cases LFM uses. OFM's own thesis reports only visual comparisons,
@@ -459,7 +459,7 @@ int RunBurgersViscous(int total_steps, int diag_every, const char* csv_path, Bur
     return 0;
 }
 
-// D1: circulation budget and attribution, checked two ways against an exact solution.
+// D2: circulation budget and attribution, checked two ways against an exact solution.
 //
 // For a material loop C, the flow-map solution gives the circulation directly:
 //
@@ -596,7 +596,7 @@ int RunAttribution(int total_steps, int diag_every, const char* csv_path, Burger
     }
 
     fclose(csv);
-    printf("\n=== D1 circulation budget ===\n");
+    printf("\n=== D2 circulation budget ===\n");
     printf("channel split at the last sample:  viscous %.8f   external %.8f\n",
            acc_gamma[ofm::kChanViscous], acc_gamma[ofm::kChanExternal]);
     printf("dual-path (budget vs direct)    : %.2f%%\n", 100.0 * last_dual);
@@ -605,7 +605,7 @@ int RunAttribution(int total_steps, int diag_every, const char* csv_path, Burger
     return 0;
 }
 
-// D1, second half: stretching and tilting reported separately.
+// D2, second half: stretching and tilting reported separately.
 //
 // The fire whirl and VLS literature argues that vertical vorticity comes from
 // tilting ambient horizontal vorticity rather than from stretching, but nobody has
@@ -676,13 +676,13 @@ int RunTiltingStretching(int res_tiles, float core, float circulation)
     printf("  mean |stretching| %.3e\n\n", b.stretching_abs_mean);
 
     const bool pass = std::fabs(tilt_err) < 1e-4 && std::fabs(stretch_err) < 1e-4;
-    printf("=== D1 tilting/stretching ===\n");
+    printf("=== D2 tilting/stretching ===\n");
     printf("%s: the split reproduces the analytic terms to %.1e and %.1e\n",
            pass ? "PASS" : "FAIL", std::fabs(tilt_err), std::fabs(stretch_err));
     return pass ? 0 : 1;
 }
 
-// D2: the Burgers core-radius fitter, and the three-radius ordering.
+// D3: the Burgers core-radius fitter, and the three-radius ordering.
 //
 // Tohidi et al. 2018 report that the Burgers model is the best fit for a
 // quasi-steady on-source fire whirl, that the azimuthal velocity of that model
@@ -829,7 +829,7 @@ int RunCoreRadii(int res_tiles, float core, float circulation, const char* csv_p
     // The criterion is Tohidi's: the peak sits at 1.12091 b_w, and the ordering
     // holds. 1% is the tolerance the rest of Stage 0 is held to.
     const bool pass = f2.ok && std::fabs(e2_r) < 0.01 && std::fabs(e2_b) < 0.01 && ordered;
-    printf("=== D2 core radii ===\n");
+    printf("=== D3 core radii ===\n");
     printf("%s: r_peak/b_w = %.5f (model %.5f, %+.2f%%), b_w to %+.2f%%, ordering %s\n",
            pass ? "PASS" : "FAIL", f2.ratio, peak_const, 100.0 * e2_r, 100.0 * e2_b,
            ordered ? "holds" : "fails");

@@ -831,3 +831,87 @@ Running the sweep also needs `module load cuda/12.6.3 gcc/11.2.0` and a login
 shell. `gcc/11.2.0` is what supplies the `GLIBCXX_3.4.29` the binary links
 against; the cuda module only adds its own `lib64`, and `module` itself is a
 shell function that a non-login `sbatch` shell does not have.
+
+### The z0 and Q0 sweep
+
+Same coarse grid, `mu = 4 kg/(m s)`, 600 s, split width read on the `x = 1750 m`
+plane at `z = 25 m`. Widths are quantised to `dx = 18.75 m`, so the useful
+content here is the ordering, not the value.
+
+| `z0` \ `Q0` | 1000 W/m^3 | 500 W/m^3 |
+|---|---|---|
+| 50 m | 131.2 m | 112.5 m |
+| 100 m | 206.2 m | 131.2 m |
+| 150 m | 243.8 m | 206.2 m |
+
+**The `z0` ordering reproduces.** Both columns are monotone: a deeper cross-flow
+shear layer gives a wider split, which is the paper's principal result from this
+set.
+
+**The `Q0` ordering does not.** Cunningham report a *wider* bifurcation for the
+*weaker* source; every row here has the weaker source narrower. Before reading
+that as a physics failure, note two things.
+
+First, the two are probably not the same measurement. The paper's Fig. 6 shows
+the bifurcation of the **potential-temperature** cross-section; `MeasurePlume`
+reports the spanwise separation of the two **`omega_z` extrema**. Those track
+each other loosely at best, and comparing them as if they were the same number
+is not a fair test. Measuring the theta bifurcation directly is the fix, and it
+is the next change to the diagnostic.
+
+Second, the runs do support the mechanism the paper conjectures for it -- that
+the width is set by how long a buoyant parcel takes to rise through the shear
+layer. The weak-source pairs form measurably further downstream: `x` = 797, 853
+and 1059 m against 703, 722 and 703 m for the strong source. A slower rise puts
+the pair further down the domain, which is exactly the picture. What that does
+to the width at one fixed plane is a different question.
+
+### The viscosity sweep says nothing, and that is the result
+
+`z0 = 100 m`, `Q0 = 1 kW/m^3`, `mu` = 4, 1, 0.15, 0.0015 kg/(m s) -- a range of
+2700 in the physical viscosity:
+
+| `mu` | split @ 1750 m | strongest plane | `|omega_z|` there |
+|---|---|---|---|
+| 4 | 206.2 m | x = 703 m | 0.0216 1/s |
+| 1 | 206.2 m | x = 703 m | 0.0244 |
+| 0.15 | 206.2 m | x = 703 m | 0.0253 |
+| 0.0015 | 206.2 m | x = 703 m | 0.0255 |
+
+Identical split, identical plane, and `|omega_z|` moving by 18% across a factor
+of 2700. The paper's runs go from a laminar symmetric bifurcation at `mu = 4` to
+a turbulent asymmetric plume at `mu = 0.0015`; nothing like that happens here.
+
+The reason is the one D1 made measurable: **the numerical dissipation floor sits
+above all but the largest `mu`**. At `dx = 18.75 m` the scheme's own dissipation
+is what sets the effective Reynolds number, so asking for a smaller `mu` changes
+nothing. A sweep whose parameter is below the floor is not a sweep, and the four
+identical rows are the cleanest possible demonstration of it -- no floor run
+needed, the collapse itself is the evidence.
+
+This is a resolution statement, not a solver defect, and it is the same shape as
+the D1 and D3/D4 results: the criterion is bound to the grid. Reproducing the
+paper's Reynolds-number progression needs the 10 m grid at least, and probably
+the same `nu = 0` control run D1 uses to put a number on the floor.
+
+### Regression
+
+`use_uniform_inlet_` defaults to `true`, so `AdvanceAsync` behaves exactly as
+before for every case that does not ask otherwise. The D1 Burgers run confirms
+it: `-0.40%` at step 1 and `-0.33%` at step 481, matching the recorded table row
+for row.
+
+### What is next, in order
+
+1. **Measure the theta bifurcation, not the `omega_z` extrema separation.** The
+   `Q0` comparison is not a fair test until it compares the same quantity the
+   paper plots.
+2. **Run at the paper's `dx = 10 m`.** `--tiles 23 15 19` is already the default
+   in the case; only the coarse sweep was run cheap. The viscosity sweep is
+   meaningless below that resolution and possibly at it.
+3. **An outflow condition.** Everything measured at `x = 1750 m` is 50 m from a
+   prescribed-profile face. This needs its own verification case before any
+   width from that plane is quotable.
+4. **Wire the buoyancy and the theta advection to `mid_u_[i]`** so the case can
+   run at `reinit_every = 5`, which is what the D2 residual argues for and what
+   this case, running at `n = 1`, is currently paying for in dissipation.

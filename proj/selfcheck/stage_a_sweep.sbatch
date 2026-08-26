@@ -49,7 +49,10 @@ for mu in 4 1 0.15 0.0015; do
 done
 
 echo
-echo "split widths (last diagnostic row of each run):"
+echo "last diagnostic row of each run:"
+printf '%-24s %10s %10s %12s %12s\n' run 'split@plane' best_x best_omega best_split
 for f in "$OUT"/*.csv; do
-  printf '%-24s %s\n' "$(basename "$f" .csv)" "$(tail -1 "$f" | awk -F, '{print $10}')"
+  # columns: ...,split_width=12,best_x=13,best_omega=14,best_split=15
+  tail -1 "$f" | awk -F, -v n="$(basename "$f" .csv)" \
+    '{printf "%-24s %10.1f %10.1f %12.4e %12.1f\n", n, $12, $13, $14, $15}'
 done

@@ -431,6 +431,37 @@ void SetShearFieldAsync(ofm::OFM& solver, const ShearSpec& spec, cudaStream_t st
         solver.init_u_z_->dev_ptr_, z_tile_dim, 2, solver.grid_origin_, solver.dx_, spec);
 }
 
+__global__ void AddAxialJetKernel(float* u_z, int3 z_tile_dim, float3 grid_origin, float dx, selfcheck::AxialJetSpec spec)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(z_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        const int idx        = tile_idx * 512 + voxel_idx;
+
+        // The z component sits on the face centre in x and y.
+        const float px = grid_origin.x + (ijk.x + 0.5f) * dx;
+        const float py = grid_origin.y + (ijk.y + 0.5f) * dx;
+        const float rx = px - spec.centre_x;
+        const float ry = py - spec.centre_y;
+        const float r2 = rx * rx + ry * ry;
+
+        u_z[idx] += spec.w_peak * expf(-r2 / (spec.scale * spec.scale));
+    }
+}
+
+void SetAxialJetAsync(ofm::OFM& solver, const AxialJetSpec& spec, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
+    AddAxialJetKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(
+        solver.init_u_z_->dev_ptr_, z_tile_dim, solver.grid_origin_, solver.dx_, spec);
+}
+
 TiltStretch MeasureTiltingStretching(ofm::OFM& solver, cudaStream_t stream)
 {
     const int3 td = solver.tile_dim_;
@@ -517,6 +548,369 @@ double CirculationOnCircle(ofm::OFM& solver,
         total += (-v.x * std::sin(th) + v.y * std::cos(th)) * radius * dtheta;
     }
     return total;
+}
+
+std::vector<double> CirculationRadialSweep(ofm::OFM& solver,
+                                           const ofm::DHMemory<float>& field_x, const ofm::DHMemory<float>& field_y, const ofm::DHMemory<float>& field_z,
+                                           float centre_x, float centre_y, const std::vector<double>& radii, int samples, cudaStream_t stream)
+{
+    const int3 td = solver.tile_dim_;
+    ofm::GetCenteralVecAsync(*(solver.u_), td, field_x, field_y, field_z, stream);
+    solver.u_->DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+
+    const float dx  = solver.dx_;
+    const double cz = solver.grid_origin_.z + 0.5 * (td.z * 8) * dx;
+    const double pi = 3.14159265358979323846;
+    const double dtheta = 2.0 * pi / samples;
+
+    std::vector<double> out(radii.size(), 0.0);
+    for (size_t i = 0; i < radii.size(); i++) {
+        const double radius = radii[i];
+        double total = 0.0;
+        for (int s = 0; s < samples; s++) {
+            const double th = (s + 0.5) * dtheta;
+            const double px = centre_x + radius * std::cos(th);
+            const double py = centre_y + radius * std::sin(th);
+            const float3 v  = SampleCentred(solver.u_->host_ptr_, td, solver.grid_origin_, dx, px, py, cz);
+            total += (-v.x * std::sin(th) + v.y * std::cos(th)) * radius * dtheta;
+        }
+        out[i] = total;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// D2: core radii
+// ---------------------------------------------------------------------------
+
+RadialProfile MeasureRadialProfile(ofm::OFM& solver, int kind, float centre_x, float centre_y, float r_max, cudaStream_t stream)
+{
+    const int3 td = solver.tile_dim_;
+    ofm::GetCenteralVecAsync(*(solver.u_), td, *(solver.init_u_x_), *(solver.init_u_y_), *(solver.init_u_z_), stream);
+    solver.u_->DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const float dx = solver.dx_;
+
+    RadialProfile out;
+    const int bin_num = static_cast<int>(r_max / dx);
+    std::vector<double> sum(bin_num, 0.0);
+    std::vector<long long> count(bin_num, 0);
+
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++) {
+            const float px = solver.grid_origin_.x + (i + 0.5f) * dx;
+            const float py = solver.grid_origin_.y + (j + 0.5f) * dx;
+            const float rx = px - centre_x;
+            const float ry = py - centre_y;
+            const float r  = sqrtf(rx * rx + ry * ry);
+            const int bin  = static_cast<int>(r / dx);
+            if (bin >= bin_num || r < 1e-6f)
+                continue;
+            for (int k = 0; k < nz; k++) {
+                const float3 v = solver.u_->host_ptr_[IjkToIdx(td, { i, j, k })];
+                if (!isfinite(v.x) || !isfinite(v.y) || !isfinite(v.z)) {
+                    out.valid = false;
+                    return out;
+                }
+                sum[bin] += (kind == kProfileAzimuthal) ? ((-v.x * ry + v.y * rx) / r) : v.z;
+                count[bin]++;
+            }
+        }
+
+    for (int b = 0; b < bin_num; b++) {
+        if (count[b] == 0)
+            continue;
+        out.r.push_back((b + 0.5) * dx);
+        out.v.push_back(sum[b] / count[b]);
+    }
+    return out;
+}
+
+RadialProfile GaussianProfileOnGrid(const ofm::OFM& solver, float centre_x, float centre_y, float r_max,
+                                    double amplitude, double scale)
+{
+    const int3 td = solver.tile_dim_;
+    const int nx = td.x * 8, ny = td.y * 8;
+    const float dx = solver.dx_;
+
+    RadialProfile out;
+    const int bin_num = static_cast<int>(r_max / dx);
+    std::vector<double> sum(bin_num, 0.0);
+    std::vector<long long> count(bin_num, 0);
+
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++) {
+            const float px = solver.grid_origin_.x + (i + 0.5f) * dx;
+            const float py = solver.grid_origin_.y + (j + 0.5f) * dx;
+            const double rx = px - centre_x;
+            const double ry = py - centre_y;
+            const double r  = std::sqrt(rx * rx + ry * ry);
+            const int bin   = static_cast<int>(r / dx);
+            if (bin >= bin_num || r < 1e-6)
+                continue;
+            sum[bin] += amplitude * std::exp(-r * r / (scale * scale));
+            count[bin]++;
+        }
+
+    for (int b = 0; b < bin_num; b++) {
+        if (count[b] == 0)
+            continue;
+        out.r.push_back((b + 0.5) * dx);
+        out.v.push_back(sum[b] / count[b]);
+    }
+    return out;
+}
+
+namespace {
+
+// The Burgers shape function, with Gamma_inf factored out.
+double BurgersBasis(double r, double b)
+{
+    const double pi = 3.14159265358979323846;
+    return (1.0 - std::exp(-r * r / (b * b))) / (2.0 * pi * r);
+}
+
+// Residual of the best fit at a fixed core radius. Gamma_inf enters linearly, so
+// it is eliminated by its own normal equation rather than searched over.
+double BurgersResidual(const RadialProfile& p, double b, double* gamma_out)
+{
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < p.r.size(); i++) {
+        const double phi = BurgersBasis(p.r[i], b);
+        num += phi * p.v[i];
+        den += phi * phi;
+    }
+    const double gamma = (den > 0.0) ? num / den : 0.0;
+    if (gamma_out)
+        *gamma_out = gamma;
+
+    double s = 0.0;
+    for (size_t i = 0; i < p.r.size(); i++) {
+        const double d = p.v[i] - gamma * BurgersBasis(p.r[i], b);
+        s += d * d;
+    }
+    return s;
+}
+
+// Peak of a sampled profile, refined by the vertex of the parabola through the
+// maximum bin and its two neighbours. Without this the peak radius is quantised
+// at the grid spacing, which is coarser than the quantity being tested.
+double RefinedPeakRadius(const RadialProfile& p, double* peak_value)
+{
+    size_t best = 0;
+    for (size_t i = 1; i < p.v.size(); i++)
+        if (p.v[i] > p.v[best])
+            best = i;
+    if (peak_value)
+        *peak_value = p.v[best];
+    if (best == 0 || best + 1 >= p.v.size())
+        return p.r[best];
+
+    const double y0 = p.v[best - 1], y1 = p.v[best], y2 = p.v[best + 1];
+    const double denom = y0 - 2.0 * y1 + y2;
+    if (std::fabs(denom) < 1e-30)
+        return p.r[best];
+    const double shift = 0.5 * (y0 - y2) / denom; // in bins, within [-0.5, 0.5]
+    const double dr    = p.r[best] - p.r[best - 1];
+    return p.r[best] + shift * dr;
+}
+
+} // namespace
+
+BurgersFit FitBurgers(const RadialProfile& profile)
+{
+    BurgersFit fit = { 0.0, 0.0, 0.0, 0.0, 0.0, 0, false };
+    if (!profile.valid || profile.r.size() < 8)
+        return fit;
+
+    const double r_lo = profile.r.front();
+    const double r_hi = profile.r.back();
+
+    // Coarse scan first: the residual is smooth in b but the bracket has to be
+    // found before a golden-section search can be trusted to be unimodal.
+    double best_b = r_lo, best_s = 1e300;
+    const int scan = 400;
+    for (int i = 0; i <= scan; i++) {
+        const double b = r_lo * 0.25 + (r_hi - r_lo * 0.25) * i / scan;
+        if (b <= 0.0)
+            continue;
+        const double s = BurgersResidual(profile, b, nullptr);
+        if (s < best_s) {
+            best_s = s;
+            best_b = b;
+        }
+    }
+
+    const double step = (r_hi - r_lo * 0.25) / scan;
+    double lo = best_b - step, hi = best_b + step;
+    if (lo <= 0.0)
+        lo = 1e-6;
+
+    const double gr = 0.6180339887498949;
+    double c = hi - gr * (hi - lo), d = lo + gr * (hi - lo);
+    double fc = BurgersResidual(profile, c, nullptr);
+    double fd = BurgersResidual(profile, d, nullptr);
+    int iters = 0;
+    while (hi - lo > 1e-12 && iters < 200) {
+        if (fc < fd) {
+            hi = d; d = c; fd = fc;
+            c  = hi - gr * (hi - lo);
+            fc = BurgersResidual(profile, c, nullptr);
+        } else {
+            lo = c; c = d; fc = fd;
+            d  = lo + gr * (hi - lo);
+            fd = BurgersResidual(profile, d, nullptr);
+        }
+        iters++;
+    }
+
+    const double b = 0.5 * (lo + hi);
+    double gamma = 0.0;
+    const double s = BurgersResidual(profile, b, &gamma);
+
+    double peak_value = 0.0;
+    const double r_peak = RefinedPeakRadius(profile, &peak_value);
+
+    fit.b_w       = b;
+    fit.gamma_inf = gamma;
+    fit.r_peak    = r_peak;
+    fit.ratio     = (b > 0.0) ? r_peak / b : 0.0;
+    fit.rms_rel   = (peak_value > 0.0) ? std::sqrt(s / profile.r.size()) / peak_value : 0.0;
+    fit.iters     = iters;
+    fit.ok        = true;
+    return fit;
+}
+
+double BurgersPeakConstant()
+{
+    // d/dr [ (1 - exp(-r^2/b^2)) / r ] = 0 reduces, with x = r^2/b^2, to
+    // exp(-x)(2x + 1) = 1, whose non-trivial root is near x = 1.2564.
+    auto f = [](double x) { return std::exp(-x) * (2.0 * x + 1.0) - 1.0; };
+    double lo = 0.5, hi = 5.0;
+    for (int i = 0; i < 200; i++) {
+        const double mid = 0.5 * (lo + hi);
+        if (f(lo) * f(mid) <= 0.0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return std::sqrt(0.5 * (lo + hi));
+}
+
+double RadiusAtFraction(const RadialProfile& profile, double fraction)
+{
+    if (!profile.valid || profile.r.empty())
+        return -1.0;
+
+    size_t best = 0;
+    for (size_t i = 1; i < profile.v.size(); i++)
+        if (profile.v[i] > profile.v[best])
+            best = i;
+
+    const double target = fraction * profile.v[best];
+    for (size_t i = best + 1; i < profile.v.size(); i++) {
+        if (profile.v[i] <= target) {
+            const double v0 = profile.v[i - 1], v1 = profile.v[i];
+            if (std::fabs(v0 - v1) < 1e-30)
+                return profile.r[i];
+            const double t = (v0 - target) / (v0 - v1);
+            return profile.r[i - 1] + t * (profile.r[i] - profile.r[i - 1]);
+        }
+    }
+    return -1.0; // never falls that far inside the sampled range
+}
+
+double RadiusFromFluxes(const RadialProfile& axial)
+{
+    if (!axial.valid || axial.r.size() < 2)
+        return -1.0;
+
+    // Trapezoidal quadrature of Q_hat = int u_z r dr and M_hat = int u_z^2 r dr.
+    double q = 0.0, m = 0.0;
+    for (size_t i = 1; i < axial.r.size(); i++) {
+        const double dr = axial.r[i] - axial.r[i - 1];
+        const double a0 = axial.v[i - 1] * axial.r[i - 1];
+        const double a1 = axial.v[i] * axial.r[i];
+        const double b0 = axial.v[i - 1] * axial.v[i - 1] * axial.r[i - 1];
+        const double b1 = axial.v[i] * axial.v[i] * axial.r[i];
+        q += 0.5 * (a0 + a1) * dr;
+        m += 0.5 * (b0 + b1) * dr;
+    }
+    if (m <= 0.0)
+        return -1.0;
+    return q / std::sqrt(m);
+}
+
+// ---------------------------------------------------------------------------
+// D4: vortex-flame Damkohler number
+// ---------------------------------------------------------------------------
+
+DamkohlerCurve MeasureDamkohler(ofm::OFM& solver, float centre_x, float centre_y,
+                                double a_extinction, double r_min, double r_max, int radius_samples,
+                                int loop_samples, cudaStream_t stream)
+{
+    DamkohlerCurve out;
+    out.r_contour = -1.0;
+    out.valid     = true;
+
+    out.r.resize(radius_samples);
+    for (int i = 0; i < radius_samples; i++)
+        out.r[i] = r_min + (r_max - r_min) * i / (radius_samples - 1);
+
+    out.gamma = CirculationRadialSweep(solver, *(solver.init_u_x_), *(solver.init_u_y_), *(solver.init_u_z_),
+                                       centre_x, centre_y, out.r, loop_samples, stream);
+
+    out.a_gamma.resize(radius_samples);
+    out.da.resize(radius_samples);
+    for (int i = 0; i < radius_samples; i++) {
+        if (!isfinite(out.gamma[i])) {
+            out.valid = false;
+            return out;
+        }
+        out.a_gamma[i] = out.gamma[i] / (2.0 * out.r[i] * out.r[i]);
+        out.da[i]      = (out.a_gamma[i] != 0.0) ? a_extinction / out.a_gamma[i] : 1e300;
+    }
+
+    // Da_Gamma rises with radius for a Burgers vortex, so the extinction region
+    // is the disc inside the first upward crossing of unity.
+    for (int i = 1; i < radius_samples; i++) {
+        if ((out.da[i - 1] - 1.0) <= 0.0 && (out.da[i] - 1.0) > 0.0) {
+            const double d0 = out.da[i - 1] - 1.0, d1 = out.da[i] - 1.0;
+            const double t  = d0 / (d0 - d1);
+            out.r_contour   = out.r[i - 1] + t * (out.r[i] - out.r[i - 1]);
+            break;
+        }
+    }
+    return out;
+}
+
+double BurgersDamkohlerContour(double gamma_inf, double b_w, double a_extinction)
+{
+    const double kappa = 2.0 * a_extinction * b_w * b_w / gamma_inf;
+    if (kappa >= 1.0)
+        return -1.0; // Da_Gamma >= 1 everywhere: no extinction region
+
+    auto g = [](double x) { return (1.0 - std::exp(-x)) / x; };
+    double lo = 1e-12, hi = 1.0;
+    while (g(hi) > kappa && hi < 1e12)
+        hi *= 2.0;
+    for (int i = 0; i < 300; i++) {
+        const double mid = 0.5 * (lo + hi);
+        if (g(mid) > kappa)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return b_w * std::sqrt(0.5 * (lo + hi));
+}
+
+double ExtinctionRateForContour(double gamma_inf, double b_w, double x)
+{
+    const double kappa = (1.0 - std::exp(-x)) / x;
+    return kappa * gamma_inf / (2.0 * b_w * b_w);
 }
 
 HostField DownloadVorticityNorm(ofm::OFM& solver, cudaStream_t stream)

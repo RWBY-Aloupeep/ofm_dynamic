@@ -682,6 +682,269 @@ int RunTiltingStretching(int res_tiles, float core, float circulation)
     return pass ? 0 : 1;
 }
 
+// D2: the Burgers core-radius fitter, and the three-radius ordering.
+//
+// Tohidi et al. 2018 report that the Burgers model is the best fit for a
+// quasi-steady on-source fire whirl, that the azimuthal velocity of that model
+// peaks at r = 1.12091 b_w (Sec. 4.1, Eq. 7), and that three core radii can be
+// defined -- b_A from the axial velocity, b_T from the excess temperature, b_w
+// from the azimuthal velocity -- which satisfy b_A > b_T > b_w throughout the
+// height of a fire whirl (Sec. 4.2, Fig. 7, after Lei et al. 2015b).
+//
+// This calibrates the estimators, not the solver: fields with known radii go in,
+// no time stepping happens, and what comes out is compared with the closed form.
+int RunCoreRadii(int res_tiles, float core, float circulation, const char* csv_path)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim = { res_tiles, res_tiles, res_tiles };
+    config.len_y    = 1.0f;
+    config.cg_iter  = 15;
+
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+
+    const float dx       = solver.dx_;
+    const float centre_x = 0.5f;
+    const float centre_y = 0.5f;
+    const float r_max    = 0.45f;
+
+    const double peak_const = selfcheck::BurgersPeakConstant();
+
+    printf("core-radius estimators, grid %d^3  (dx = %.6f)\n", res_tiles * 8, dx);
+    printf("  peak constant from the model root exp(-x)(2x+1) = 1: %.6f"
+           "   (Tohidi et al. 2018 quote 1.12091)\n\n", peak_const);
+
+    // --- case 1: the fitter alone, on an exactly sampled analytic profile ---
+    //
+    // Same radial bins the grid produces, but the values are the closed form, so
+    // the only error left is the fit itself.
+    selfcheck::RadialProfile exact;
+    {
+        const double pi = 3.14159265358979323846;
+        const int bins  = static_cast<int>(r_max / dx);
+        for (int b = 0; b < bins; b++) {
+            const double r = (b + 0.5) * dx;
+            exact.r.push_back(r);
+            exact.v.push_back(circulation / (2.0 * pi * r) * (1.0 - std::exp(-r * r / (static_cast<double>(core) * core))));
+        }
+    }
+    const selfcheck::BurgersFit f1 = selfcheck::FitBurgers(exact);
+    const double e1_b = (f1.b_w - core) / core;
+    const double e1_g = (f1.gamma_inf - circulation) / circulation;
+
+    printf("case 1 -- fitter on the analytic profile (b_w = %.4f, Gamma_inf = %.4f)\n", core, circulation);
+    printf("  b_w          fitted %.8f   exact %.8f   rel err %+.3e\n", f1.b_w, core, e1_b);
+    printf("  Gamma_inf    fitted %.8f   exact %.8f   rel err %+.3e\n", f1.gamma_inf, circulation, e1_g);
+    printf("  r_peak / b_w        %.6f   model %.6f   rel err %+.3e\n",
+           f1.ratio, peak_const, (f1.ratio - peak_const) / peak_const);
+    printf("  residual RMS / peak %.3e   (%d golden-section iterations)\n\n", f1.rms_rel, f1.iters);
+
+    // --- case 2: the whole pipeline, on the field the solver actually holds ---
+    solver.init_u_x_->ClearDevAsync(stream);
+    solver.init_u_y_->ClearDevAsync(stream);
+    solver.init_u_z_->ClearDevAsync(stream);
+    const selfcheck::ColumnVortexSpec col = { centre_x, centre_y, core, circulation };
+    selfcheck::AddColumnVortexAsync(solver, col, true, stream);
+    cudaStreamSynchronize(stream);
+
+    const selfcheck::RadialProfile p2 = selfcheck::MeasureRadialProfile(solver, selfcheck::kProfileAzimuthal, centre_x, centre_y, r_max, stream);
+    const selfcheck::BurgersFit f2 = selfcheck::FitBurgers(p2);
+    if (!f2.ok) {
+        printf("case 2: fit failed\n");
+        return 1;
+    }
+    const double e2_b = (f2.b_w - core) / core;
+    const double e2_r = (f2.ratio - peak_const) / peak_const;
+
+    printf("case 2 -- seeded and projected on the grid, fitted from U_theta(r)\n");
+    printf("  b_w          fitted %.8f   seeded %.8f   rel err %+.3e   (%.1f cells)\n",
+           f2.b_w, core, e2_b, core / dx);
+    printf("  Gamma_inf    fitted %.8f   seeded %.8f   rel err %+.3e\n",
+           f2.gamma_inf, circulation, (f2.gamma_inf - circulation) / circulation);
+    printf("  r_peak / b_w        %.6f   model %.6f   rel err %+.3e\n", f2.ratio, peak_const, e2_r);
+    printf("  residual RMS / peak %.3e\n\n", f2.rms_rel);
+
+    // --- case 3: the ordering b_A > b_T > b_w ---
+    //
+    // b_A comes from a Gaussian axial jet and b_T from an analytic excess
+    // temperature binned the same way; the solver carries no temperature field
+    // until the low-Mach extension, so that leg exercises the estimator rather
+    // than a simulated field. Scales are chosen so the ordering is strict.
+    const double scale_a = 2.6 * core; // axial velocity Gaussian scale
+    const double scale_t = 1.8 * core; // excess temperature Gaussian scale
+    const double sqrt_ln2 = std::sqrt(std::log(2.0));
+
+    solver.init_u_x_->ClearDevAsync(stream);
+    solver.init_u_y_->ClearDevAsync(stream);
+    solver.init_u_z_->ClearDevAsync(stream);
+    selfcheck::AddColumnVortexAsync(solver, col, false, stream); // analytic, not projected
+    const selfcheck::AxialJetSpec jet = { centre_x, centre_y, static_cast<float>(scale_a), 1.0f };
+    selfcheck::SetAxialJetAsync(solver, jet, stream);
+    cudaStreamSynchronize(stream);
+
+    const selfcheck::RadialProfile pw = selfcheck::MeasureRadialProfile(solver, selfcheck::kProfileAzimuthal, centre_x, centre_y, r_max, stream);
+    const selfcheck::RadialProfile pa = selfcheck::MeasureRadialProfile(solver, selfcheck::kProfileAxial, centre_x, centre_y, r_max, stream);
+    const selfcheck::RadialProfile pt = selfcheck::GaussianProfileOnGrid(solver, centre_x, centre_y, r_max, 1.0, scale_t);
+
+    const selfcheck::BurgersFit f3 = selfcheck::FitBurgers(pw);
+    const double b_w_m  = f3.b_w;
+    const double b_a_m  = selfcheck::RadiusAtFraction(pa, 0.5);
+    const double b_t_m  = selfcheck::RadiusAtFraction(pt, 0.5);
+    const double b_a_fx = selfcheck::RadiusFromFluxes(pa);
+
+    const double b_a_exact = scale_a * sqrt_ln2;
+    const double b_t_exact = scale_t * sqrt_ln2;
+
+    printf("case 3 -- the three radii, and their ordering\n");
+    printf("  b_A  half-max of U_z     %.8f   exact %.8f   rel err %+.3e\n",
+           b_a_m, b_a_exact, (b_a_m - b_a_exact) / b_a_exact);
+    printf("  b_A  flux form Q/sqrt(M) %.8f   exact %.8f   rel err %+.3e\n",
+           b_a_fx, scale_a, (b_a_fx - scale_a) / scale_a);
+    printf("  b_T  half-max of dT      %.8f   exact %.8f   rel err %+.3e\n",
+           b_t_m, b_t_exact, (b_t_m - b_t_exact) / b_t_exact);
+    printf("  b_w  Burgers fit         %.8f   exact %.8f   rel err %+.3e\n",
+           b_w_m, static_cast<double>(core), (b_w_m - core) / core);
+    const bool ordered = (b_a_m > b_t_m) && (b_t_m > b_w_m);
+    printf("  ordering b_A > b_T > b_w : %s   (%.4f > %.4f > %.4f)\n\n",
+           ordered ? "holds" : "FAILS", b_a_m, b_t_m, b_w_m);
+
+    if (csv_path) {
+        FILE* csv = fopen(csv_path, "w");
+        if (csv) {
+            fprintf(csv, "r,u_theta,u_z,dT,burgers_fit\n");
+            const double pi = 3.14159265358979323846;
+            for (size_t i = 0; i < pw.r.size(); i++) {
+                const double r   = pw.r[i];
+                const double fit = f3.gamma_inf / (2.0 * pi * r) * (1.0 - std::exp(-r * r / (f3.b_w * f3.b_w)));
+                fprintf(csv, "%.8f,%.8f,%.8f,%.8f,%.8f\n",
+                        r, pw.v[i], i < pa.v.size() ? pa.v[i] : 0.0, i < pt.v.size() ? pt.v[i] : 0.0, fit);
+            }
+            fclose(csv);
+            printf("csv: %s\n", csv_path);
+        }
+    }
+
+    // The criterion is Tohidi's: the peak sits at 1.12091 b_w, and the ordering
+    // holds. 1% is the tolerance the rest of Stage 0 is held to.
+    const bool pass = f2.ok && std::fabs(e2_r) < 0.01 && std::fabs(e2_b) < 0.01 && ordered;
+    printf("=== D2 core radii ===\n");
+    printf("%s: r_peak/b_w = %.5f (model %.5f, %+.2f%%), b_w to %+.2f%%, ordering %s\n",
+           pass ? "PASS" : "FAIL", f2.ratio, peak_const, 100.0 * e2_r, 100.0 * e2_b,
+           ordered ? "holds" : "fails");
+    return pass ? 0 : 1;
+}
+
+// D4: the vortex-flame Damkohler number.
+//
+// Linan, Vera & Sanchez 2015 (Sec. 7) define the strain a vortex imposes on a
+// flame as A_Gamma = Gamma / (2 r0^2) and the vortex Damkohler number as
+// Da_Gamma = A_e / A_Gamma, the ratio of the vortex turnover time to the chemical
+// time, and state that local extinction is to be expected for Da_Gamma <~ 1.
+// This is the self-check on the prescribed-heat-source assumption: where
+// Da_Gamma falls below one, that assumption has no support.
+//
+// Evaluated pointwise by taking Gamma and r0 at the same radius. On an analytic
+// Burgers vortex the Da_Gamma = 1 contour is a circle whose radius solves
+// (1 - exp(-x))/x = 2 A_e b_w^2 / Gamma_inf with x = (r/b_w)^2, which is what the
+// measured contour is compared against.
+int RunDamkohler(int res_tiles, float core, float circulation, const char* csv_path)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim = { res_tiles, res_tiles, res_tiles };
+    config.len_y    = 1.0f;
+    config.cg_iter  = 15;
+
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+
+    const float dx       = solver.dx_;
+    const float centre_x = 0.5f;
+    const float centre_y = 0.5f;
+
+    const selfcheck::ColumnVortexSpec col = { centre_x, centre_y, core, circulation };
+    selfcheck::AddColumnVortexAsync(solver, col, true, stream);
+    cudaStreamSynchronize(stream);
+
+    printf("vortex-flame Damkohler number, grid %d^3  (dx = %.6f)\n", res_tiles * 8, dx);
+    printf("  Burgers column: b_w = %.4f (%.1f cells), Gamma_inf = %.4f\n",
+           core, core / dx, circulation);
+    printf("  A_Gamma = Gamma(r) / (2 r^2),  Da_Gamma = A_e / A_Gamma"
+           "   (Linan, Vera & Sanchez 2015, Sec. 7)\n\n");
+
+    // Radii the contour is searched over. The sweep starts one cell out, where
+    // the loop integral first has cells to interpolate from.
+    const double r_min = 2.0 * dx;
+    const double r_max = 0.40;
+    const int radius_samples = 400;
+    const int loop_samples   = 512;
+
+    // Extinction rates chosen so the analytic contour lands at a known multiple
+    // of the core radius, plus one case with no contour at all.
+    const double targets[] = { 0.25, 1.0, 2.25, 4.0 };
+    const int case_num = 4;
+
+    FILE* csv = csv_path ? fopen(csv_path, "w") : nullptr;
+    if (csv)
+        fprintf(csv, "case,a_extinction,r_exact,r_measured,rel_err\n");
+
+    printf("%10s %12s %12s %12s %10s\n", "r*/b_w", "A_e", "r* exact", "r* measured", "rel err");
+    double worst = 0.0;
+    bool all_found = true;
+    for (int c = 0; c < case_num; c++) {
+        const double x   = targets[c];
+        const double a_e = selfcheck::ExtinctionRateForContour(circulation, core, x);
+        const double r_exact = selfcheck::BurgersDamkohlerContour(circulation, core, a_e);
+
+        const selfcheck::DamkohlerCurve curve =
+            selfcheck::MeasureDamkohler(solver, centre_x, centre_y, a_e, r_min, r_max, radius_samples, loop_samples, stream);
+        if (!curve.valid) {
+            printf("case %d: non-finite result\n", c);
+            return 1;
+        }
+        if (curve.r_contour < 0.0) {
+            printf("%10.2f %12.4f %12.6f %12s %10s\n", std::sqrt(x), a_e, r_exact, "none", "-");
+            all_found = false;
+            continue;
+        }
+        const double err = (curve.r_contour - r_exact) / r_exact;
+        if (std::fabs(err) > worst)
+            worst = std::fabs(err);
+        printf("%10.2f %12.4f %12.6f %12.6f %+9.3e\n", std::sqrt(x), a_e, r_exact, curve.r_contour, err);
+        if (csv)
+            fprintf(csv, "%d,%.8f,%.8f,%.8f,%.6e\n", c, a_e, r_exact, curve.r_contour, err);
+    }
+
+    // A_Gamma is largest on the axis, so Da_Gamma is smallest there and the
+    // extinction region is the core. Raising A_e past Gamma_inf / (2 b_w^2) lifts
+    // the whole curve above one and there is no such region at all.
+    const double a_none = 1.2 * circulation / (2.0 * static_cast<double>(core) * core);
+    const double r_none_exact = selfcheck::BurgersDamkohlerContour(circulation, core, a_none);
+    const selfcheck::DamkohlerCurve none =
+        selfcheck::MeasureDamkohler(solver, centre_x, centre_y, a_none, r_min, r_max, radius_samples, loop_samples, stream);
+    printf("\nno-contour case: A_e = %.4f gives kappa = 1.2 > 1\n", a_none);
+    printf("  analytic: %s     measured: %s\n",
+           r_none_exact < 0.0 ? "no contour" : "contour",
+           none.r_contour < 0.0 ? "no contour" : "contour");
+    const bool none_ok = (r_none_exact < 0.0) && (none.r_contour < 0.0);
+
+    if (csv) {
+        fclose(csv);
+        printf("csv: %s\n", csv_path);
+    }
+
+    const bool pass = all_found && none_ok && worst < 0.01;
+    printf("\n=== D4 vortex-flame Damkohler ===\n");
+    printf("%s: the Da_Gamma = 1 contour matches the analytic radius to %.2f%% over "
+           "r*/b_w = 0.5 to 2.0%s\n",
+           pass ? "PASS" : "FAIL", 100.0 * worst,
+           none_ok ? ", and the no-contour regime is reported correctly" : "");
+    return pass ? 0 : 1;
+}
+
 int main(int argc, char** argv)
 {
     std::string test        = "leapfrog3d";
@@ -742,7 +1005,9 @@ int main(int argc, char** argv)
                    "                 [--res-tiles T]  (T tiles per side, 8T cells; default 16 = 128^3)\n"
                    "       selfcheck --test attribution [--nu NU] [--loop-radius R] [--reinit-every N]\n"
                    "                 [--res-tiles T] [--steps N] [--diag-every N]\n"
-                   "       selfcheck --test tilting [--res-tiles T]\n");
+                   "       selfcheck --test tilting [--res-tiles T]\n"
+                   "       selfcheck --test coreradii [--res-tiles T] [--core B0] [--circulation G]\n"
+                   "       selfcheck --test damkohler [--res-tiles T] [--core B0] [--circulation G]\n");
             return 0;
         }
     }
@@ -752,6 +1017,18 @@ int main(int argc, char** argv)
 
     if (test == "tilting")
         return RunTiltingStretching(res_tiles, bp.core, bp.circulation);
+
+    if (test == "coreradii") {
+        if (csv_path == "leapfrog3d.csv")
+            csv_path = "coreradii.csv";
+        return RunCoreRadii(res_tiles, bp.core, bp.circulation, csv_path.c_str());
+    }
+
+    if (test == "damkohler") {
+        if (csv_path == "leapfrog3d.csv")
+            csv_path = "damkohler.csv";
+        return RunDamkohler(res_tiles, bp.core, bp.circulation, csv_path.c_str());
+    }
 
     if (test == "attribution") {
         if (!dt_set)

@@ -139,4 +139,110 @@ double CirculationOnCircle(ofm::OFM& solver,
                            const ofm::DHMemory<float>& field_x, const ofm::DHMemory<float>& field_y, const ofm::DHMemory<float>& field_z,
                            float centre_x, float centre_y, float radius, int samples, cudaStream_t stream);
 
+// Same integral at many radii, but the field is pulled back to the host once
+// instead of once per radius. A sweep fine enough to place an isocontour needs
+// hundreds of loops, and at 256^3 one download per loop is minutes of transfer.
+std::vector<double> CirculationRadialSweep(ofm::OFM& solver,
+                                           const ofm::DHMemory<float>& field_x, const ofm::DHMemory<float>& field_y, const ofm::DHMemory<float>& field_z,
+                                           float centre_x, float centre_y, const std::vector<double>& radii, int samples, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// D2: core radii
+// ---------------------------------------------------------------------------
+
+// An azimuthally and axially averaged radial profile, binned at the grid
+// spacing. Bin b covers [b*dx, (b+1)*dx) and is reported at its centre.
+struct RadialProfile {
+    std::vector<double> r;
+    std::vector<double> v;
+    bool valid = true;
+};
+
+enum ProfileKind {
+    kProfileAzimuthal = 0, // U_theta, the component b_w is fitted to
+    kProfileAxial     = 1  // U_z, the component b_A is taken from
+};
+
+// A columnar axial jet, uniform in z, carrying a Gaussian radial profile
+//   u_z(r) = w_peak * exp(-r^2 / scale^2).
+// Uniform in z with no transverse component, so it is divergence free; it does
+// violate the normal-velocity condition at the z walls, which is why the case
+// that uses it takes no time steps.
+struct AxialJetSpec {
+    float centre_x;
+    float centre_y;
+    float scale;
+    float w_peak;
+};
+void SetAxialJetAsync(ofm::OFM& solver, const AxialJetSpec& spec, cudaStream_t stream);
+
+RadialProfile MeasureRadialProfile(ofm::OFM& solver, int kind, float centre_x, float centre_y, float r_max, cudaStream_t stream);
+
+// The same binning applied to an analytic Gaussian evaluated at cell centres,
+// so a profile the solver does not carry (the excess temperature, until the
+// low-Mach extension provides one) reaches the estimators with the same
+// discretisation error as the ones it does.
+RadialProfile GaussianProfileOnGrid(const ofm::OFM& solver, float centre_x, float centre_y, float r_max,
+                                    double amplitude, double scale);
+
+// Least-squares fit of the Burgers profile (Tohidi et al. 2018, Eq. 7)
+//   U_theta(r) = (Gamma_inf / 2 pi r) (1 - exp(-r^2 / b_w^2))
+// to a measured profile. The model is linear in Gamma_inf, so the fit is a
+// one-dimensional search over b_w with Gamma_inf eliminated in closed form.
+struct BurgersFit {
+    double gamma_inf;
+    double b_w;
+    double r_peak;   // peak of the measured profile, refined sub-bin
+    double ratio;    // r_peak / b_w, which the model puts at 1.12091
+    double rms_rel;  // RMS residual over the peak value
+    int iters;
+    bool ok;
+};
+BurgersFit FitBurgers(const RadialProfile& profile);
+
+// Root of exp(-x)(2x + 1) = 1, whose square root is the constant Tohidi et al.
+// quote as 1.12091. Computed rather than assumed, so the fit is checked against
+// the model and not against a transcribed number.
+double BurgersPeakConstant();
+
+// Tohidi et al. 2018 Sec. 4.2: b_A and b_T are the radii at which the axial
+// velocity and the excess temperature fall to a fraction of their maximum at
+// that height -- 0.5 in the continuous flame region (Lei et al. 2015b).
+double RadiusAtFraction(const RadialProfile& profile, double fraction);
+
+// Tohidi et al. 2018, Eq. 9: b_A = Q_hat / sqrt(M_hat) from the specific mass
+// and axial momentum fluxes. Unlike the fraction-of-maximum form this needs no
+// top-hat assumption, and for a Gaussian profile of scale a it returns a.
+double RadiusFromFluxes(const RadialProfile& axial);
+
+// ---------------------------------------------------------------------------
+// D4: vortex-flame Damkohler number
+// ---------------------------------------------------------------------------
+
+// Linan, Vera & Sanchez 2015, Sec. 7: the strain a vortex imposes on a flame is
+// A_Gamma = Gamma / (2 r0^2), and the vortex Damkohler number Da_Gamma = A_e /
+// A_Gamma compares the vortex turnover time with the chemical time, with local
+// extinction expected for Da_Gamma <~ 1. Evaluated pointwise by taking Gamma and
+// r0 at the same radius, which reproduces the paper's definition at r0.
+struct DamkohlerCurve {
+    std::vector<double> r;
+    std::vector<double> gamma;
+    std::vector<double> a_gamma;
+    std::vector<double> da;
+    double r_contour; // radius where Da_Gamma = 1; negative when there is none
+    bool valid;
+};
+DamkohlerCurve MeasureDamkohler(ofm::OFM& solver, float centre_x, float centre_y,
+                                double a_extinction, double r_min, double r_max, int radius_samples,
+                                int loop_samples, cudaStream_t stream);
+
+// Where Da_Gamma = 1 sits for an analytic Burgers vortex. With x = (r/b_w)^2 the
+// condition reduces to (1 - exp(-x))/x = 2 A_e b_w^2 / Gamma_inf, whose left side
+// decreases monotonically from 1 to 0, so there is one root when the right side
+// is below 1 and none otherwise. Returns a negative value in the latter case.
+double BurgersDamkohlerContour(double gamma_inf, double b_w, double a_extinction);
+
+// The extinction strain rate that places the analytic contour at r = b_w*sqrt(x).
+double ExtinctionRateForContour(double gamma_inf, double b_w, double x);
+
 } // namespace selfcheck

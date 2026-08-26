@@ -408,6 +408,221 @@ and both terms must vanish: mean `|tilting|` comes back at 2e-15 and mean
 ./build/selfcheck --test tilting --res-tiles 16
 ```
 
+## D2: the Burgers core-radius fitter, and the three-radius ordering
+
+Tohidi et al. 2018 report that the Burgers model is the best fit for a
+quasi-steady on-source fire whirl, that its azimuthal velocity peaks at
+`r = 1.12091 b_w` (Section 4.1, Equation 7), and that three core radii can be
+defined which satisfy `b_A > b_T > b_w` throughout the height of a fire whirl
+(Section 4.2, Figure 7, after Lei et al. 2015b):
+
+- `b_w`, from the azimuthal velocity — the Burgers parameter, fitted here.
+- `b_T`, "the radial location where the excess temperature declines to half of
+  the maximum recorded value at that height".
+- `b_A`, "the radial distance ... at which the local axial velocity `U_z` has
+  declined to a fraction of the maximum recorded value at the same height", the
+  fraction being 0.5 in the continuous flame region. Equation 9 gives a second,
+  integral form, `b_A = Q_hat / sqrt(M_hat)` from the specific mass and axial
+  momentum fluxes, which needs no top-hat assumption.
+
+Note that Section 4.2 characterises `b_w` as the radius at which the tangential
+velocity is maximum, whereas in the Burgers model of Equation 7 the maximum sits
+at `1.12091 b_w`. The two conventions differ by that factor. The fitter reports
+the Equation 7 parameter, which is why the criterion is stated as a ratio.
+
+### What was implemented
+
+`FitBurgers` does a least-squares fit of
+
+    U_theta(r) = (Gamma_inf / 2 pi r) (1 - exp(-r^2 / b_w^2))
+
+to a measured radial profile. The model is **linear in `Gamma_inf`**, so that
+parameter is eliminated by its own normal equation and only `b_w` is searched
+over — a coarse scan to bracket, then golden section. No initial guess, no
+Levenberg-Marquardt, and the result is deterministic.
+
+The peak radius is taken from the data, not from the fitted model: reading the
+peak off the model and dividing by the model's own `b_w` would return 1.12091 by
+construction and test nothing. It is located by the vertex of the parabola
+through the maximum bin and its two neighbours, which is needed because the bins
+are one cell wide and that is coarser than the quantity being tested.
+
+`BurgersPeakConstant` solves `exp(-x)(2x + 1) = 1` — the stationarity condition
+of Equation 7 — and returns `sqrt(x)`, so the literature constant is checked
+rather than transcribed. It returns **1.1209064**, against the 1.12091 quoted.
+
+`RadiusAtFraction` and `RadiusFromFluxes` implement the two `b_A` forms and the
+`b_T` form. `MeasureRadialProfile` bins the solver's own field; the excess
+temperature has no field to come from until the low-Mach extension, so
+`GaussianProfileOnGrid` supplies that leg from an analytic profile put through
+the identical binning.
+
+### Result
+
+Three cases, at three resolutions. Unit cube, `b_w = 0.06`, `Gamma_inf = 0.05`,
+no time stepping — these calibrate the estimators, not the solver.
+
+**Case 1, the fitter alone**, on the closed-form profile sampled at the grid's
+own bins:
+
+| grid | `b_w` rel. err | `Gamma_inf` rel. err | `r_peak/b_w` rel. err | residual RMS/peak |
+|---|---|---|---|---|
+| 256^3 | -4.4e-12 | -2.5e-12 | +9.7e-04 | 1.4e-12 |
+| 128^3 | -3.4e-13 | -2.0e-13 | +4.6e-03 | 1.1e-13 |
+| 64^3 | -3.8e-12 | -2.2e-12 | +1.9e-02 | 1.3e-12 |
+
+The fit recovers both parameters to round-off at every resolution, and the
+residual is round-off too, so **the fitter contributes no error**. What does vary
+is the peak ratio, and it varies with resolution alone — that column is the
+error of locating the peak on one-cell bins, not of the fit. It falls 1.9e-2 ->
+4.6e-3 -> 9.7e-4 for successive halvings of `dx`, ratios of 4.15 and 4.72, so the
+parabolic refinement is converging at second order.
+
+**Case 2, the whole pipeline**: seed the columnar Burgers vortex, project, and
+fit the azimuthal profile measured back off the grid.
+
+| grid | `b_w` in cells | `b_w` rel. err | `Gamma_inf` rel. err | `r_peak/b_w` | rel. err |
+|---|---|---|---|---|---|
+| 256^3 | 15.4 | -2.9e-03 | -1.3e-03 | 1.12325 | +0.21% |
+| 128^3 | 7.7 | -7.9e-03 | -3.9e-03 | 1.12861 | +0.69% |
+| 64^3 | 3.8 | -1.9e-02 | -9.8e-03 | 1.13817 | +1.54% |
+
+**256^3 and 128^3 pass the 1% criterion; 64^3 does not**, at 3.8 cells across the
+core. This is the same resolution binding the D5 result has, and for the same
+reason.
+
+**Case 3, the ordering.** A Gaussian axial jet of scale `2.6 b_w` supplies `U_z`,
+an analytic excess temperature of scale `1.8 b_w` supplies `dT`, and the Burgers
+column supplies `U_theta`. For a Gaussian of scale `a`, the half-maximum radius is
+`a sqrt(ln 2)` and the flux form of Equation 9 returns `a` exactly, so all three
+estimators have closed-form targets.
+
+| grid | `b_A` half-max | `b_A` flux | `b_T` half-max | `b_w` fit | ordering |
+|---|---|---|---|---|---|
+| 256^3 | -1.6e-03 | -4.0e-04 | -8.9e-05 | -2.9e-03 | holds |
+| 128^3 | -2.9e-03 | -6.4e-04 | +1.2e-03 | -8.0e-03 | holds |
+| 64^3 | -6.8e-03 | -1.4e-03 | +5.8e-03 | -1.9e-02 | holds |
+
+Relative errors against the closed form. **The ordering `b_A > b_T > b_w` is
+reported correctly at every resolution**, including the one where the individual
+radii miss 1%, because it is an inequality between numbers separated by 45% and
+50% — far more than the estimator errors.
+
+**The flux form of `b_A` is the better-conditioned estimator**, by a factor of
+4-5 against the fraction-of-maximum form at every resolution (-4.0e-04 against
+-1.6e-03 at 256^3). That is what one would expect of an integral against a local
+interpolation, and it is worth preferring Equation 9 when the profile is noisy.
+
+### Scope limit
+
+`b_T` is measured from an analytic excess temperature, not a simulated one,
+because the solver is constant-density and carries no temperature field. That
+leg therefore calibrates the estimator, and connecting it to a simulated
+temperature field waits on the low-Mach extension. `b_w` and `b_A` are both
+measured from fields the solver holds.
+
+### Reproducing
+
+```
+./build/selfcheck --test coreradii --res-tiles 32 --csv coreradii.csv
+```
+
+`--core` and `--circulation` set `b_w` and `Gamma_inf`. The CSV carries the three
+measured profiles and the fitted Burgers curve on the same radial bins.
+
+## D4: the vortex-flame Damkohler number
+
+Linan, Vera & Sanchez 2015 (Section 7) characterise a vortex-flame interaction
+by the strain the vortex imposes on the flame,
+
+    A_Gamma = Gamma / (2 r0^2),
+
+and the vortex Damkohler number
+
+    Da_Gamma = A_e / A_Gamma,
+
+"defined as the ratio of the characteristic vortex turnover time, `1/A_Gamma`, to
+the characteristic chemical time, `1/A_e`", with `A_e` the critical strain rate at
+extinction. They state that "local flame extinction should be expected for
+`Da_Gamma <~ 1`". This is the self-check on the prescribed-heat-source
+assumption: where `Da_Gamma` falls below one, that assumption has no support.
+
+**The plan's `A_Gamma ~ Gamma / r0^2` is missing the factor of two.** The paper
+writes `A_Gamma = Gamma / (2 r0^2)` as a definition. The factor moves the
+`Da_Gamma = 1` contour by `sqrt(2)` in the strain that produces it, so it matters
+for a criterion stated as a contour position. The paper's form is what is
+implemented here.
+
+### What was implemented
+
+The paper's `Gamma` and `r0` are the vortex's circulation and characteristic
+radius. Evaluating the same expression with the circulation enclosed at radius
+`r` gives a pointwise field that reduces to the paper's definition at `r = r0`:
+
+    A_Gamma(r) = Gamma(r) / (2 r^2),   Da_Gamma(r) = A_e / A_Gamma(r)
+
+`Gamma(r)` is the D1 line integral, so the two diagnostics share their
+measurement of circulation. `CirculationRadialSweep` was added because placing a
+contour needs hundreds of loops and `CirculationOnCircle` pulls the whole field
+back to the host on each call — at 256^3 that is minutes of transfer per contour.
+The sweep downloads once and integrates every loop on the host.
+
+For a Burgers vortex the contour is a circle whose radius follows in closed form.
+With `x = (r/b_w)^2`, `Da_Gamma = 1` reduces to
+
+    (1 - exp(-x)) / x = 2 A_e b_w^2 / Gamma_inf = kappa
+
+whose left side falls monotonically from 1 to 0. So there is exactly one root
+when `kappa < 1` and none otherwise, and `A_Gamma` is largest on the axis, which
+puts the extinction region **inside** the contour.
+
+### Result
+
+Unit cube, `b_w = 0.06`, `Gamma_inf = 0.05`, seeded and projected. Four
+extinction rates chosen to place the analytic contour at known multiples of the
+core radius, plus one case with no contour at all.
+
+| `r*/b_w` | `A_e` | `r*` exact | 128^3 measured | rel. err | 256^3 measured | rel. err |
+|---|---|---|---|---|---|---|
+| 0.50 | 6.1444 | 0.030000 | 0.029182 | -2.73% | 0.029794 | -0.69% |
+| 1.00 | 4.3897 | 0.060000 | 0.059692 | -0.51% | 0.059917 | -0.14% |
+| 1.50 | 2.7611 | 0.090000 | 0.089875 | -0.14% | 0.089966 | -0.038% |
+| 2.00 | 1.7043 | 0.120000 | 0.119961 | -0.033% | 0.119990 | -0.0086% |
+
+**256^3 passes the 1% criterion across the whole range.** At 128^3 three of the
+four contours are within 0.51% and only the tightest fails, at 2.73%.
+
+The error is set by how many cells the contour spans, not by the grid as such:
+`r* = 0.060` is 7.7 cells at 128^3 and gives -0.51%, while `r* = 0.030` is 7.7
+cells at 256^3 and gives -0.69%. Contours wider than about 10 cells are accurate
+to better than 0.15% at either resolution. The far-field cases converge fastest
+because nearly all the circulation is enclosed by then, so `Gamma(r)` is
+insensitive to where exactly the loop sits.
+
+**The no-contour regime is reported correctly.** Setting `A_e` to `1.2 *
+Gamma_inf / (2 b_w^2)` puts `kappa = 1.2 > 1`, so `Da_Gamma > 1` everywhere and
+no extinction is predicted. Both resolutions report no contour, matching the
+analytic answer. This matters because a diagnostic that always finds a contour
+would look like it was working while telling you nothing.
+
+### What the test does and does not establish
+
+It establishes that the implemented diagnostic reproduces the closed-form
+contour of the definition on a discretely represented field: the measured side
+goes through seeding, projection, cell-centre interpolation, loop quadrature and
+a root find, none of which the analytic side sees. It does not establish that
+`Da_Gamma <~ 1` is where a real flame extinguishes — that is Linan's physical
+claim, cited, not tested here.
+
+### Reproducing
+
+```
+./build/selfcheck --test damkohler --res-tiles 32 --csv damkohler.csv
+```
+
+The CSV carries one row per extinction rate with the exact and measured contour
+radii.
+
 ## The source-term channel: how it was found missing
 
 `RKAxisAccumulateForceAsync` — the path integral that carries external forces and
@@ -452,3 +667,9 @@ command with `--reinit-every` set to 1, 2, 5 and 10; `--steps` counts advection 
 the simulated time is the same for every interval. The CSV carries per-sample kinetic energy, peak speed, peak vorticity,
 both ring positions in the (axial, radial) plane, their separation and the running
 leap count.
+
+The other cases are `--test burgers` (D5, the source-term channel), `--test
+attribution` and `--test tilting` (D1), and `--test coreradii` and `--test
+damkohler` (D2 and D4). Each section above gives its own command line. Every case
+returns a non-zero exit code when it misses its criterion, so a batch script can
+gate on them.

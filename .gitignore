@@ -97,3 +97,7 @@ core.*
 # --- Literature PDFs ---
 # Papers live in the project's Zotero library, not in this repository.
 *.pdf
+
+# --- Claude Code local state (settings, scratch, and git worktrees) ---
+# Holds live worktrees; never let `git clean -fd` reach it.
+.claude/

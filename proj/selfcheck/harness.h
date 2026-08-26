@@ -245,6 +245,16 @@ double BurgersDamkohlerContour(double gamma_inf, double b_w, double a_extinction
 // The extinction strain rate that places the analytic contour at r = b_w*sqrt(x).
 double ExtinctionRateForContour(double gamma_inf, double b_w, double x);
 
+// Abort before any measurement if the kernels cannot run on this device. The
+// build carries cubin for sm_75 (gpu-rtx6k) and sm_89 (gpu-l40, gpu-l40s) plus
+// sm_89 PTX; on an older architecture -- the ckpt partition mixes several --
+// every launch fails with "no kernel image is available for execution on the
+// device". Nothing in the solver checks launch status, so without this the run
+// finishes in milliseconds with every field still zero and prints that as a
+// result: a whole sweep of zeros that looks like physics. Returns false and
+// says what it found instead.
+bool CheckDeviceUsable();
+
 // ---------------------------------------------------------------------------
 // Stage A: a buoyant plume from a surface heat source in a sheared cross flow,
 // after Cunningham, Goodrick, Hussaini & Linn 2005 (Int. J. Wildland Fire 14,
@@ -292,8 +302,40 @@ void AddPlumeHeatAsync(ofm::DHMemory<float>& theta, int3 tile_dim, float3 grid_o
 
 // Writes the whole external-force field: f_z = g*theta/theta0 on the z faces,
 // and the canopy drag -Cd*a*|u_h|*u_i on the lowest cell level, zero elsewhere.
+// The three staggered components of one velocity field. init_u_ is only current
+// at a reinitialization-cycle boundary, so at reinit_every_ > 1 nothing in the
+// Stage A step may read it: the buoyancy, the drag and the theta advection all
+// have to take the cycle's own history instead. mid_u_[i] holds the projected
+// velocity of step i of the cycle, which sits at that step's midpoint.
+struct PlumeVelocity {
+    ofm::DHMemory<float>* x;
+    ofm::DHMemory<float>* y;
+    ofm::DHMemory<float>* z;
+};
+
+// The latest projected velocity, for use before AdvanceAsync: the cycle's start
+// on its first step, the previous step's velocity after that.
+PlumeVelocity PlumeVelocityBefore(ofm::OFM& solver);
+
+// The velocity of the step AdvanceAsync has just taken, for use after it. Being
+// a midpoint velocity, this is the right one to advect theta across that step.
+PlumeVelocity PlumeVelocityAfter(ofm::OFM& solver);
+
 void SetBuoyancyAndDragAsync(ofm::OFM& solver, const ofm::DHMemory<float>& theta,
-                             const PlumeSpec& spec, cudaStream_t stream);
+                             const PlumeSpec& spec, PlumeVelocity u, cudaStream_t stream);
+
+// Advect theta one step. theta is the field every one of the paper's criteria is
+// read from, and in the first cut it was the only field in the case carrying no
+// error compensation at all: the velocity goes through the flow map and the
+// solver's BFECC pass, while theta got a bare semi-Lagrangian step whose
+// trilinear interpolation is first order in space. With bfecc set this applies
+// the same correction the solver applies to velocity, in the same order --
+// advect, advect back, subtract, advect the error, correct, clamp -- reusing
+// BfeccClampAsync for the clamp. fwd and err are scratch, cell centred and the
+// same size as theta; dst must be neither src nor scratch.
+void AdvectThetaAsync(ofm::DHMemory<float>& dst, ofm::DHMemory<float>& fwd, ofm::DHMemory<float>& err,
+                      int3 tile_dim, ofm::DHMemory<float>& src, PlumeVelocity u,
+                      float dx, float dt, bool bfecc, bool clamp, cudaStream_t stream);
 
 struct PlumeDiag {
     double max_theta;   // K, over the whole field
@@ -313,6 +355,25 @@ struct PlumeDiag {
     double plane_theta; // K, peak anomaly on the requested plane
     double u_max;       // m/s, peak horizontal speed in the domain
     bool   valid;
+    // What Cunningham actually measured. Their Fig. 6 is the potential-temperature
+    // cross section on this plane, contoured every 0.25 K starting at 300.25 K,
+    // and both statements the figure supports -- wider bifurcation for the deeper
+    // shear layer, wider for the weaker source -- are read off those contours.
+    // The omega_z extrema above are only loosely related to them, so comparing
+    // the two is not a fair test of either. The plane is reduced to the column
+    // maximum P(y) = max_z theta(y,z) and measured there.
+    double theta_width;  // m, between the outermost P = 0.25 K crossings
+    double theta_split;  // m, between the two branch maxima; 0 when single-lobed
+    double theta_left;   // m, left branch
+    double theta_right;  // m, right branch
+    double theta_saddle; // K, the minimum of P between the two branches
+    double theta_peak;   // K, the lower of the two branch maxima
+    bool   bifurcated;   // a plotted contour level falls between saddle and peak
+    // The same measure on the strongest-CVP plane, which is far enough upstream
+    // to be clear of the prescribed outflow.
+    double best_theta_width;
+    double best_theta_split;
+    bool   best_bifurcated;
 };
 
 // Measured on the y-z plane nearest plane_x, at the height nearest cvp_z, from

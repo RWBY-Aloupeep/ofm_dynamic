@@ -3,9 +3,11 @@
 #include "ofm_util.h"
 #include "util.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace selfcheck {
 
@@ -1129,22 +1131,218 @@ void AddPlumeHeatAsync(ofm::DHMemory<float>& theta, int3 tile_dim, float3 grid_o
         theta.dev_ptr_, tile_dim, grid_origin, dx, spec, t, dt);
 }
 
+// AdvanceAsync stores the step it has just taken in mid_u_[step_ % reinit_every_]
+// and then increments step_, so the cycle index is read differently on the two
+// sides of the call. On the first step of a cycle there is no history yet and
+// the cycle's start, init_u_, is the answer.
+PlumeVelocity PlumeVelocityBefore(ofm::OFM& solver)
+{
+    const int cycle_step = solver.step_ % solver.reinit_every_;
+    if (cycle_step == 0)
+        return { solver.init_u_x_.get(), solver.init_u_y_.get(), solver.init_u_z_.get() };
+    return { solver.mid_u_x_[cycle_step - 1].get(), solver.mid_u_y_[cycle_step - 1].get(),
+             solver.mid_u_z_[cycle_step - 1].get() };
+}
+
+PlumeVelocity PlumeVelocityAfter(ofm::OFM& solver)
+{
+    const int cycle_step = (solver.step_ - 1) % solver.reinit_every_;
+    return { solver.mid_u_x_[cycle_step].get(), solver.mid_u_y_[cycle_step].get(),
+             solver.mid_u_z_[cycle_step].get() };
+}
+
 void SetBuoyancyAndDragAsync(ofm::OFM& solver, const ofm::DHMemory<float>& theta,
-                             const PlumeSpec& spec, cudaStream_t stream)
+                             const PlumeSpec& spec, PlumeVelocity u, cudaStream_t stream)
 {
     const int3 td         = solver.tile_dim_;
     const int3 x_tile_dim = { td.x + 1, td.y, td.z };
     const int3 y_tile_dim = { td.x, td.y + 1, td.z };
     const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
 
-    ofm::GetCenteralVecAsync(*solver.u_, td, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_, stream);
+    ofm::GetCenteralVecAsync(*solver.u_, td, *u.x, *u.y, *u.z, stream);
 
     BuoyancyZKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(
         solver.f_z_->dev_ptr_, z_tile_dim, td, theta.dev_ptr_, spec.g / spec.theta0);
     CanopyDragKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
-        solver.f_x_->dev_ptr_, x_tile_dim, 0, solver.u_->dev_ptr_, td, solver.init_u_x_->dev_ptr_, spec.cd_a);
+        solver.f_x_->dev_ptr_, x_tile_dim, 0, solver.u_->dev_ptr_, td, u.x->dev_ptr_, spec.cd_a);
     CanopyDragKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
-        solver.f_y_->dev_ptr_, y_tile_dim, 1, solver.u_->dev_ptr_, td, solver.init_u_y_->dev_ptr_, spec.cd_a);
+        solver.f_y_->dev_ptr_, y_tile_dim, 1, solver.u_->dev_ptr_, td, u.y->dev_ptr_, spec.cd_a);
+}
+
+namespace {
+__global__ void DeviceProbeKernel(int* out)
+{
+    *out = 1;
+}
+} // namespace
+
+bool CheckDeviceUsable()
+{
+    int device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+        printf("ERROR: no usable CUDA device.\n");
+        return false;
+    }
+
+    int* probe = nullptr;
+    if (cudaMalloc(&probe, sizeof(int)) != cudaSuccess) {
+        printf("ERROR: cannot allocate on %s.\n", prop.name);
+        return false;
+    }
+    cudaMemset(probe, 0, sizeof(int));
+    DeviceProbeKernel<<<1, 1>>>(probe);
+    cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess)
+        err = cudaDeviceSynchronize();
+    int host = 0;
+    if (err == cudaSuccess)
+        err = cudaMemcpy(&host, probe, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(probe);
+
+    if (err != cudaSuccess || host != 1) {
+        printf("ERROR: kernels do not run on %s (sm_%d%d): %s.\n"
+               "       Add this architecture to add_cugencodes in proj/selfcheck/xmake.lua,\n"
+               "       or use gpu-rtx6k (sm_75) or gpu-l40s (sm_89). Every field would have\n"
+               "       stayed zero and the run would have reported that as a measurement.\n",
+               prop.name, prop.major, prop.minor,
+               err != cudaSuccess ? cudaGetErrorString(err) : "the probe kernel wrote nothing");
+        return false;
+    }
+    printf("device: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
+    return true;
+}
+
+namespace {
+
+// Cunningham's Fig. 6 plots the first contour at 300.25 K over a 300 K base and
+// steps every 0.25 K, so this single level fixes both the plume outline the
+// figure shows and the depth a dip must have before two lobes read as separate
+// branches of a bifurcation.
+constexpr double kThetaContour = 0.25;
+
+struct ThetaProfile {
+    double width      = 0.0;
+    double split      = 0.0;
+    double left       = 0.0;
+    double right      = 0.0;
+    double saddle     = 0.0;
+    double lower_peak = 0.0;
+    bool   bifurcated = false;
+};
+
+// Sub-cell peak position from the parabola through a local maximum and its two
+// neighbours. Without it every position is a multiple of dx, which at Stage A's
+// resolutions quantizes the answer more coarsely than the physics does.
+double RefinePeak(const std::vector<double>& p, int j, double y0, double dx)
+{
+    if (j <= 0 || j + 1 >= static_cast<int>(p.size()))
+        return y0 + j * dx;
+    const double denom = p[j - 1] - 2.0 * p[j] + p[j + 1];
+    if (denom >= 0.0)
+        return y0 + j * dx;
+    const double shift = 0.5 * (p[j - 1] - p[j + 1]) / denom;
+    return y0 + (j + std::max(-0.5, std::min(0.5, shift))) * dx;
+}
+
+// Reduce one column-maximum profile P(y) = max_z theta(y,z) to the two numbers
+// Fig. 6 is read for: the lateral extent of the first contour, and the
+// separation of the two branches of the bifurcation.
+ThetaProfile AnalyseThetaProfile(const std::vector<double>& p, double y0, double dx)
+{
+    ThetaProfile out;
+    const int n = static_cast<int>(p.size());
+    int lo = -1, hi = -1;
+    for (int j = 0; j < n; j++)
+        if (p[j] >= kThetaContour) {
+            if (lo < 0)
+                lo = j;
+            hi = j;
+        }
+    if (lo < 0)
+        return out;
+
+    // Interpolate the contour crossing on each flank, so the width is not
+    // quantized to the grid the way the omega_z extrema separation was.
+    double left_edge  = y0 + lo * dx;
+    double right_edge = y0 + hi * dx;
+    if (lo > 0 && p[lo] > p[lo - 1])
+        left_edge = y0 + (lo - 1 + (kThetaContour - p[lo - 1]) / (p[lo] - p[lo - 1])) * dx;
+    if (hi + 1 < n && p[hi] > p[hi + 1])
+        right_edge = y0 + (hi + (p[hi] - kThetaContour) / (p[hi] - p[hi + 1])) * dx;
+    out.width = right_edge - left_edge;
+
+    // The two tallest local maxima above the contour are the branches. Taking the
+    // two outermost instead would let a single grid-scale bump on a flank stand in
+    // for a branch, and the saddle test below would then reject the real pair.
+    int first = -1, last = -1;
+    for (int j = lo; j <= hi; j++) {
+        const double l = (j > 0) ? p[j - 1] : -1.0;
+        const double r = (j + 1 < n) ? p[j + 1] : -1.0;
+        if (!(p[j] > l && p[j] >= r))
+            continue;
+        if (first < 0 || p[j] > p[first]) {
+            last  = first;
+            first = j;
+        }
+        else if (last < 0 || p[j] > p[last]) {
+            last = j;
+        }
+    }
+    if (first < 0 || last < 0)
+        return out;
+    if (first > last)
+        std::swap(first, last);
+
+    double saddle = p[first];
+    for (int j = first; j <= last; j++)
+        saddle = std::min(saddle, p[j]);
+    out.saddle    = saddle;
+    out.lower_peak = std::min(p[first], p[last]);
+
+    // Fig. 6 contours every 0.25 K from 0.25 K up, so the two lobes are drawn as
+    // two separately closed contours exactly when a plotted level falls between
+    // the saddle and the lower of the two peaks. That is the figure's own
+    // resolution for "bifurcated", and it is weaker than demanding a full
+    // interval of relief: peaks at 0.93 K over a 0.68 K saddle close separately
+    // at 0.75 K even though the dip is a quarter of a kelvin short of an
+    // interval. Requiring the full interval would report that plume as single
+    // lobed when the paper's own figure would show it split.
+    const double next_contour = std::floor(saddle / kThetaContour + 1.0) * kThetaContour;
+    if (next_contour > out.lower_peak)
+        return out;
+    out.left       = RefinePeak(p, first, y0, dx);
+    out.right      = RefinePeak(p, last, y0, dx);
+    out.split      = out.right - out.left;
+    out.bifurcated = true;
+    return out;
+}
+
+} // namespace
+
+void AdvectThetaAsync(ofm::DHMemory<float>& dst, ofm::DHMemory<float>& fwd, ofm::DHMemory<float>& err,
+                      int3 tile_dim, ofm::DHMemory<float>& src, PlumeVelocity u,
+                      float dx, float dt, bool bfecc, bool clamp, cudaStream_t stream)
+{
+    // The uncorrected step, which is also what the clamp below bounds against --
+    // the same role u_ plays in the solver's own BFECC.
+    ofm::AdvectN2CAsync(fwd, tile_dim, src, *u.x, *u.y, *u.z, dx, dt, stream);
+    if (!bfecc) {
+        ofm::AddFieldsAsync(dst, tile_dim, fwd, fwd, 0.0f, stream);
+        return;
+    }
+    // Back one step, difference against where it started: that is the error the
+    // forward step made, expressed at the departure points.
+    ofm::AdvectN2CAsync(err, tile_dim, fwd, *u.x, *u.y, *u.z, dx, -dt, stream);
+    ofm::AddFieldsAsync(err, tile_dim, err, src, -1.0f, stream);
+    // Carry the error forward the same way and take off half of it.
+    ofm::AdvectN2CAsync(dst, tile_dim, err, *u.x, *u.y, *u.z, dx, dt, stream);
+    ofm::AddFieldsAsync(dst, tile_dim, fwd, dst, -0.5f, stream);
+    if (clamp) {
+        const int3 max_ijk = { tile_dim.x * 8 - 1, tile_dim.y * 8 - 1, tile_dim.z * 8 - 1 };
+        ofm::BfeccClampAsync(dst, tile_dim, max_ijk, fwd, stream);
+    }
 }
 
 PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
@@ -1175,6 +1373,11 @@ PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
     d.plane_theta = 0.0;
     d.u_max       = 0.0;
     d.valid       = false;
+    d.theta_width = d.theta_split = d.theta_left = d.theta_right = 0.0;
+    d.theta_saddle = d.theta_peak = 0.0;
+    d.bifurcated  = false;
+    d.best_theta_width = d.best_theta_split = 0.0;
+    d.best_bifurcated  = false;
 
     for (int i = 0; i < nx; i++)
         for (int j = 0; j < ny; j++)
@@ -1212,6 +1415,7 @@ PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
     // asked for; the strongest plane says where the pair actually is.
     d.best_x = d.best_omega = d.best_split = 0.0;
     d.plane_theta = 0.0;
+    int best_i    = -1;
     for (int i = 1; i < nx - 1; i++) {
         double wp = -1.0e30, wn = 1.0e30, yp = 0.0, yn = 0.0, th_max = 0.0;
         for (int j = 1; j < ny - 1; j++) {
@@ -1232,6 +1436,7 @@ PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
             d.best_omega = strength;
             d.best_x     = org.x + (i + 0.5) * dx;
             d.best_split = std::fabs(yp - yn);
+            best_i       = i;
         }
         if (i == ip) {
             d.omega_pos   = wp;
@@ -1246,6 +1451,40 @@ PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
     // be a structure rather than round-off: the ambient flow carries no omega_z
     // at all, so 1e-3 1/s is already well clear of the noise.
     d.valid = d.omega_pos > 1.0e-3 && d.omega_neg < -1.0e-3;
+
+    // The potential-temperature bifurcation, which is what Fig. 6 shows and what
+    // the paper's two ordering results are read off. Reported on the requested
+    // plane, and again on the strongest-CVP plane, which is far enough upstream
+    // to be clear of the prescribed outflow.
+    const double y0 = org.y + 0.5 * dx;
+    auto column_max = [&](int i) {
+        std::vector<double> p(ny, 0.0);
+        for (int j = 0; j < ny; j++) {
+            double m = 0.0;
+            for (int k = 0; k < nz; k++) {
+                const double t = th[at(i, j, k)];
+                if (t > m)
+                    m = t;
+            }
+            p[j] = m;
+        }
+        return p;
+    };
+
+    const ThetaProfile pp = AnalyseThetaProfile(column_max(ip), y0, dx);
+    d.theta_width  = pp.width;
+    d.theta_split  = pp.split;
+    d.theta_left   = pp.left;
+    d.theta_right  = pp.right;
+    d.theta_saddle = pp.saddle;
+    d.theta_peak   = pp.lower_peak;
+    d.bifurcated   = pp.bifurcated;
+    if (best_i >= 0) {
+        const ThetaProfile bp = AnalyseThetaProfile(column_max(best_i), y0, dx);
+        d.best_theta_width = bp.width;
+        d.best_theta_split = bp.split;
+        d.best_bifurcated  = bp.bifurcated;
+    }
     return d;
 }
 

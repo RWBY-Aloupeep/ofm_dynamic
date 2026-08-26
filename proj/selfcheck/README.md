@@ -24,6 +24,15 @@ ships with; LFM runs its leapfrog figure at 10), and `--rk-order 2|3|4` selects 
 flow-map marching order. Diagnostics are sampled at cycle boundaries, because the solver's
 velocity state is only current there.
 
+Every case starts by launching a probe kernel and checking that it ran, and prints
+the device it is on. The build carries cubin for `sm_75` (`gpu-rtx6k`) and `sm_89`
+(`gpu-l40`, `gpu-l40s`) plus `compute_75` PTX for anything newer; on an older
+device -- the `ckpt` partition mixes generations, down to P100 -- every launch
+would otherwise fail unreported and the run would print a full table of zeros as
+if it were a measurement. Pin all the cases of one sweep to a single GPU
+generation; `ckpt` has `rtx6k` nodes, reachable with `--constraint=rtx6k`, which
+is the way in when the owned partition is at its GPU limit.
+
 `-P .` matters: without it xmake walks up, finds `proj/xmake.lua`, and tries to
 resolve the GUI packages. Compute nodes on klone have no outbound network, so any
 package that is not already cached will fail there; configure on the login node if

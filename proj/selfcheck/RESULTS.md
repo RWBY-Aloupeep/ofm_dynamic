@@ -752,11 +752,13 @@ and drag:
   had no caller anywhere.
 - `MeasurePlume` reports the peak anomaly, plume top, `w_max`, and the two
   extrema of `omega_z` on the measurement plane with the distance between them.
+  It also reports the potential-temperature bifurcation, which is the quantity
+  the paper actually plots -- see below.
 
-The buoyancy and the `theta` advection both read `init_u_`, which is only
-current at a cycle boundary, so this first cut runs at `reinit_every = 1` and
-warns otherwise. Wiring them to `mid_u_[i]` is what `n = 5` needs, and `n = 5`
-is what the D2 residual argues for; that is the next change, not this one.
+The buoyancy and the `theta` advection originally both read `init_u_`, which is
+only current at a cycle boundary, so the first cut ran at `reinit_every = 1` and
+warned otherwise. Both now read the cycle's own velocity history instead, which
+is what `n > 1` needs -- also below.
 
 Building it also turned up a latent break: `src/ofm/ofm_util.h` uses `uint8_t`
 without including `<cstdint>`. It only surfaced when a comment edit invalidated
@@ -852,12 +854,12 @@ set.
 *weaker* source; every row here has the weaker source narrower. Before reading
 that as a physics failure, note two things.
 
-First, the two are probably not the same measurement. The paper's Fig. 6 shows
-the bifurcation of the **potential-temperature** cross-section; `MeasurePlume`
-reports the spanwise separation of the two **`omega_z` extrema**. Those track
-each other loosely at best, and comparing them as if they were the same number
-is not a fair test. Measuring the theta bifurcation directly is the fix, and it
-is the next change to the diagnostic.
+First, the two are not the same measurement. The paper's Fig. 6 shows the
+bifurcation of the **potential-temperature** cross-section; this table is the
+spanwise separation of the two **`omega_z` extrema**. Those track each other
+loosely at best, and comparing them as if they were the same number is not a
+fair test. The second cut measures the theta bifurcation directly; see below for
+what that changes and what it does not.
 
 Second, the runs do support the mechanism the paper conjectures for it -- that
 the width is set by how long a buoyant parcel takes to rise through the shear
@@ -866,7 +868,7 @@ and 1059 m against 703, 722 and 703 m for the strong source. A slower rise puts
 the pair further down the domain, which is exactly the picture. What that does
 to the width at one fixed plane is a different question.
 
-### The viscosity sweep says nothing, and that is the result
+### The viscosity sweep says nothing here -- but the measure was part of why
 
 `z0 = 100 m`, `Q0 = 1 kW/m^3`, `mu` = 4, 1, 0.15, 0.0015 kg/(m s) -- a range of
 2700 in the physical viscosity:
@@ -882,36 +884,281 @@ Identical split, identical plane, and `|omega_z|` moving by 18% across a factor
 of 2700. The paper's runs go from a laminar symmetric bifurcation at `mu = 4` to
 a turbulent asymmetric plume at `mu = 0.0015`; nothing like that happens here.
 
+**Read the "identical split" column with care.** It is quantised to `dx`, and
+the second cut shows that quantisation was hiding a response that was present
+all along -- the interpolated `theta` width moves monotonically over the same
+four runs. The floor conclusion below survives; the claim that the collapse
+needed no further evidence does not.
+
 The reason is the one D1 made measurable: **the numerical dissipation floor sits
 above all but the largest `mu`**. At `dx = 18.75 m` the scheme's own dissipation
 is what sets the effective Reynolds number, so asking for a smaller `mu` changes
-nothing. A sweep whose parameter is below the floor is not a sweep, and the four
-identical rows are the cleanest possible demonstration of it -- no floor run
-needed, the collapse itself is the evidence.
+nothing. A sweep whose parameter is below the floor is not a sweep. The four identical
+rows are suggestive rather than conclusive, though: see the second cut, where
+the same four runs measured on `theta` give a monotone, saturating series that
+locates the floor instead of merely asserting it.
 
 This is a resolution statement, not a solver defect, and it is the same shape as
 the D1 and D3/D4 results: the criterion is bound to the grid. Reproducing the
 paper's Reynolds-number progression needs the 10 m grid at least, and probably
 the same `nu = 0` control run D1 uses to put a number on the floor.
 
+## Stage A, second cut: measuring what the paper measures
+
+The first cut left four things to do, in order. Items 1 and 4 are done here;
+item 2 is the resolution the runs below are at; item 3, an outflow condition,
+is separate work with its own verification case and is not attempted here.
+
+### The theta bifurcation, read the way Fig. 6 is read
+
+The `Q0` comparison failed above because the two sides were not the same
+quantity. Going back to the paper settles what the right one is. Fig. 6's
+caption reads: *cross sections of potential temperature in the y-z plane at
+x = 1750 m ... contour interval is 0.25 K with the first plotted contour equal
+to 300.25 K.* Both orderings the paper draws from that figure -- wider for the
+deeper shear layer, wider for the weaker source -- are read off those contours,
+and off nothing else.
+
+So the diagnostic measures the same thing:
+
+- The plane is reduced to the column maximum `P(y) = max_z theta(y, z)`.
+- **`theta_width`** is the distance between the outermost `P = 0.25 K`
+  crossings, the paper's first plotted contour. The crossings are linearly
+  interpolated, so the width is no longer quantised to `dx` the way the
+  `omega_z` extrema separation was -- that quantisation is what made four
+  viscosity runs report identical widths to the metre.
+- **`theta_split`** is the distance between the two outermost maxima of `P`,
+  with the peak positions refined by the parabola through each maximum and its
+  neighbours.
+- Two lobes count as a **bifurcation** only when the saddle between them lies at
+  least one contour interval -- 0.25 K, the figure's own interval -- below the
+  lower of the two peaks. That is the level at which Fig. 6 would draw them as
+  two closed contours rather than one lobed one, so it is the paper's own
+  threshold rather than an invented one. A single-lobed plane is reported as
+  such instead of returning a number that looks like a width.
+
+All of it is reported twice: on the requested plane, and again on the plane
+where the counter-rotating pair is strongest, which sits far enough upstream to
+be clear of the prescribed outflow.
+
+### The buoyancy and the theta advection no longer read `init_u_`
+
+`ReinitAsync` leaves `init_u_` current only at the end of a cycle; anywhere else
+inside one it still holds the cycle's start. That is why the first cut was
+pinned to `reinit_every = 1`. Two selectors fix it, since `AdvanceAsync` stores
+the step it has just taken in `mid_u_[step_ % reinit_every_]` and *then*
+increments `step_`, so the cycle index reads differently on the two sides of the
+call:
+
+- `PlumeVelocityBefore` -- the latest projected velocity, for building the
+  buoyancy and the drag: `init_u_` on the cycle's first step, `mid_u_[i-1]`
+  after that.
+- `PlumeVelocityAfter` -- the velocity of the step just taken, `mid_u_[i]`, for
+  advecting `theta` across it.
+
+The second is not just a workaround. `ReinitAsync` marches the flow map across a
+full `dt` per step using `mid_u_[i]`, which is to say the solver already treats
+those buffers as step-midpoint velocities; using the same buffer for the
+semi-Lagrangian `theta` update gives that update its second-order transport,
+where the old code used the end-of-step velocity. So the change moves the `n = 1`
+answer slightly as well, and the sweep below was re-run rather than carried over.
+
+`ReinitAsync` is now also called once per cycle rather than once per step, which
+is what it was always meant for, and the driver refuses a `--diag-every` that is
+not a multiple of `n` -- otherwise a measurement mid-cycle would read a stale
+`init_u_` and report it without complaint.
+
+### theta was the only field in the case with no error compensation
+
+Measuring the bifurcation is what exposed this. The velocity in this solver is
+carried by the flow map and then corrected by a BFECC pass with a clamp. `theta`
+was advected by a bare call to `AdvectN2CAsync` -- an RK2 backtrace with
+trilinear interpolation and nothing else. That interpolation is first order in
+space, and it is applied 2400 times over a 600 s run.
+
+So the field every one of Cunningham's criteria is read from was the least
+accurate field in the simulation, by a wide margin, and the first thing the new
+diagnostic reported was a single lobe at every resolution and every case: two
+branches that exist in `omega_z` but are smeared into one hump in `theta`.
+
+`AdvectThetaAsync` applies to `theta` the same correction the solver applies to
+velocity, in the same order -- advect, advect back, difference against the
+start, advect the error, subtract half of it, clamp against the uncorrected
+result -- reusing the solver's own `BfeccClampAsync` for the last step.
+`--theta-advection plain|bfecc|bfecc-clamp` selects it, so the uncorrected runs
+above stay reproducible as the control.
+
+### A run that reports zeros is worse than a run that fails
+
+Trying to use the idle `ckpt` capacity turned up a failure mode worth recording.
+`proj/selfcheck/xmake.lua` built cubin for `sm_75` and `sm_89` only, and `ckpt`
+mixes GPU generations. On a node outside that pair every kernel launch fails
+with *no kernel image is available for execution on the device* -- and nothing
+in `src/ofm` or the harness checks launch status. A 200-step plume run therefore
+finished in 0.3 s with every field exactly zero, and printed those zeros as
+diagnostic rows. The only symptom was the wall time.
+
+For a project whose criteria are all relative errors against published or
+analytic values, a diagnostic that silently reports zeros is the worst possible
+failure: a whole sweep of them would tabulate cleanly. Two changes:
+
+- `CheckDeviceUsable` runs a one-line probe kernel at start-up, checks the
+  launch, and aborts with the device name and compute capability if it did not
+  run. Every case now prints the device it ran on, which also makes the logs
+  self-documenting.
+- `compute_75` PTX is added to the gencode list as a JIT fallback, so any device
+  from Turing on runs rather than failing. PTX only JITs forwards, so anything
+  older is still caught by the probe.
+
+A sweep should still be pinned to a single partition. An ordering result read
+off cases that ran on different hardware is not one.
+
+### The paper's grid, and what the theta measure says there
+
+`dx = 10 m` (184 x 120 x 152), `dt = 0.25 s`, 600 s, `n = 1`, plain semi-Lagrangian
+`theta` -- the same configuration as the coarse runs above, at the paper's own
+resolution. The 10 m grid is much less damped: peak `|omega_z|` rises from
+0.021 to 0.054 1/s and the peak anomaly from 7.4 to 12.4 K.
+
+| `z0` | `theta` width, `Q0` = 1000 | `Q0` = 500 |
+|---|---|---|
+| 50 m | 515.2 m | 357.4 m |
+| 100 m | 523.5 m | 331.0 m |
+| 150 m | 553.4 m | 342.1 m |
+
+At `Q0` = 1 kW/m^3 those three are monotone -- 515.2, 523.5, 553.4 m -- and it is
+tempting to call the `z0` ordering reproduced. **It is not, and the reason is in
+the next section: a single snapshot is not a measurement here.** At
+`Q0` = 0.5 kW/m^3 the same three are not even monotone: 357.4, 331.0, 342.1 m.
+
+**But none of these six is bifurcated.** Every one is a single lobe: the tallest
+two local maxima are separated by a dip of a few hundredths of a kelvin where
+one contour interval is 0.25 K. So `theta_width` above is the width of the
+plume's 0.25 K outline, not the separation of two branches, and it carries a
+confound the branch separation would not: an absolute 0.25 K contour encloses
+less of a half-strength source no matter what the bifurcation does. **The `Q0`
+result cannot be tested until the bifurcation itself is resolved**, and that is
+a sharper statement of the failure than the first cut's -- which blamed a
+mismatched quantity, correctly, but could not say what the right quantity would
+show.
+
+The coarse grid does not bifurcate either, and there the two lobes are usually
+not even distinguishable: `theta_peak` and `theta_saddle` come back as one
+maximum in most cases.
+
+### One snapshot is not a measurement: the plume is still unsteady at 600 s
+
+The paper reads Fig. 6 at "the time at which the flows are essentially steady
+(typically achieved after approximately 600 s)", and the case was built to match
+that. Comparing consecutive diagnostic samples shows these runs are not steady
+there. Between `t` = 450 s and `t` = 600 s the `theta` width moves by:
+
+| | range over the cases in that sweep |
+|---|---|
+| `n` = 1 | 4.1% to 19.7% |
+| `n` = 5 | 27.7% to 82.8% |
+
+**The between-case differences the orderings are read from are smaller than the
+within-case variation of the individual numbers.** The `z0` spread at
+`Q0` = 1 kW/m^3 is 7.4% end to end while its three members individually move
+4.1%, 17.1% and 11.0% between the last two samples. That ordering is therefore
+not established, and neither is its failure at `Q0` = 0.5.
+
+This is not a defect of the theta measure -- the `omega_z` widths move as much,
+it is just that quantising them to `dx` made them look stable. It is a statement
+about the flow: Cunningham themselves report a quasi-periodic oscillation of the
+bifurcation with a period near 200 s, so sampling one instant near 600 s samples
+one phase of it.
+
+The measurement has to be a time average over the last few hundred seconds, with
+its own spread reported, before any of these orderings is quotable. Diagnostics
+cost far less than the step -- a whole 600 s case is about 90 s of wall clock --
+so sampling every 30 s instead of every 150 s is nearly free. That is the next
+run, and it is a precondition for the `z0` and `Q0` criteria, not an extra.
+
+### `n` = 5 is markedly less dissipative, as the D2 residual argued
+
+The rewiring makes `reinit_every = 5` runnable, and it does what raising the
+reinitialization interval is supposed to do. At the fine grid, peak `|omega_z|`
+on the strongest plane:
+
+| case | `n` = 1 | `n` = 5 |
+|---|---|---|
+| `z0` = 50 m, `Q0` = 1000 | 0.0541 | 0.0695 (+28%) |
+| `z0` = 100 m, `Q0` = 1000 | 0.0539 | 0.0703 (+30%) |
+| `z0` = 150 m, `Q0` = 1000 | 0.0534 | 0.0731 (+37%) |
+
+That is the same direction as what D1 measured on the Burgers vortex, now on a
+real configuration. The cost is that the livelier flow is also the noisier one
+to sample, which is the previous section's problem in a sharper form.
+
+### The viscosity sweep at 10 m: it responds, and it still saturates
+
+The first cut read four identical rows and concluded the sweep measured nothing.
+That was half right. The `omega_z` extrema separation it tabulated is quantised
+to `dx`, which hid a response that was there; the interpolated `theta` measure
+shows it at both resolutions.
+
+| `mu` kg/(m s) | peak `|omega_z|`, 18.75 m | 10 m | `theta` width, 10 m |
+|---|---|---|---|
+| 4 | 0.0215 | 0.0539 | 524.3 m |
+| 1 | 0.0244 | 0.0654 | 494.9 m |
+| 0.15 | 0.0253 | 0.0694 | 499.3 m |
+| 0.0015 | 0.0254 | 0.0700 | 487.1 m |
+
+The shape is the same at both grids and it is the shape a dissipation floor
+makes: the response is real between `mu` = 4 and 1, weaker from 1 to 0.15, and
+gone below that. Step by step the coarse column gains 13.5%, 3.7%, 0.4%; the
+fine column gains 21.3%, 6.1%, 0.9%. End to end that is 18.1% coarse against
+**29.9% fine**.
+
+So refining the grid by 1.9x moved the floor down and roughly doubled how much
+of the sweep is above it -- but **the floor at `dx = 10 m` still sits above
+`mu` = 0.15**. Cunningham's progression from a laminar symmetric bifurcation at
+`mu` = 4 to a turbulent asymmetric plume at `mu` = 0.0015 needs the bottom of
+that range to be the physical viscosity, and here it still is not. The paper's
+own grid is not sufficient for the paper's own Reynolds-number series in this
+solver.
+
+This is a sharper claim than the first cut's, and it comes with a number rather
+than an assertion. It does not need a separate `nu = 0` run to support it: the
+saturation between consecutive `mu` values is the floor being crossed.
+
+### Run-to-run reproducibility
+
+The AMGPCG solve accumulates with atomics, so two runs of the same case are not
+bit-identical. There are two independent measurements of the scatter:
+
+- The coarse sweep was run twice on the same node. Of ten cases, nine returned
+  the same `theta_width` to the printed 0.1 m and one moved by 0.1 m in 477.5 m,
+  0.02%. Every `omega_z` extrema separation was identical.
+- The fine sweep contains an accidental replicate: `shear_z100_q1000` and
+  `visc_mu4` are the same configuration, run separately. They give 523.5 m and
+  524.3 m, a spread of **0.15%**.
+
+The fine-grid figure is the one to read the orderings against. The `z0` spread at
+`Q0` = 1 kW/m^3 is 7.4% from end to end, comfortably outside it; the `Q0` = 0.5
+spread is 8%, but non-monotone, so its middle point is the one at issue rather
+than its size. No number here is quoted past a tenth of a metre.
+
 ### Regression
 
 `use_uniform_inlet_` defaults to `true`, so `AdvanceAsync` behaves exactly as
-before for every case that does not ask otherwise. The D1 Burgers run confirms
-it: `-0.40%` at step 1 and `-0.33%` at step 481, matching the recorded table row
-for row.
+before for every case that does not ask otherwise. Nothing in `src/ofm` changed
+in the second cut either -- the rewiring is all on the harness side -- and the
+D1 Burgers case confirms both: on the recorded 256^3 configuration it returns
+`-0.40%`, `-0.38%`, `-0.33%`, `-0.30%` at its four samples, which is the
+recorded table row for row.
 
 ### What is next, in order
 
-1. **Measure the theta bifurcation, not the `omega_z` extrema separation.** The
-   `Q0` comparison is not a fair test until it compares the same quantity the
-   paper plots.
-2. **Run at the paper's `dx = 10 m`.** `--tiles 23 15 19` is already the default
-   in the case; only the coarse sweep was run cheap. The viscosity sweep is
-   meaningless below that resolution and possibly at it.
-3. **An outflow condition.** Everything measured at `x = 1750 m` is 50 m from a
+1. **An outflow condition.** Everything measured at `x = 1750 m` is 50 m from a
    prescribed-profile face. This needs its own verification case before any
-   width from that plane is quotable.
-4. **Wire the buoyancy and the theta advection to `mid_u_[i]`** so the case can
-   run at `reinit_every = 5`, which is what the D2 residual argues for and what
-   this case, running at `n = 1`, is currently paying for in dissipation.
+   width from that plane is quotable, which is why it is separate work rather
+   than part of Stage A.
+2. **The CVP's vorticity attribution.** Cunningham only assert that tilting
+   dominates; D2 exists to put a number on it. The first of the two things
+   Stage A is meant to deliver that the paper does not have.
+3. **The horseshoe vortex**, which Cunningham and Barata 2024 each missed for
+   the same near-wall resolution reason. The second deliverable, and the one
+   that will need the finest grid.

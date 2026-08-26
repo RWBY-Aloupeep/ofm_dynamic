@@ -964,6 +964,8 @@ struct PlumeRun {
     float cvp_z      = 25.0f;          // m, height at which the CVP is measured
     int reinit_every = 1;
     int rk_order     = 3;
+    bool theta_bfecc = true;  // error-compensate the theta advection
+    bool theta_clamp = true;  // and clamp it, as the solver does for velocity
 };
 
 int RunPlume(const PlumeRun& run, const char* csv_path)
@@ -995,15 +997,25 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
            td.x * 8, td.y * 8, td.z * 8, dx, lx, ly, lz);
     printf("       U0 = %.2f m/s, z0 = %.0f m, Q0 = %.0f W/m^3, mu = %.4f kg/(m s) -> nu = %.4f m^2/s\n",
            spec.u0, spec.z0, spec.q0, run.mu, solver.viscosity_);
-    printf("       dt = %.3f s, %d steps = %.0f s, n = %d\n",
-           run.dt, run.steps, run.steps * run.dt, run.reinit_every);
+    printf("       dt = %.3f s, %d steps = %.0f s, n = %d, theta advection = %s\n",
+           run.dt, run.steps, run.steps * run.dt, run.reinit_every,
+           run.theta_bfecc ? (run.theta_clamp ? "BFECC + clamp" : "BFECC") : "plain semi-Lagrangian");
     const float diffusion_number = solver.viscosity_ * 2.0f * run.dt / (dx * dx);
     const float cfl              = spec.u0 * run.dt / dx;
     printf("       explicit diffusion number = %.4f%s, cross-flow CFL = %.3f\n",
            diffusion_number, diffusion_number > 0.16f ? "  [WARNING: above the ~1/6 limit]" : "", cfl);
-    if (run.reinit_every != 1)
-        printf("       [WARNING: the buoyancy and the theta advection both read init_u_, which is\n"
-               "        only current at a cycle boundary. n != 1 needs them wired to mid_u_.]\n");
+    // Diagnostics read init_u_, which ReinitAsync leaves current only at the end
+    // of a cycle. Anywhere else in the cycle it still holds the cycle's start.
+    if (run.diag_every % run.reinit_every != 0) {
+        printf("       [ERROR: --diag-every %d is not a multiple of n = %d; init_u_ is only\n"
+               "        current at a cycle boundary, so the measurement would read a stale field.]\n",
+               run.diag_every, run.reinit_every);
+        return 1;
+    }
+    if (run.steps % run.reinit_every != 0)
+        printf("       [WARNING: %d steps is not a whole number of n = %d cycles; the last partial\n"
+               "        cycle is never reinitialized and is dropped from the diagnostics.]\n",
+               run.steps, run.reinit_every);
 
     selfcheck::SetPlumeInitialVelocityAsync(solver, spec, stream);
     selfcheck::SetPlumeBcAsync(solver, spec, stream);
@@ -1013,8 +1025,13 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     const int cell_num = ofm::Prod(td) * 512;
     ofm::DHMemory<float> theta_a(cell_num);
     ofm::DHMemory<float> theta_b(cell_num);
+    // Scratch for the BFECC pass: the uncorrected forward step and the error.
+    ofm::DHMemory<float> theta_fwd(cell_num);
+    ofm::DHMemory<float> theta_err(cell_num);
     theta_a.ClearDevAsync(stream);
     theta_b.ClearDevAsync(stream);
+    theta_fwd.ClearDevAsync(stream);
+    theta_err.ClearDevAsync(stream);
     cudaStreamSynchronize(stream);
     ofm::DHMemory<float>* theta = &theta_a;
     ofm::DHMemory<float>* next  = &theta_b;
@@ -1024,7 +1041,9 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         printf("cannot open %s\n", csv_path);
         return 1;
     }
-    fprintf(csv, "step,time,max_theta,plume_top,w_max,u_max,plane_theta,omega_pos,omega_neg,y_pos,y_neg,split_width,best_x,best_omega,best_split\n");
+    fprintf(csv, "step,time,max_theta,plume_top,w_max,u_max,plane_theta,omega_pos,omega_neg,y_pos,y_neg,"
+                 "split_width,best_x,best_omega,best_split,theta_width,theta_split,theta_saddle,theta_peak,"
+                 "bifurcated,best_theta_width,best_theta_split,best_bifurcated\n");
     printf("\n%6s %8s %10s %10s %8s %8s %10s %10s %12s\n",
            "step", "t", "max_dT", "top", "w_max", "u_max", "w_z(+)", "w_z(-)", "split");
 
@@ -1033,23 +1052,43 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     for (int step = 0; step < run.steps; step++) {
         const float t = step * run.dt;
         selfcheck::AddPlumeHeatAsync(*theta, td, solver.grid_origin_, dx, spec, t, run.dt, stream);
-        selfcheck::SetBuoyancyAndDragAsync(solver, *theta, spec, stream);
+        // The buoyancy and the drag are built on the latest projected velocity,
+        // and theta is then advected across the step by the velocity of the step
+        // just taken -- a midpoint velocity, so the semi-Lagrangian update gets
+        // its second-order transport. Neither reads init_u_, which is what lets
+        // this run at n > 1.
+        selfcheck::SetBuoyancyAndDragAsync(solver, *theta, spec, selfcheck::PlumeVelocityBefore(solver), stream);
         solver.AdvanceAsync(run.dt, stream);
-        solver.ReinitAsync(run.dt, stream);
-        ofm::AdvectN2CAsync(*next, td, *theta, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_,
-                            dx, run.dt, stream);
+        const selfcheck::PlumeVelocity step_u = selfcheck::PlumeVelocityAfter(solver);
+        selfcheck::AdvectThetaAsync(*next, theta_fwd, theta_err, td, *theta, step_u, dx, run.dt,
+                                    run.theta_bfecc, run.theta_clamp, stream);
         std::swap(theta, next);
+        // Once per cycle, not once per step: ReinitAsync re-marches the flow map
+        // through the whole cycle's velocity history.
+        if ((step + 1) % run.reinit_every == 0)
+            solver.ReinitAsync(run.dt, stream);
 
-        if ((step + 1) % run.diag_every == 0 || step + 1 == run.steps) {
+        // Only ever at a cycle boundary, which the diag_every check above
+        // guarantees; the final step is added when it happens to be one.
+        if ((step + 1) % run.diag_every == 0
+            || (step + 1 == run.steps && (step + 1) % run.reinit_every == 0)) {
             const selfcheck::PlumeDiag d = selfcheck::MeasurePlume(solver, *theta, run.plane_x, run.cvp_z, stream);
             printf("%6d %8.1f %10.3f %10.1f %8.2f %8.2f %10.4f %10.4f %12.1f | best x=%6.0f |w|=%.4f split=%6.1f%s\n",
                    step + 1, (step + 1) * run.dt, d.max_theta, d.plume_top, d.w_max, d.u_max,
                    d.omega_pos, d.omega_neg, d.split_width,
                    d.best_x, d.best_omega, d.best_split, d.valid ? "" : "  [no CVP on plane]");
-            fprintf(csv, "%d,%.3f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e,%.3f,%.3f,%.3f,%.3f,%.6e,%.3f\n",
+            printf("       theta: width %6.1f m, split %6.1f m%s (peaks %.3f K over saddle %.3f K) "
+                   "| best plane: width %6.1f m, split %6.1f m%s\n",
+                   d.theta_width, d.theta_split, d.bifurcated ? "" : " [single lobe]",
+                   d.theta_peak, d.theta_saddle,
+                   d.best_theta_width, d.best_theta_split, d.best_bifurcated ? "" : " [single lobe]");
+            fprintf(csv, "%d,%.3f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e,%.3f,%.3f,%.3f,%.3f,%.6e,%.3f,"
+                         "%.3f,%.3f,%.6f,%.6f,%d,%.3f,%.3f,%d\n",
                     step + 1, (step + 1) * run.dt, d.max_theta, d.plume_top, d.w_max, d.u_max, d.plane_theta,
                     d.omega_pos, d.omega_neg, d.y_pos, d.y_neg, d.split_width,
-                    d.best_x, d.best_omega, d.best_split);
+                    d.best_x, d.best_omega, d.best_split,
+                    d.theta_width, d.theta_split, d.theta_saddle, d.theta_peak, d.bifurcated ? 1 : 0,
+                    d.best_theta_width, d.best_theta_split, d.best_bifurcated ? 1 : 0);
             fflush(csv);
             last = d;
         }
@@ -1061,9 +1100,11 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         printf("FAIL: no counter-rotating pair on the x = %.0f m plane at z = %.0f m\n", run.plane_x, run.cvp_z);
         return 1;
     }
-    printf("PASS: counter-rotating pair present, split width %.1f m "
+    printf("PASS: counter-rotating pair present, omega_z extrema %.1f m apart "
            "(w_z = %+.4f at y = %.0f m, %+.4f at y = %.0f m)\n",
            last.split_width, last.omega_pos, last.y_pos, last.omega_neg, last.y_neg);
+    printf("      theta bifurcation on the same plane: %s, width %.1f m, split %.1f m\n",
+           last.bifurcated ? "present" : "absent (single lobe)", last.theta_width, last.theta_split);
     return 0;
 }
 
@@ -1105,6 +1146,15 @@ int main(int argc, char** argv)
         }
         else if (arg == "--spacing" && i + 1 < argc)
             rp.spacing = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--theta-advection" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            plume.theta_bfecc      = (mode != "plain");
+            plume.theta_clamp      = (mode == "bfecc-clamp");
+            if (mode != "plain" && mode != "bfecc" && mode != "bfecc-clamp") {
+                printf("--theta-advection takes plain, bfecc or bfecc-clamp\n");
+                return 1;
+            }
+        }
         else if (arg == "--reinit-every" && i + 1 < argc)
             reinit_every = std::atoi(argv[++i]);
         else if (arg == "--rk-order" && i + 1 < argc)
@@ -1147,10 +1197,16 @@ int main(int argc, char** argv)
                    "       selfcheck --test coreradii [--res-tiles T] [--core B0] [--circulation G]\n"
                    "       selfcheck --test damkohler [--res-tiles T] [--core B0] [--circulation G]\n"
                    "       selfcheck --test plume [--z0 Z] [--q0 Q] [--mu MU] [--dt DT] [--steps N]\n"
-                   "                 [--diag-every N] [--plane-x X] [--cvp-z Z] [--tiles TX TY TZ]\n");
+                   "                 [--diag-every N] [--plane-x X] [--cvp-z Z] [--tiles TX TY TZ]\n"
+                   "                 [--reinit-every N] [--theta-advection plain|bfecc|bfecc-clamp]\n");
             return 0;
         }
     }
+
+    // Every case below reports numbers, and a device the kernels cannot launch on
+    // would let all of them report zeros. Check once, here, before any of them run.
+    if (!selfcheck::CheckDeviceUsable())
+        return 2;
 
     if (test == "leapfrog3d")
         return RunLeapfrogRings(total_steps, diag_every, csv_path.c_str(), rp, dt, reinit_every, rk_order);

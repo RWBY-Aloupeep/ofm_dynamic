@@ -36,8 +36,14 @@ target("selfcheck")
     add_files("../../src/ofm/ofm_util.cu")
     add_files("*.cu")
 
-    -- gpu-rtx6k is Turing (sm_75); gpu-l40s and gpu-l40 are Ada (sm_89).
-    add_cugencodes("sm_75", "sm_89")
+    -- gpu-rtx6k is Turing (sm_75); gpu-l40s and gpu-l40 are Ada (sm_89). The
+    -- compute_75 PTX is a JIT fallback so that any device from Turing on -- the
+    -- ckpt partition mixes several -- still runs instead of failing every launch.
+    -- PTX only JITs forwards, so this covers sm_75 and newer and nothing older;
+    -- CheckDeviceUsable catches the rest. Pin a sweep to one partition even so:
+    -- an ordering result should not be read off cases that ran on different
+    -- hardware.
+    add_cugencodes("sm_75", "sm_89", "compute_75")
     add_cuflags("--std c++17", "-lineinfo", "--extended-lambda")
     add_packages("cuda")
 

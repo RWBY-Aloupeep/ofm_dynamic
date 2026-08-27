@@ -34,7 +34,7 @@ LICENSE file intact, and don't present upstream code as this project's contribut
 The full research plan (literature audit, the three concrete gaps it identifies, the Stage 0–D
 roadmap, per-stage pass criteria, and open risks) is **not duplicated in this repo**. It lives in
 the "Fire-Whirl Flow Maps" Artifact, owned by the project's author, and is mirrored into persistent
-memory. It is versioned (v1.3 as of 2026-08-25) and is updated independently of this code.
+memory. It is versioned (v2.0 as of 2026-08-26) and is updated independently of this code.
 
 **It is authoritative.** Read it (`Artifact action:"read"`) before planning any implementation work,
 and take the objective, the stage ordering, and the pass criteria from it rather than proposing your

@@ -213,7 +213,8 @@ by viscosity alone and its core obeys `b(t)^2 = b(0)^2 + 4*nu*t` exactly. The Bu
 profile is the model the fire whirl literature fits to measured cores -- several
 studies report it as the best fit for a quasi-steady on-source fire whirl, its
 normalised profile is self-similar, and its azimuthal velocity peaks at
-`r = 1.12091 b_w` (Tohidi et al. 2018, Eq. 6-7).
+`r = 1.12091 b_w` (Tohidi et al. 2018, Eq. 7 -- Eq. 6 on the same page is the
+Rankine model, not this one).
 
 The estimator needs no circulation input. Peak vorticity of the profile is
 `Gamma / (pi b^2)` and circulation is conserved, so

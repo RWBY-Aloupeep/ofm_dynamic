@@ -1058,11 +1058,11 @@ there. Between `t` = 450 s and `t` = 600 s the `theta` width moves by:
 | `n` = 1 | 4.1% to 19.7% |
 | `n` = 5 | 27.7% to 82.8% |
 
-**The between-case differences the orderings are read from are smaller than the
+**The between-case differences the orderings were read from are smaller than the
 within-case variation of the individual numbers.** The `z0` spread at
 `Q0` = 1 kW/m^3 is 7.4% end to end while its three members individually move
-4.1%, 17.1% and 11.0% between the last two samples. That ordering is therefore
-not established, and neither is its failure at `Q0` = 0.5.
+4.1%, 17.1% and 11.0% between the last two samples. Nothing can be concluded
+from single snapshots here, in either direction.
 
 This is not a defect of the theta measure -- the `omega_z` widths move as much,
 it is just that quantising them to `dx` made them look stable. It is a statement
@@ -1070,11 +1070,73 @@ about the flow: Cunningham themselves report a quasi-periodic oscillation of the
 bifurcation with a period near 200 s, so sampling one instant near 600 s samples
 one phase of it.
 
-The measurement has to be a time average over the last few hundred seconds, with
-its own spread reported, before any of these orderings is quotable. Diagnostics
-cost far less than the step -- a whole 600 s case is about 90 s of wall clock --
-so sampling every 30 s instead of every 150 s is nearly free. That is the next
-run, and it is a precondition for the `z0` and `Q0` criteria, not an extra.
+Diagnostics cost far less than the step -- a whole 600 s case is about 90 s of
+wall clock -- so sampling every 30 s instead of every 150 s is nearly free. The
+sweep was re-run that way, and the next section is what it says.
+
+### The measurement that settles both criteria
+
+Six Fig. 6 cases at the paper's grid, sampled every 30 s, averaged over the last
+200 s (7 samples), run twice: once with the bare semi-Lagrangian `theta` step
+and once with BFECC + clamp. Everything else identical, so the pair isolates the
+scheme. Uncertainties are the standard error of the 7 samples.
+
+**What the scheme changes.** It is not a detail:
+
+| case | width plain | width BFECC | peak dT plain | BFECC | bifurcated, plain -> BFECC |
+|---|---|---|---|---|---|
+| `z0` 50, `Q0` 1000 | 539.5 | 738.2 | 11.80 K | 26.77 K | 0.00 -> 1.00 |
+| `z0` 50, `Q0` 500 | 375.2 | 579.8 | 6.00 | 15.20 | 0.00 -> 1.00 |
+| `z0` 100, `Q0` 1000 | 580.1 | 943.2 | 12.39 | 27.94 | 0.00 -> 0.86 |
+| `z0` 100, `Q0` 500 | 356.0 | 616.0 | 6.30 | 16.66 | 0.00 -> 1.00 |
+| `z0` 150, `Q0` 1000 | 612.4 | 1125.4 | 12.77 | 28.10 | 0.00 -> 1.00 |
+| `z0` 150, `Q0` 500 | 323.7 | 678.8 | 6.62 | 17.41 | 0.00 -> 1.00 |
+
+The uncompensated step was destroying more than half the plume's thermal
+amplitude, and with it the buoyancy that drives the whole flow. **With `theta`
+error-compensated the plume bifurcates in essentially every sample of every
+case; without it, in none.** The first cut's "no bifurcation anywhere" was a
+statement about the advection scheme, not about the physics.
+
+The measurement also gets much steadier: the width's sample scatter falls from
+6-14% to 1-5%, because the field being measured is no longer being ground down
+between samples.
+
+**`z0`: the paper's principal result reproduces.** Bifurcation split, BFECC:
+
+| `z0` | `Q0` = 1 kW/m^3 | `Q0` = 0.5 kW/m^3 |
+|---|---|---|
+| 50 m | 477.5 +- 3.0 m | 386.5 +- 3.1 m |
+| 100 m | 565.3 +- 10.9 m | 421.9 +- 6.3 m |
+| 150 m | 668.1 +- 20.0 m | 464.9 +- 29.2 m |
+
+Both columns are monotone. End to end the strong-source column gains 190.6 m,
+**9.4x the combined standard error**; the weak-source column gains 78.4 m,
+2.7x. Deeper cross-flow shear gives a wider bifurcation, measured on the
+quantity Fig. 6 plots, at the grid Fig. 6 was computed on, with an error bar.
+
+**`Q0`: it does not, and now that is a real result.** The paper reports a wider
+bifurcation for the weaker source (their Fig. 6e against 6f). Every case here is
+the other way, on the same quantity:
+
+| `z0` | weak minus strong, split | in standard errors |
+|---|---|---|
+| 50 m | -91.0 m | 21.2x |
+| 100 m | -143.3 m | 11.4x |
+| 150 m | -203.2 m | 5.7x |
+
+This is no longer a mismatched-quantity problem, and it is far outside the
+scatter. Either the reduction drops something the effect needs -- the volume
+expansion is the obvious candidate, since the peak anomaly is now 28 K and
+`dT/T0` is O(0.09) -- or the prescribed outflow is distorting the plane. Both
+are named gaps; this is the first Stage A result that puts weight on which.
+
+**One caveat on the widest case.** `z0` = 150 m at `Q0` = 1 kW/m^3 has a 0.25 K
+outline 1125 m across in a domain 1200 m wide, so its *width* is close to the
+free-slip lateral walls, where Cunningham had Orlanski outflow. The *split* is
+an interior measurement and much less exposed, which is one more reason to read
+the split rather than the width -- but the `z0` = 150 row should be re-run in a
+wider domain before it is quoted on its own.
 
 ### `n` = 5 is markedly less dissipative, as the D2 residual argued
 
@@ -1150,15 +1212,30 @@ D1 Burgers case confirms both: on the recorded 256^3 configuration it returns
 `-0.40%`, `-0.38%`, `-0.33%`, `-0.30%` at its four samples, which is the
 recorded table row for row.
 
+### Where Stage A stands
+
+| the paper's claim | status |
+|---|---|
+| counter-rotating pair, positive `omega_z` on the right looking downstream | reproduced (first cut) |
+| plume cross-section bifurcates | reproduced, but only with `theta` error-compensated |
+| deeper shear layer -> wider bifurcation | **reproduced**, 9.4x sem at `Q0` = 1 kW/m^3 |
+| weaker source -> wider bifurcation | **fails**, opposite by 5.7-21.2x sem |
+| laminar-to-turbulent progression over `mu` | not reachable: the dissipation floor at 10 m is still above `mu` = 0.15 |
+| `St` ~ 0.25 shedding | not tested |
+| cross-section not Gaussian | not tested |
+
 ### What is next, in order
 
-1. **An outflow condition.** Everything measured at `x = 1750 m` is 50 m from a
-   prescribed-profile face. This needs its own verification case before any
-   width from that plane is quotable, which is why it is separate work rather
-   than part of Stage A.
-2. **The CVP's vorticity attribution.** Cunningham only assert that tilting
+1. **A wider domain for the `z0` = 150 m cases**, whose 0.25 K outline is within
+   75 m of the free-slip lateral wall. Cheap, and it either confirms that row or
+   removes it.
+2. **An outflow condition.** Everything measured at `x = 1750 m` is 50-90 m from
+   a prescribed-profile face. It needs its own verification case, which is why
+   it is separate work rather than part of Stage A -- but the `Q0` failure now
+   gives a concrete reason to want it.
+3. **The CVP's vorticity attribution.** Cunningham only assert that tilting
    dominates; D2 exists to put a number on it. The first of the two things
    Stage A is meant to deliver that the paper does not have.
-3. **The horseshoe vortex**, which Cunningham and Barata 2024 each missed for
+4. **The horseshoe vortex**, which Cunningham and Barata 2024 each missed for
    the same near-wall resolution reason. The second deliverable, and the one
    that will need the finest grid.

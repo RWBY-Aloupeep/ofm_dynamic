@@ -1241,6 +1241,206 @@ recorded table row for row.
    the same near-wall resolution reason. The second deliverable, and the one
    that will need the finest grid.
 
+## Is there an optimal reinitialization interval? Two errors, charged two ways
+
+D1 §8 concluded that "numerical dissipation is charged per reinitialization, not
+per unit of simulated time", and drew from it the rule *raise `reinit_every`
+rather than lower `dt`*. That conclusion rested on two measurements taken on
+different cases with different metrics: coarsening `dt` at `n = 1` (1/120 to
+1/480, four times fewer reinitializations) moved the floor by 3.55x, while
+raising `n` at fixed `dt` (1 to 10, ten times fewer) moved the ring case's peak
+vorticity by only 2.56x. Written as `E ~ N_reinit^alpha` with
+`N_reinit = T/(n dt)`, those give `alpha = 0.91` and `alpha = 0.41`, which would
+mean the two knobs are not interchangeable and no one-line rule exists.
+
+They are interchangeable. The disagreement was an artefact of comparing two
+cases and two metrics, and the sweep below replaces both with one surface
+measured on one case with one metric.
+
+### The sweep
+
+D1's columnar Burgers vortex, the only case here with a closed-form answer
+(`b(t)^2 = b0^2 + 4 nu t`, read back self-normalised as
+`nu_eff = b0^2 (w0/w - 1)/(4t)`), on 128^3, with the simulated time held at
+`T = 1 s` in every run so that "per unit time" is the same axis throughout.
+Every `n` divides every step count, so the last diagnostic lands exactly on
+`t = 1` rather than at the first cycle boundary past it -- D1 §8's own two floor
+numbers were sampled at `t = 1.01` and `t = 0.75`, which is why the 3.55x there
+is not a clean ratio.
+
+Four sets: the floor at `nu = 0` over `dt` in {1/240, 1/480, 1/960, 1/1920} and
+`n` in {1, 2, 4, 8, 16, 48, 120, 240}; the same grid at `nu = 1e-3` and at
+`nu = 3e-4`; the same `n` ladder at twice the circulation; and a timing ladder
+with diagnostics off. 112 runs, 52 minutes on one RTX 6000.
+
+### The dissipation floor is a function of `n*dt` alone
+
+Configurations sharing a cycle length agree to better than half a percent, over
+a 200x range of cycle lengths:
+
+| `n*dt` | `(n, 1/dt)` | `nu_eff` |
+|---|---|---|
+| 1/480 | (1, 480) / (2, 960) / (4, 1920) | 7.0246e-5 / 7.0260e-5 / 7.0412e-5 |
+| 1/240 | (1, 240) / (2, 480) / (4, 960) / (8, 1920) | 3.6008 / 3.6043 / 3.6042 / 3.6131 e-5 |
+| 1/60 | (4, 240) / (8, 480) / (16, 960) | 1.0660 / 1.0689 / 1.0643 e-5 |
+
+`nu_eff * n * dt` stays between 1.40e-7 and 1.90e-7 while `N_reinit` varies by a
+factor of 1000. So the floor is very nearly a fixed charge per
+reinitialization, and **raising `n` and coarsening `dt` are the same lever**;
+only their product matters. `n = 1`, `dt = 1/480` returns 7.0246e-5, which
+reproduces D1 §8's 7.02e-5 exactly and makes this a regression on that number as
+well.
+
+Doubling the circulation -- hence the velocity and the strain rate -- at fixed
+`dt` leaves the floor unchanged to within 1-4% for `n` up to 120. The floor
+therefore follows the cycle's *duration*, not the distance the map is marched
+across it. Of the two rules that coincide at fixed `dx` and fixed flow,
+`n*dt = const` (which is what LFM's driver enforces, `dt = 1/(frame_rate *
+reinit_every)`) is the one the floor obeys; `n*sigma = const` is not.
+
+The collapse degrades at the two longest cycles (`n` = 120 and 240 at the
+coarsest `dt`), where the peak vorticity changes by only parts in 10^5 over the
+whole run and the estimator is closer to its own resolution. Those corners are
+reported but not leaned on.
+
+### The source-term channel is charged the opposite way: per sub-step
+
+The `nu = 0` floor cannot see the one error that grows with cycle length. The
+path integral accumulates the source into the impulse through the forward map,
+so a longer cycle pulls it through a longer composition. Splitting the viscous
+error into the floor, which pushes `nu_eff` up, and whatever is left, which
+pulls it down --
+
+    rel_err = floor/nu - deficit
+
+-- gives a deficit that is flat in `dt` and grows with `n`:
+
+| `n` | `dt`=1/240 | 1/480 | 1/960 | 1/1920 | spread |
+|---|---|---|---|---|---|
+| 4 | 5.03% | 5.23% | 5.49% | 6.30% | 25% |
+| 8 | 5.67% | 5.81% | 6.00% | 6.26% | 10% |
+| 16 | 7.31% | 7.27% | 7.38% | 7.55% | **4%** |
+| 48 | 14.68% | 13.95% | 13.65% | 13.60% | 8% |
+| 120 | 32.05% | 29.20% | 27.84% | 27.19% | 18% |
+| 240 | 52.86% | 48.51% | 46.20% | 44.97% | 18% |
+
+Eight times more simulated time per cycle changes the deficit by a few percent
+of itself; four times more sub-steps roughly doubles it. The growth is described
+by a per-sub-step fractional loss, `deficit = base + 1 - (1 - eps)^n`. Fitting
+`eps` to the `n` = 48 and 240 pair at `dt` = 1/1920 gives **`eps` = 0.224% at
+`nu` = 1e-3 and 0.227% at `nu` = 3e-4 -- the same rate at both viscosities**,
+which is what a property of the scheme rather than of the case should look like.
+The fit is a two-point one, so the check is the rows it was not fitted to: it
+puts `n` = 120 at 27.0% against 27.2% measured and 31.9% against 33.5%, and
+`n` = 16 at 6.9% against 7.6% and 11.6% against 10.2%. Right shape, one to two
+points of slack.
+
+The `base` offsets differ (3.4% and 8.1%) and are the unreliable part:
+subtracting a floor measured at `nu = 0` from a run at `nu > 0` is only
+approximate, because the two are not the same field. The `n` = 1 and 2 rows,
+where `floor/nu` reaches 27%, are unreliable for the same reason and are omitted
+above.
+
+So the two error terms are charged on different axes. The floor is a fixed
+price per reinitialization and falls as `1/(n dt)`. The source deficit is a
+fixed price per sub-step of the cycle and grows as `1 - (1-eps)^n`. Nothing
+collapses the pair onto one parameter, and `dt` and `n` are interchangeable for
+the first but not the second.
+
+### The error zero is a cancellation, not an optimum
+
+The two terms have opposite signs, so the total error passes through zero. It is
+tempting to read that zero as the optimal interval, and at one viscosity it even
+looks like a law: the crossing sits at a fixed cycle *duration*, so `n*` scales
+as `1/dt`.
+
+| | `nu` = 1e-3 | `nu` = 3e-4 |
+|---|---|---|
+| `dt` = 1/240 | below `n` = 1 | `n*` = 2.10, `n* dt` = 0.0087 |
+| `dt` = 1/480 | `n*` = 1.41, `n* dt` = 0.0029 | `n*` = 3.85, 0.0080 |
+| `dt` = 1/960 | `n*` = 2.59, 0.0027 | `n*` = 6.89, 0.0072 |
+| `dt` = 1/1920 | `n*` = 4.66, 0.0024 | `n*` = 11.60, 0.0060 |
+
+Each column is nearly constant, which is the law. But the two columns are not
+the same law: dropping `nu` by 3.33x moves the crossing by 2.8x, which is what
+`floor/nu ~ 1/(nu n dt)` predicts if the deficit does not depend on `nu`. **The
+zero is where numerical dissipation happens to cancel the source deficit, and it
+moves with `nu`.** It is not a property of the scheme and must not be quoted as
+an optimal interval.
+
+What is a property of the scheme is the pair of scalings. Given a target, they
+say what to do: the floor is bought down by lengthening the cycle in *time*, by
+either knob; the source channel is paid for in *sub-steps*, so at a fixed cycle
+duration the cheaper configuration is the one with fewer, longer steps.
+
+### No stability limit appeared, which was the other expectation
+
+The leapfrog ring case had both `n` = 10 runs go non-finite at step 860, which
+suggested that `n` is bounded above by stability and that a cheap error-based
+controller would spend its time avoiding that bound. Nothing here hit it. All
+112 runs completed and produced a finite diagnostic at `t` = 1, including
+`n` = 240 at `dt` = 1/240, which is one cycle spanning the entire run: the flow
+map is marched 240 sub-steps from identity and never reset. It is accurate to
+0.002% on the floor and wrong by 53% on the source term, but it is stable.
+
+So the ceiling on `n` in this case is set by the source channel's accuracy, not
+by stability. The ring case's blow-up came after the rings had hit the far wall
+and the peak vorticity had reached 160; it is a property of that violent field,
+not of long cycles as such. Whether a Stage A or Stage B configuration has a
+stability ceiling low enough to matter is still open, and it is a different
+question from this one.
+
+### Cost saturates by `n` = 8
+
+Wall clock for 1 s of simulated time, diagnostics off:
+
+| `n` | 1 | 2 | 4 | 8 | 16 | 48 | 120 | 240 |
+|---|---|---|---|---|---|---|---|---|
+| s | 19 | 16 | 14 | 13 | 13 | 12 | 13 | 13 |
+
+A 32% saving, all of it collected by `n` = 8. That is the shape the structure
+predicts: `ReinitAsync` marches O(`n`) sub-steps per cycle
+(`ofm.cu:233,251`), so the marching work per unit simulated time does not depend
+on `n`, and what raising `n` removes is one Projection 2, one map reset and one
+BFECC pass per cycle -- a term that decays as `1/n` onto a floor. The timer has
+1 s resolution, so the last three columns are one value, not three.
+
+### What this changes
+
+1. **D1 §8's rule "raise `reinit_every` rather than lower `dt`" is wrong as a
+   statement about the floor.** The floor depends only on `n*dt`, so the two are
+   the same lever. What is true is the weaker statement D1 actually measured:
+   refining `dt` at fixed `n` makes the solution more diffusive, because it
+   shortens the cycle. Refining `dt` while holding `n*dt` fixed does not.
+2. **Raising `n` has a cost that none of the three arguments for
+   `reinit_every = 5` counted.** They were dissipation, speed, and the D2
+   dual-path residual, all of them on the floor side. The source deficit is on
+   the other side: at 128^3 it charges 0.224% per sub-step, so `n` = 5 gives up
+   1.1% of the source term. Since the deficit is an interpolation error it falls
+   with `dx` -- D1's own `n` = 1 numbers imply about 5.3% at 128^3 against about
+   1.5% at 256^3, a factor of 3.7 for a doubling, so close to second order -- so
+   at 256^3 `n` = 5 costs about 0.3%. That does not overturn `n` = 5, but it is a term that
+   belongs in the ledger, and it is the term that will decide how far above 5 it
+   is safe to go.
+3. **There is no viscosity-independent optimal `n` to compute.** The question
+   "what is the best interval" has no answer without naming which error is
+   being minimised and at what resolution.
+
+### Reproducing
+
+```
+sbatch proj/selfcheck/reinit_dt_sweep.sbatch          # all four sets
+SET=nuvisclo BUILD=0 sbatch proj/selfcheck/reinit_dt_sweep.sbatch
+python3 proj/selfcheck/reinit_dt_summary.py /gscratch/amath/diwenxu/wildfire-sim-runs/reinit-dt
+```
+
+In a fresh worktree, `git submodule update --init --recursive` first, from the
+login node: the submodules start out empty and the build dies on a missing
+`amgpcg.h`.
+
+Output, including the tabled summary, is under
+`/gscratch/amath/diwenxu/wildfire-sim-runs/reinit-dt`.
+
 ## Stage A, third cut: an open boundary, verified on its own
 
 The second cut ended with two named reasons to want an outflow condition: the

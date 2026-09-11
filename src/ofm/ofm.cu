@@ -22,6 +22,8 @@ void OFM::Alloc(int3 _tile_dim, int _reinit_every)
     int z_voxel_num = Prod(z_tile_dim) * 512;
 
     // boundary
+    if (flux_sum_ == nullptr)
+        cudaMalloc(&flux_sum_, 2 * sizeof(double));
     is_bc_x_  = std::make_shared<DHMemory<uint8_t>>(x_voxel_num);
     is_bc_y_  = std::make_shared<DHMemory<uint8_t>>(y_voxel_num);
     is_bc_z_  = std::make_shared<DHMemory<uint8_t>>(z_voxel_num);
@@ -103,6 +105,8 @@ void OFM::Alloc(int3 _tile_dim, int _reinit_every)
     min_dim       = min_dim > tile_dim_.y ? tile_dim_.y : min_dim;
     min_dim       = min_dim > tile_dim_.z ? tile_dim_.z : min_dim;
     int level_num = (int)log2(min_dim) + 1;
+    if (max_level_num_ > 0 && level_num > max_level_num_)
+        level_num = max_level_num_;
     amgpcg_.Alloc(_tile_dim, level_num);
 }
 
@@ -400,6 +404,23 @@ void OFM::ProjectAsync(cudaStream_t _stream)
     int3 x_tile_dim = { tile_dim_.x + 1, tile_dim_.y, tile_dim_.z };
     int3 y_tile_dim = { tile_dim_.x, tile_dim_.y + 1, tile_dim_.z };
     int3 z_tile_dim = { tile_dim_.x, tile_dim_.y, tile_dim_.z + 1 };
+
+    bool any_convective = false;
+    for (int f = 0; f < 6; f++)
+        any_convective = any_convective || convective_face_[f];
+    if (any_convective) {
+        DHMemory<float>* bc_val[3] = { bc_val_x_.get(), bc_val_y_.get(), bc_val_z_.get() };
+        DHMemory<float>* tmp_u[3]  = { tmp_u_x_.get(), tmp_u_y_.get(), tmp_u_z_.get() };
+        for (int f = 0; f < 6; f++)
+            if (convective_face_[f])
+                ConvectiveFaceUpdateAsync(*bc_val[f / 2], *tmp_u[f / 2], tile_dim_, f / 2, f % 2, _stream);
+        cudaMemsetAsync(flux_sum_, 0, 2 * sizeof(double), _stream);
+        DomainFluxAsync(flux_sum_, tile_dim_, *is_bc_x_, *is_bc_y_, *is_bc_z_, *bc_val_x_, *bc_val_y_, *bc_val_z_,
+                        *tmp_u_x_, *tmp_u_y_, *tmp_u_z_, convective_face_, _stream);
+        for (int f = 0; f < 6; f++)
+            if (convective_face_[f])
+                ConvectiveFaceCorrectAsync(*bc_val[f / 2], tile_dim_, f / 2, f % 2, flux_sum_, _stream);
+    }
 
     SetBcAxisAsync(*tmp_u_x_, x_tile_dim, *is_bc_x_, *bc_val_x_, _stream);
     SetBcAxisAsync(*tmp_u_y_, y_tile_dim, *is_bc_y_, *bc_val_y_, _stream);

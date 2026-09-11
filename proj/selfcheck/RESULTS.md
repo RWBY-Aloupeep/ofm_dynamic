@@ -1239,3 +1239,379 @@ recorded table row for row.
 4. **The horseshoe vortex**, which Cunningham and Barata 2024 each missed for
    the same near-wall resolution reason. The second deliverable, and the one
    that will need the finest grid.
+
+## Stage A, third cut: an open boundary, verified on its own
+
+The second cut ended with two named reasons to want an outflow condition: the
+paper's measurement plane sits 50-90 m from a face on which the first two cuts
+prescribed the cross-flow profile, and the failed `Q0` ordering had that face as
+one of its two candidate explanations. This cut adds the condition, verifies it
+on an exact solution as the project's rules require, and then re-reads the Fig.
+6 orderings with it. It also adds two things Cunningham's direct runs have that
+the case did not: thermal diffusion of `theta` at `Pr = 0.7`, and the damping
+layer under the lid.
+
+### The condition was already in the Poisson solver, hidden
+
+Reading `SetCoefByIsBcKernel`, `ApplyPressureXKernel` and the AMGPCG matvec
+together: a staggered face marked in `is_bc_*` carries a prescribed normal
+velocity and the pressure sees a homogeneous Neumann condition across it -- the
+diagonal count drops by one. A domain face that is *not* marked keeps its
+diagonal entry, the matvec finds no neighbour beyond it, and `ApplyPressure`
+reads the exterior pressure as zero. That is a Dirichlet `p = 0` cell beyond the
+face: the projection sets the face's normal velocity from the pressure gradient
+and mass leaves or enters at whatever rate the interior asks for. It is the
+zero-gauge **pressure outlet** that Barata et al. 2024 (Sec. 2.1) and 2025 (Sec.
+2.1) put on their lateral, top and outlet faces in FLUENT, and the `p_ext = 0`
+form of the FDS OPEN boundary (FDS Technical Reference Vol. 1, Sec. 4.3.3; FDS
+pins its `H = p/rho + |u|^2/2` rather than `p`, but with `p_ext = 0` the
+outgoing pressure is the same zero). The graphics solvers this code descends
+from never use it because they mark all six faces as walls.
+
+So the solver-side change is small: `SetDomainFaceAsync` clears the mark on one
+whole domain face, `ofm.h` documents the exterior-pressure convention, and the
+one trap is `AMGPCG::pure_neumann_`, which defaults to `true` and subtracts the
+mean of the right-hand side before every V-cycle. That is right for the
+singular all-Neumann operator and wrong the moment the pressure level is
+pinned; it is switched off whenever a face is open.
+
+What this is **not** is Cunningham's Orlanski (1976) radiation condition, which
+extrapolates a phase speed from the interior and advects the boundary value at
+it. Orlanski 1976 is not in the corpus, so it was not implemented from memory;
+the pressure outlet is the condition two corpus papers use for exactly this
+kind of plume. The tangential velocity at an open face is whatever the
+semi-Lagrangian step lands there -- its backtrace is clamped to the domain, so
+this is the zero-gradient condition FDS Sec. 4.4.5 describes for outflow.
+
+### The verification case: a vortex column leaving through the face
+
+A boundary condition is verified by a flow that crosses it with a known answer.
+The case is the Gaussian vortex column of D1 and D3 (Tohidi et al. 2018 Eq. 7,
+`omega = Gamma/(pi a^2) exp(-r^2/a^2)`), uniform in `z` between free-slip
+walls, carried by a uniform stream `U` along `+x` through the downstream face.
+In an unbounded inviscid fluid it translates unchanged, so the solution is
+known at every time. The inflow and lateral faces prescribe that solution's
+normal velocity, updated every step from the exact centre position, so only the
+downstream face carries the condition under test.
+
+The condition is not exact for this flow, and that is the point: a vortex core
+is a pressure minimum, and the outlet pins the pressure to zero, so as the core
+crosses the face the boundary must do something the exact solution does not.
+The case measures how much. Three runs make the measurement:
+
+| run | downstream face | role |
+|---|---|---|
+| open | `p = 0` | the condition under test |
+| closed | `u = U` prescribed | what the first two cuts did to the plume |
+| long | twice as far away, never reached | the solver's own error on the same nodes |
+
+Box `2 x 1 x 1/8` at `dx = 1/128` (256 x 128 x 16), `U = 1`, `a = 0.05`
+(6.4 cells), `Gamma = 0.25` (peak swirl about `U/2`), centre starting at
+`x = 0.75`, `dt = 1/384`, run to `t = 1.75` when the exact centre is ten core
+radii past the face. Vorticity is taken at the cell corners from the face
+velocities directly, so the sum over the corner set is the exact discrete
+circulation around the rectangle half a cell inside the boundary, and the
+analytic value is the Gaussian's integral over that same rectangle. Reported
+per sample: circulation still inside against exact, the L2 error of the
+vorticity field over the whole rectangle and over the interior `x < x_out - 4a`
+(normalised by the exact field's norm `Gamma/(a sqrt(2 pi))`), the peak, and
+the largest `|w|`, which the exact solution has at zero.
+
+The pass criteria below are **proposed** here, not taken from the plan
+Artifact, which asked for a verification case without naming one; they are
+written so that the closed box, the treatment being replaced, must fail them.
+
+### Result: transparent to what stays inside, late by a fraction of a core on the way out
+
+Runs at `n` = 1 and `n` = 5 (steps and sampling adjusted to whole cycles at
+`n` = 5), on `gpu-rtx6k`. First, what the solver does to this vortex with no
+boundary in the way -- the long box, on the short box's nodes:
+
+| `n` | peak vorticity when the centre reaches `x = 2` | interior L2 error there | circulation *outside* the core box before the face |
+|---|---|---|---|
+| 1 | 0.830 of exact | 0.106 | +0.105 `Gamma` |
+| 5 | 0.926 of exact | 0.045 | +0.103 `Gamma` |
+
+The core is conserved: summed over a box of half-width `6a` about the exact
+centre the circulation stays at `0.25000` to four places until the face is
+reached, in every run. The peak decay and the L2 error are the dissipation
+floor D1 measured, again smaller at `n` = 5. The third column is new and is
+**not** the outflow's: it is identical in the open, closed and long boxes, it
+grows from the first step, and it stays behind (`+0.029 Gamma`, still creeping
+up) after the vortex has gone. It lives outside the core box, so along the
+walls or the inflow; the third verification run below localises it. It is a
+solver finding about the free-slip lateral walls with a prescribed normal
+velocity, recorded here and taken out of every comparison by reading the open
+and closed boxes against the long box on the same nodes rather than against
+the exact field.
+
+Then the boundary itself, as open minus long at every sample:
+
+| `n` | criterion | open | closed control |
+|---|---|---|---|
+| 1 | interior L2 error added while the core is in transit (`x < x_out - 4a`) | **+0.007** | +0.062 |
+| 1 | circulation left behind after exit | **-0.0002 `Gamma`** | -0.0001 `Gamma` |
+| 1 | peak vorticity left behind after exit | **0.0022** of the initial peak | 0.0022 |
+| 1 | largest `|Gamma_in - Gamma_in(long)|` during the crossing | 0.070 `Gamma` | 0.025 `Gamma` |
+| 1 | peak / long-box peak as the centre reaches the face | 1.095 | 1.049 |
+| 5 | interior L2 error added while in transit | +0.025 | +0.104 |
+| 5 | circulation left behind after exit | **+0.0000 `Gamma`** | +0.0002 `Gamma` |
+| 5 | peak vorticity left behind after exit | **0.0021** | 0.0021 |
+| 5 | largest `|Gamma_in - Gamma_in(long)|` during the crossing | 0.108 `Gamma` | 0.034 `Gamma` |
+| 5 | peak / long-box peak as the centre reaches the face | 1.099 | 1.035 |
+
+Read row by row:
+
+- **Nothing reflects.** After the vortex has left, the open box holds the same
+  circulation as the long box to `2e-4 Gamma` and the same residual peak
+  (0.2% of the initial, the wall-row noise). The closed box also holds nothing
+  afterwards, but only because it never let anything through: its vortex is
+  ground down against the prescribed face instead.
+- **The interior is untouched at `n` = 1** (+0.7% of the field norm, against
+  +6.2% for the closed box), and lightly touched at `n` = 5 (+2.5%, against
+  +10.4%). The closed box's contamination is what the second cut's measurement
+  plane, 5 cells from such a face, was sitting in.
+- **The crossing is late.** As the exact centre reaches the face the long box
+  has 0.140 `Gamma` left inside the measured rectangle, the open box 0.158
+  (`n` = 1); the core is held for a fraction of a core radius and its peak
+  rises by 10% as it is pulled through -- the cost of pinning the pressure to
+  zero across a pressure minimum. Both boxes are late; the closed box less so
+  on this one number, and worse on every other.
+
+Against the proposed thresholds (1% interior, 1% residual, 2% on the crossing
+curve), the open face passes the first two at `n` = 1, fails the interior one
+narrowly at `n` = 5, and fails the crossing one at both. The crossing
+threshold does not separate the treatments -- the closed box "passes" it more
+nearly while distorting the interior ten times more -- so it is the wrong
+number to gate on, and the plan Artifact should say which of these it adopts.
+The two that discriminate are the interior contamination and the residual;
+on those the open face is transparent and the closed box is not. What the
+crossing lag means for the plume is not a matter for this case: the plume's
+own long-domain reference below measures it directly, on the quantity the
+orderings are read from.
+
+### The pressure outlet fails the plume, and why
+
+With the face verified on the vortex, the six Fig. 6 cases were run with the
+downstream face open, and again with the lateral faces open too. Every
+`Q0` = 1 kW/m^3 case, and the widest `Q0` = 0.5 case with the lateral faces
+open, went non-finite between 390 s and 450 s. The trigger is visible in the
+diagnostics: the plume top reaches the 1500 m lid at about 360 s (it does in
+the closed and long boxes too), and within 30-60 s the largest speed goes
+from 10 m/s to several hundred. The weak-source cases, whose plume stays
+below the lid at the face, ran through. Replacing the air that enters through
+an open face with ambient air (the semi-Lagrangian backtrace is clamped to the
+domain, so without that a cell the flow enters through keeps its own `theta`
+and re-imports the plume's buoyancy from outside) was necessary but not
+sufficient: the same case still failed at the same time.
+
+The reason is what the vortex case already showed in miniature. A zero-gauge
+outlet assumes the fluid beyond the face is ambient. In the Boussinesq
+pressure a buoyant column under a lid carries a hydrostatic part -- `dp/dz =
+g theta'/theta0`, so the pressure just under the lid is high by
+`g (theta'/theta0) H` -- and when that column reaches a face where `p` is
+pinned to zero, the whole of it becomes a horizontal gradient across one cell.
+Cunningham's own words are that the outflow "occurs entirely on the lateral
+and downstream boundaries", that is, the plume leaves through them; the
+exterior there is plume, not ambient air. The pressure outlet is the wrong
+class of condition for a flow that carries its own pressure field out of the
+box, and this is the case Stage A needs. It is kept in the code as
+`--outflow x|xy`, verified and documented, and not used for the orderings.
+
+### The convective face
+
+The condition Cunningham cite, Orlanski's, is a radiation condition: the
+boundary value is advected out at a phase speed estimated from the interior,
+and nothing is said about the pressure. The projection scheme here computes
+the first half of that already -- the semi-Lagrangian step lands on every
+open face the value `u(x - u dt)`, which is `du/dt + u_n du/dn = 0` with the
+local normal velocity as the phase speed -- and the second half is a choice
+about the projection. `OFM::convective_face_` makes it: the face keeps its
+Dirichlet mark, but at every projection its prescribed value is refreshed
+from the advected velocity, the set of convective faces is then shifted by
+one constant so that the flux through the whole domain boundary nets to zero
+(the pure-Neumann operator needs that, and it is the only global coupling the
+condition has), and the pressure sees Neumann across the face as it does at a
+wall. Nothing is pinned, so the plume's hydrostatic pressure crosses the face
+with the plume. Orlanski 1976 is not in the corpus and the adaptive phase
+speed was not implemented; this is the local-speed convective condition, and
+it is named as such.
+
+On the vortex case it behaves as the pressure outlet did for what stays
+inside, and better on the way out (table below). On the plume, the case that
+failed at 390 s under the pressure outlet runs to 600 s: the plume top reaches
+the lid at 360 s, the warm layer under it is flushed through the downstream
+face over the next 150 s, the largest speed never exceeds 11 m/s, and the
+counter-rotating pair is on the plane at the end.
+
+The vortex case, convective face against the long box on the same nodes, next
+to the pressure outlet:
+
+| `n` | criterion | convective | pressure outlet | closed control |
+|---|---|---|---|---|
+| 1 | interior L2 error added while the core is in transit | **+0.006** | +0.007 | +0.062 |
+| 1 | circulation left behind after exit | **-0.0001 `Gamma`** | -0.0002 | -0.0001 |
+| 1 | peak vorticity left behind after exit | **0.0022** | 0.0022 | 0.0022 |
+| 1 | largest `|Gamma_in - Gamma_in(long)|` during the crossing | **0.038 `Gamma`** | 0.070 | 0.025 |
+| 1 | peak / long-box peak as the centre reaches the face | 0.929 | 1.095 | 1.049 |
+| 5 | interior L2 error added while in transit | **+0.008** | +0.025 | +0.104 |
+| 5 | circulation left behind after exit | **+0.0001 `Gamma`** | +0.0000 | +0.0002 |
+| 5 | peak vorticity left behind after exit | **0.0021** | 0.0021 | 0.0021 |
+| 5 | largest `|Gamma_in - Gamma_in(long)|` during the crossing | **0.041 `Gamma`** | 0.108 | 0.034 |
+| 5 | peak / long-box peak as the centre reaches the face | 0.980 | 1.099 | 1.035 |
+
+It passes the interior and residual criteria at both `n`, adds less than 1% to
+the interior at `n` = 5 where the pressure outlet added 2.5%, and its crossing
+lag is half the pressure outlet's; the core is slightly damped on the way out
+(peak 0.93 of the long box's at `n` = 1) rather than stretched. Runs in
+`/gscratch/amath/diwenxu/wildfire-sim-runs/outflow-v4/`, read by
+`analyse_outflow.py`.
+
+### A multigrid trap found on the way: some tile counts give a non-finite solve
+
+The wider reference box (23 x 30 x 19 tiles, so that the plume's flanks are
+600 m further from the walls) returned a field that was non-finite after the
+very first projection, with no CUDA error reported. Probing tile counts and
+multigrid depths (`OFM::Alloc` takes `log2(min tile count) + 1` levels; each
+level halves the tile count, rounding up):
+
+| tiles | levels | coarsest level | initial projection |
+|---|---|---|---|
+| 23 x 15 x 19 (the paper's grid) | 4 (default) | 3 x 2 x 3 | fine |
+| 23 x 15 x 19 | 5 | 2 x 1 x 2 | fine |
+| 46 x 15 x 19 (long box) | 4 (default) | 6 x 2 x 3 | fine |
+| 23 x 14 x 19 | 4 (default) | 3 x 2 x 3 | fine |
+| 23 x 16 x 19 | 5 (default) | 2 x 1 x 2 | **non-finite** |
+| 23 x 16 x 19 | 4 | 3 x 2 x 3 | fine |
+| 23 x 17 x 19 | 4 | 3 x 3 x 3 | **illegal memory access** |
+| 23 x 30 x 19 (wide box) | 5 (default) | 2 x 2 x 2 | **non-finite** |
+| 23 x 30 x 19 | 4 | 3 x 4 x 3 | **non-finite** |
+| 23 x 30 x 19 | 3 | 6 x 8 x 5 | fine |
+| 24 x 30 x 20 | 4 | 3 x 4 x 3 | **non-finite** |
+| 24 x 16 x 19, 23 x 16 x 20, 24 x 16 x 20, 23 x 24 x 19 | 5 (default) | | **non-finite** |
+| 16^3, 32^3, 32 x 16 x 16, 32 x 16 x 2 | default | | fine |
+
+No single rule fits (2 x 1 x 2 is fine from 15 y-tiles and not from 16; 36
+coarse tiles are fine as 6 x 2 x 3 and not as 3 x 4 x 3), so this is recorded
+as an open AMGPCG submodule issue rather than diagnosed here. What the harness
+does about it: `OFM::max_level_num_` caps the depth (`--max-levels`), the wide
+box runs with three levels, and because a shallower hierarchy is a weaker
+preconditioner for the same fixed 15 CG iterations, its narrow control is run
+with three levels too so the two are compared at equal solver settings. The
+plume driver also now refuses to continue when the initial projection leaves
+the field non-finite, or when a diagnostic finds a non-finite value or a speed
+above 100 m/s -- the same lesson as the device probe: fail loudly, never print
+zeros.
+
+### The plume with the convective outflow, against a reference with the outflow far away
+
+The six Fig. 6 cases at the paper's grid, `theta` diffusing at `Pr` = 0.7,
+sampled every 30 s and averaged over the last 200 s, under five boundary
+treatments; and the same six in a box twice as long (46 x 15 x 19 tiles,
+3600 m), where the prescribed downstream face is 1850 m from the measurement
+plane, as the reference for what that plane looks like with no downstream
+boundary near it. Bifurcation split at `x` = 1750 m, in metres, with the
+standard error of the seven samples, and the difference from the reference in
+combined standard errors:
+
+| case | long reference | closed (first two cuts) | downstream convective | downstream + lateral convective |
+|---|---|---|---|---|
+| `z0` 50, `Q0` 1000 | 420.1 +- 5.1 | 392.3 (-27.8, **3.8x**) | 403.5 (-16.6, 1.9x) | 391.6 (-28.5, 3.9x) |
+| `z0` 50, `Q0` 500 | 323.3 +- 10.3 | 312.2 (-11.1, 0.9x) | 312.4 (-10.9, 0.8x) | 304.5 (-18.8, 1.4x) |
+| `z0` 100, `Q0` 1000 | 479.9 +- 4.0 | 467.8 (-12.1, 1.9x) | 478.7 (-1.2, 0.2x) | 455.0 (-24.9, **4.6x**) |
+| `z0` 100, `Q0` 500 | 364.9 +- 9.1 | 351.1 (-13.8, 1.2x) | 356.6 (-8.3, 0.6x) | 342.3 (-22.6, 1.8x) |
+| `z0` 150, `Q0` 1000 | 596.3 +- 32.1 | 603.1 (+6.8, 0.1x) | 608.6 (+12.3, 0.3x) | 567.1 (-29.2, 0.6x) |
+| `z0` 150, `Q0` 500 | 388.5 +- 32.9 | 374.2 (-14.3, 0.3x) | 380.8 (-7.7, 0.2x) | 371.9 (-16.6, 0.4x) |
+
+**The prescribed face was contaminating the plane**, by up to 28 m (7%) and
+3.8 standard errors in the strongest, shallowest case, and always in the same
+direction (narrower). **With the downstream face convective the plane agrees
+with the far-outflow reference in every case**, within 2 standard errors, and
+the systematic sign is gone. That is the check the boundary was built for,
+on the quantity the orderings are read from, and it passes.
+
+Opening the lateral faces as well -- Cunningham's actual set -- narrows the
+split by a further 10-25 m in every case, 4-5 standard errors in two of them.
+The long reference cannot judge that, since it keeps the lateral walls; the
+wide box is the reference for it, and is reported below.
+
+**What this does to the two orderings.** Deeper shear still gives a wider
+bifurcation, in every treatment: with the downstream face convective the
+strong-source column runs 403.5 -> 478.7 -> 608.6 m, 6.6 combined standard
+errors end to end. **The weaker source is still narrower in every treatment**,
+4.8 to 12.1 standard errors with the downstream face convective, 4.9 to 12.2
+with the lateral faces open too, and 4.5 to 11.6 in the long reference where
+no boundary is near the plane. The second cut named the prescribed outflow as
+one of two candidate explanations for that failure; **it is not the
+explanation**. The remaining named candidate is the Boussinesq reduction.
+
+**Thermal diffusion** at `Pr` = 0.7 (`kappa` = 4.86 m^2/s at `mu` = 4)
+lowers the peak anomaly from 27-28.5 K to 24-25 K and narrows the split by
+40-65 m (10-14%), so it belongs in any comparison with the paper's direct
+runs, which have it. It changes no ordering. Nor does the **sponge** change
+the split (within 1-2 standard errors of the same runs without it), but it
+does cut the 0.25 K *width* by up to 30% in the `z0` = 150 m strong-source
+case, whose plume top sits in the damped layer -- one more reason the split,
+not the width, is the number to read. **`n` = 5** with the convective faces
+runs to the end in all six cases (the pressure outlet lost every one at
+`n` = 5 before 150 s), reproduces the `z0` ordering, and scatters far more
+between samples (standard errors of 30-75 m against 4-35 m at `n` = 1), as the
+second cut found for the closed box; it is not used for the orderings here.
+
+**Regression.** The closed box with diffusion off, re-run on this code,
+matches the second cut's six splits to within 0.5 standard errors and its
+six widths to within 0.3 (largest split difference 12.6 m on the
+`z0` = 150 m strong-source case, whose standard error is 19 m).
+
+### The lateral walls, judged by the wide box
+
+The wide box (23 x 30 x 19 tiles, 2400 m across, the heat source recentred at
+`y` = 1200 m, three multigrid levels because of the trap above) against the
+paper's box with the same three levels, both closed:
+
+| case | narrow, closed | wide, closed | difference |
+|---|---|---|---|
+| `z0` 50, `Q0` 1000 | 387.0 | 382.0 | -5.0 (0.4x) |
+| `z0` 50, `Q0` 500 | 306.3 | 314.5 | +8.2 (0.8x) |
+| `z0` 100, `Q0` 1000 | 478.7 | 457.2 | -21.5 (1.9x) |
+| `z0` 100, `Q0` 500 | 348.6 | 345.8 | -2.8 (0.2x) |
+| `z0` 150, `Q0` 1000 | 591.2 | 567.4 | -23.8 (0.5x) |
+| `z0` 150, `Q0` 500 | 371.7 | 366.1 | -5.7 (0.1x) |
+
+and the same pair with the downstream face convective: differences of -19 to
++34 m, none above 1.3 standard errors. **Moving the lateral walls 600 m
+further out does not change the split**, including in the `z0` = 150 m
+strong-source case whose 0.25 K outline the second cut found within 75 m of
+the wall; that row can be quoted. (The three-level and four-level solvers
+agree on the split to within 1.3 standard errors and on the width to within
+1.4, with the width differing by up to 80 m -- the fixed 15 CG iterations are
+not fully converged, and the width is the more sensitive of the two.)
+
+Which leaves the lateral *convective* faces as the odd one out: they narrow
+the split by 4 to 32 m relative to the narrow closed box, 5.0 standard errors
+in the `z0` = 100 m strong-source case, when removing the wall altogether does
+nothing. The likely cause is in the flux correction, which shifts every
+convective face by the same constant, so the lateral faces carry a share of
+whatever the downstream face's advected flux falls short of the inflow by; a
+correction confined to the downstream face is the obvious next thing to try.
+Until that is done, the configuration for the orderings is **downstream face
+convective, lateral faces free-slip walls**, which the wide box shows to be
+far enough away.
+
+### Where Stage A stands after the third cut
+
+| the paper's claim | status |
+|---|---|
+| counter-rotating pair, positive `omega_z` on the right looking downstream | reproduced (first cut) |
+| plume cross-section bifurcates | reproduced, with `theta` error-compensated |
+| deeper shear layer -> wider bifurcation | **reproduced** with the verified outflow: 6.6x sem at `Q0` = 1 kW/m^3 |
+| weaker source -> wider bifurcation | **fails**, opposite by 4.8-12.1x sem, and the outflow is now excluded as the cause |
+| laminar-to-turbulent progression over `mu` | not reachable at 10 m (second cut) |
+| `St` ~ 0.25 shedding | not tested |
+| cross-section not Gaussian | not tested |
+
+What is next, in order: the `Q0` failure now has one named candidate left,
+the Boussinesq reduction, and the low-Mach question the plan lists first
+under Sec. 7 is where that goes; the lateral-face flux correction above;
+then the CVP attribution and the horseshoe vortex, unchanged from the second
+cut's list.

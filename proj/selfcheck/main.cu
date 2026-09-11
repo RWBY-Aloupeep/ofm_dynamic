@@ -966,6 +966,25 @@ struct PlumeRun {
     int rk_order     = 3;
     bool theta_bfecc = true;  // error-compensate the theta advection
     bool theta_clamp = true;  // and clamp it, as the solver does for velocity
+    int outflow      = 0;     // 0 closed box, 1 downstream face open, 2 downstream and lateral open
+    float pr         = 0.7f;  // Prandtl number tying kappa to mu; 0 turns theta diffusion off
+    bool sponge      = false; // Rayleigh damping layer under the lid
+    float src_y      = 600.0f; // m, heat-source centre; move it with the domain when widening
+    int max_levels   = 0;      // multigrid level cap, 0 = automatic
+};
+
+// Verification of the open boundary on the translating Gaussian vortex column.
+// Unit-free: the y extent is 1, the default box is 2 x 1 x 1/8.
+struct OutflowRun {
+    int3 tiles       = { 32, 16, 2 }; // 256 x 128 x 16 cells, dx = 1/128
+    float dt         = 1.0f / 384.0f; // stream CFL 1/3, swirl adds about half that
+    int steps        = 672;           // t = 1.75: the centre is 0.5 = 10 a past the face
+    int diag_every   = 16;
+    int reinit_every = 1;
+    int rk_order     = 3;
+    int outflow      = 1;             // 1 open, 0 the closed control
+    bool long_domain = false;         // double the length: the reference the vortex never leaves
+    float margin     = 0.2f;          // interior = x < x_out - margin, four core radii
 };
 
 int RunPlume(const PlumeRun& run, const char* csv_path)
@@ -977,14 +996,21 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     config.cg_iter      = 15;
     config.reinit_every = run.reinit_every;
     config.rk_order     = run.rk_order;
+    config.max_levels   = run.max_levels;
 
     ofm::OFM solver;
     GPUTimer profiler(64);
     selfcheck::SetupSolver(solver, config, profiler, stream);
 
     selfcheck::PlumeSpec spec;
-    spec.z0 = run.z0;
-    spec.q0 = run.q0;
+    spec.z0      = run.z0;
+    spec.q0      = run.q0;
+    spec.outflow = run.outflow;
+    spec.pr      = run.pr;
+    spec.sponge  = run.sponge;
+    spec.src_y   = run.src_y;
+    // Cunningham's direct runs: conductivity from the viscosity through Pr.
+    const float kappa = run.pr > 0.0f ? run.mu / (spec.rho * run.pr) : 0.0f;
 
     solver.use_source_term_ = true;
     solver.viscosity_       = run.mu / spec.rho;
@@ -1000,6 +1026,15 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     printf("       dt = %.3f s, %d steps = %.0f s, n = %d, theta advection = %s\n",
            run.dt, run.steps, run.steps * run.dt, run.reinit_every,
            run.theta_bfecc ? (run.theta_clamp ? "BFECC + clamp" : "BFECC") : "plain semi-Lagrangian");
+    printf("       boundaries: %s; theta diffusion: %s; sponge: %s\n",
+           run.outflow == 0 ? "closed box, U(z) prescribed on both x faces"
+           : run.outflow == 1 ? "downstream face open (p = 0)"
+           : run.outflow == 2 ? "downstream and lateral faces open (p = 0)"
+           : run.outflow == 3 ? "downstream face convective" : "downstream and lateral faces convective",
+           kappa > 0.0f ? "on" : "off", run.sponge ? "on, top 10% of the domain" : "off");
+    if (kappa > 0.0f)
+        printf("       Pr = %.2f -> kappa = %.4f m^2/s, kappa dt/dx^2 = %.4f%s\n", run.pr, kappa,
+               kappa * run.dt / (dx * dx), kappa * run.dt / (dx * dx) > 0.16f ? "  [WARNING: above the ~1/6 limit]" : "");
     const float diffusion_number = solver.viscosity_ * 2.0f * run.dt / (dx * dx);
     const float cfl              = spec.u0 * run.dt / dx;
     printf("       explicit diffusion number = %.4f%s, cross-flow CFL = %.3f\n",
@@ -1021,6 +1056,25 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     selfcheck::SetPlumeBcAsync(solver, spec, stream);
     selfcheck::ProjectCurrentVelocityAsync(solver, stream);
     cudaStreamSynchronize(stream);
+    {
+        // A launch that failed here would leave every later field at zero and
+        // the run would print those zeros as a result.
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("CUDA error after setup: %s\n", cudaGetErrorString(err));
+            return 1;
+        }
+        solver.init_u_x_->DevToHostAsync(stream);
+        cudaStreamSynchronize(stream);
+        int bad = 0;
+        for (int i = 0; i < solver.init_u_x_->size_; i++)
+            if (!std::isfinite(solver.init_u_x_->host_ptr_[i]))
+                bad++;
+        if (bad) {
+            printf("FAIL: %d of %d x-face velocities are not finite after the initial projection\n", bad, solver.init_u_x_->size_);
+            return 1;
+        }
+    }
 
     const int cell_num = ofm::Prod(td) * 512;
     ofm::DHMemory<float> theta_a(cell_num);
@@ -1057,12 +1111,20 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         // just taken -- a midpoint velocity, so the semi-Lagrangian update gets
         // its second-order transport. Neither reads init_u_, which is what lets
         // this run at n > 1.
-        selfcheck::SetBuoyancyAndDragAsync(solver, *theta, spec, selfcheck::PlumeVelocityBefore(solver), stream);
+        selfcheck::SetBuoyancyAndDragAsync(solver, *theta, spec, selfcheck::PlumeVelocityBefore(solver), run.dt, stream);
         solver.AdvanceAsync(run.dt, stream);
         const selfcheck::PlumeVelocity step_u = selfcheck::PlumeVelocityAfter(solver);
         selfcheck::AdvectThetaAsync(*next, theta_fwd, theta_err, td, *theta, step_u, dx, run.dt,
                                     run.theta_bfecc, run.theta_clamp, stream);
         std::swap(theta, next);
+        selfcheck::AmbientInflowThetaAsync(*theta, td, step_u, run.outflow, dx, run.dt, stream);
+        // Operator split: diffusion after the advection, over the same step.
+        if (kappa > 0.0f) {
+            selfcheck::DiffuseThetaAsync(*next, *theta, td, kappa, dx, run.dt, stream);
+            std::swap(theta, next);
+        }
+        if (run.sponge)
+            selfcheck::SpongeThetaAsync(*theta, td, solver.grid_origin_, dx, spec, run.dt, stream);
         // Once per cycle, not once per step: ReinitAsync re-marches the flow map
         // through the whole cycle's velocity history.
         if ((step + 1) % run.reinit_every == 0)
@@ -1072,7 +1134,18 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         // guarantees; the final step is added when it happens to be one.
         if ((step + 1) % run.diag_every == 0
             || (step + 1 == run.steps && (step + 1) % run.reinit_every == 0)) {
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                printf("CUDA error at step %d: %s\n", step + 1, cudaGetErrorString(err));
+                fclose(csv);
+                return 1;
+            }
             const selfcheck::PlumeDiag d = selfcheck::MeasurePlume(solver, *theta, run.plane_x, run.cvp_z, stream);
+            if (!std::isfinite(d.max_theta) || !std::isfinite(d.u_max) || d.u_max > 100.0f) {
+                printf("FAIL: the field is no longer finite (or u_max = %.1f m/s) at t = %.1f s\n", d.u_max, (step + 1) * run.dt);
+                fclose(csv);
+                return 1;
+            }
             printf("%6d %8.1f %10.3f %10.1f %8.2f %8.2f %10.4f %10.4f %12.1f | best x=%6.0f |w|=%.4f split=%6.1f%s\n",
                    step + 1, (step + 1) * run.dt, d.max_theta, d.plume_top, d.w_max, d.u_max,
                    d.omega_pos, d.omega_neg, d.split_width,
@@ -1108,6 +1181,129 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     return 0;
 }
 
+// The open boundary on the translating Gaussian vortex column (see harness.h).
+// Three runs make the measurement: the open box, the closed control with the
+// downstream face prescribed at the stream, and the long box in which the vortex
+// never reaches the face. Every quantity below is reported against the exact
+// solution, and the long box says how much of the error is the solver's own.
+int RunOutflow(const OutflowRun& run, const char* csv_path)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim     = run.tiles;
+    if (run.long_domain)
+        config.tile_dim.x *= 2;
+    config.len_y        = 1.0f;
+    config.cg_iter      = 15;
+    config.reinit_every = run.reinit_every;
+    config.rk_order     = run.rk_order;
+
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+
+    selfcheck::TranslatingVortexSpec spec;
+    spec.outflow = run.outflow;
+
+    const float dx = solver.dx_;
+    const int3 td  = solver.tile_dim_;
+    const float lx = td.x * 8 * dx;
+    // The face under test is the one of the short box, at x = lx_short; in the
+    // long box the same nodes are measured, so the numbers line up.
+    const float x_out = run.tiles.x * 8 * dx;
+
+    printf("outflow: %d x %d x %d cells, dx = %.5f, box %.3f x %.3f x %.4f; face under test at x = %.3f%s\n",
+           td.x * 8, td.y * 8, td.z * 8, dx, lx, td.y * 8 * dx, td.z * 8 * dx, x_out,
+           run.long_domain ? " (long box: the vortex never reaches it)" : "");
+    printf("         U = %.2f, a = %.3f (%.1f cells), Gamma = %.3f, peak omega = %.3f, centre x0 = %.3f\n",
+           spec.u_stream, spec.core, spec.core / dx, spec.circulation,
+           spec.circulation / (3.14159265f * spec.core * spec.core), spec.x0);
+    printf("         dt = %.5f, %d steps = t %.3f, n = %d, rk = %d; downstream face %s\n",
+           run.dt, run.steps, run.steps * run.dt, run.reinit_every, run.rk_order,
+           run.long_domain ? "twice as far away" : (run.outflow == 1 ? "OPEN (p = 0)" : (run.outflow == 2 ? "CONVECTIVE" : "prescribed at U (closed control)")));
+
+    selfcheck::SetTranslatingVortexAsync(solver, spec, stream);
+    selfcheck::SetTranslatingVortexBcAsync(solver, spec, 0.0f, true, stream);
+    selfcheck::ProjectCurrentVelocityAsync(solver, stream);
+    cudaStreamSynchronize(stream);
+
+    if (run.steps % run.reinit_every != 0 || run.diag_every % run.reinit_every != 0) {
+        printf("steps and diag-every must be multiples of n = %d\n", run.reinit_every);
+        return 1;
+    }
+
+    FILE* csv = fopen(csv_path, "w");
+    if (!csv) {
+        printf("cannot open %s\n", csv_path);
+        return 1;
+    }
+    fprintf(csv, "step,time,x_c_exact,gamma_in,gamma_in_exact,gamma_core,gamma_core_exact,gamma_walls,gamma_inflow,gamma_elsewhere,min_omega,peak_omega,peak_omega_exact,peak_x,peak_y,l2_all,l2_interior,max_w\n");
+
+    const selfcheck::TranslatingVortexDiag d0 = selfcheck::MeasureTranslatingVortex(solver, spec, 0.0f, x_out, run.margin, stream);
+    printf("         seeded: Gamma_in = %.5f (exact %.5f), peak omega = %.3f (exact %.3f), L2 err = %.4f\n\n",
+           d0.gamma_in, d0.gamma_in_exact, d0.peak_omega, d0.peak_omega_exact, d0.l2_all);
+    printf("%6s %7s %7s %9s %9s %9s %9s %8s %8s %8s %8s %8s %8s\n",
+           "step", "t", "x_c", "Gamma_in", "exact", "G_core", "exact", "min_w", "peak_w", "x_peak", "L2 all", "L2 int", "max|w|");
+
+    double max_gamma_dev = 0.0, max_l2_int_transit = 0.0, residual_gamma = 0.0, residual_peak = 0.0;
+    bool exited = false;
+    const double gamma = spec.circulation;
+    for (int step = 0; step < run.steps; step++) {
+        const float t_mid = (step + 0.5f) * run.dt;
+        selfcheck::SetTranslatingVortexBcAsync(solver, spec, t_mid, false, stream);
+        solver.AdvanceAsync(run.dt, stream);
+        if ((step + 1) % run.reinit_every == 0) {
+            selfcheck::SetTranslatingVortexBcAsync(solver, spec, (step + 1) * run.dt, false, stream);
+            solver.ReinitAsync(run.dt, stream);
+        }
+        if ((step + 1) % run.diag_every != 0 && step + 1 != run.steps)
+            continue;
+        cudaStreamSynchronize(stream);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("CUDA error at step %d: %s\n", step + 1, cudaGetErrorString(err));
+            fclose(csv);
+            return 1;
+        }
+        const float t = (step + 1) * run.dt;
+        const selfcheck::TranslatingVortexDiag d = selfcheck::MeasureTranslatingVortex(solver, spec, t, x_out, run.margin, stream);
+        if (!d.valid) {
+            printf("non-finite field at t = %.3f\n", t);
+            fclose(csv);
+            return 1;
+        }
+        const double x_c = spec.x0 + spec.u_stream * t;
+        printf("%6d %7.3f %7.3f %9.5f %9.5f %9.5f %9.5f %8.3f %8.3f %8.3f %8.4f %8.4f %8.1e  walls %+.4f inflow %+.4f else %+.4f\n",
+               step + 1, t, x_c, d.gamma_in, d.gamma_in_exact, d.gamma_core, d.gamma_core_exact, d.min_omega,
+               d.peak_omega, d.peak_x, d.l2_all, d.l2_interior, d.max_w, d.gamma_walls, d.gamma_inflow, d.gamma_elsewhere);
+        fprintf(csv, "%d,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.6f,%.6f,%.6f,%.6f,%.6f,%.8f,%.8f,%.3e\n",
+                step + 1, t, x_c, d.gamma_in, d.gamma_in_exact, d.gamma_core, d.gamma_core_exact,
+                d.gamma_walls, d.gamma_inflow, d.gamma_elsewhere, d.min_omega,
+                d.peak_omega, d.peak_omega_exact, d.peak_x, d.peak_y, d.l2_all, d.l2_interior, d.max_w);
+        fflush(csv);
+
+        max_gamma_dev = std::max(max_gamma_dev, std::fabs(d.gamma_in - d.gamma_in_exact) / gamma);
+        // "In transit": until the exact centre has passed the face by the margin.
+        if (x_c < x_out + run.margin)
+            max_l2_int_transit = std::max(max_l2_int_transit, d.l2_interior);
+        // "Exited": less than 0.1% of the circulation is still inside, exactly.
+        if (d.gamma_in_exact < 1e-3 * gamma) {
+            exited         = true;
+            residual_gamma = std::fabs(d.gamma_in) / gamma;
+            residual_peak  = d.peak_omega / d.peak_omega_exact;
+        }
+    }
+    fclose(csv);
+    printf("\nwrote %s\n", csv_path);
+    printf("max |Gamma_in - exact| / Gamma over the run     = %.4f\n", max_gamma_dev);
+    printf("max interior L2 error while the core is in transit = %.4f  (x < x_out - %.2f)\n", max_l2_int_transit, run.margin);
+    if (exited)
+        printf("after exit: |Gamma_in| / Gamma = %.4f, residual peak omega / exact peak = %.4f\n", residual_gamma, residual_peak);
+    else
+        printf("after exit: not reached in this run\n");
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     std::string test        = "leapfrog3d";
@@ -1123,6 +1319,8 @@ int main(int argc, char** argv)
     float loop_radius = 0.0f; // attribution only: 0 means use the core radius
     int rk_order     = 3; // TVD-RK3, the order OFM shipped with
     PlumeRun plume;       // stage A only
+    OutflowRun outflow;   // open-boundary verification only
+    bool tiles_set = false;
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -1177,7 +1375,39 @@ int main(int argc, char** argv)
             plume.tiles.x = std::atoi(argv[++i]);
             plume.tiles.y = std::atoi(argv[++i]);
             plume.tiles.z = std::atoi(argv[++i]);
+            tiles_set     = true;
         }
+        else if (arg == "--outflow" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "closed")
+                plume.outflow = 0, outflow.outflow = 0;
+            else if (mode == "x" || mode == "open")
+                plume.outflow = 1, outflow.outflow = 1;
+            else if (mode == "xy")
+                plume.outflow = 2, outflow.outflow = 1;
+            else if (mode == "cx" || mode == "conv")
+                plume.outflow = 3, outflow.outflow = 2;
+            else if (mode == "cxy")
+                plume.outflow = 4, outflow.outflow = 2;
+            else {
+                printf("--outflow takes closed, x (or open), xy, cx (or conv) or cxy\n");
+                return 1;
+            }
+        }
+        else if (arg == "--pr" && i + 1 < argc)
+            plume.pr = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--len-y" && i + 1 < argc)
+            plume.len_y = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--src-y" && i + 1 < argc)
+            plume.src_y = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--max-levels" && i + 1 < argc)
+            plume.max_levels = std::atoi(argv[++i]);
+        else if (arg == "--sponge")
+            plume.sponge = true;
+        else if (arg == "--long")
+            outflow.long_domain = true;
+        else if (arg == "--margin" && i + 1 < argc)
+            outflow.margin = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--nu" && i + 1 < argc)
             bp.viscosity = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--dt" && i + 1 < argc) {
@@ -1198,7 +1428,10 @@ int main(int argc, char** argv)
                    "       selfcheck --test damkohler [--res-tiles T] [--core B0] [--circulation G]\n"
                    "       selfcheck --test plume [--z0 Z] [--q0 Q] [--mu MU] [--dt DT] [--steps N]\n"
                    "                 [--diag-every N] [--plane-x X] [--cvp-z Z] [--tiles TX TY TZ]\n"
-                   "                 [--reinit-every N] [--theta-advection plain|bfecc|bfecc-clamp]\n");
+                   "                 [--reinit-every N] [--theta-advection plain|bfecc|bfecc-clamp]\n"
+                   "                 [--outflow closed|x|xy|cx|cxy] [--pr PR] [--sponge] [--len-y LY] [--src-y Y] [--max-levels L]\n"
+                   "       selfcheck --test outflow [--outflow open|conv|closed] [--long] [--tiles TX TY TZ]\n"
+                   "                 [--dt DT] [--steps N] [--diag-every N] [--reinit-every N] [--margin M]\n");
             return 0;
         }
     }
@@ -1246,6 +1479,22 @@ int main(int argc, char** argv)
         plume.reinit_every = reinit_every;
         plume.rk_order     = rk_order;
         return RunPlume(plume, csv_path.c_str());
+    }
+
+    if (test == "outflow") {
+        if (csv_path == "leapfrog3d.csv")
+            csv_path = "outflow.csv";
+        if (tiles_set)
+            outflow.tiles = plume.tiles;
+        if (dt_set)
+            outflow.dt = dt;
+        if (total_steps != 2000)
+            outflow.steps = total_steps;
+        if (diag_every != 10)
+            outflow.diag_every = diag_every;
+        outflow.reinit_every = reinit_every;
+        outflow.rk_order     = rk_order;
+        return RunOutflow(outflow, csv_path.c_str());
     }
 
     if (test == "burgers") {

@@ -34,8 +34,20 @@ def sep(a, b):
     return (b[0] - a[0], (abs(b[0] - a[0]) / pooled if pooled else float('inf')))
 
 ROOT = '/gscratch/amath/diwenxu/wildfire-sim-runs'
-sets = [('plain semi-Lagrangian', f'{ROOT}/stage-a-dense-plain'),
-        ('BFECC + clamp',         f'{ROOT}/stage-a-dense-bfecc')]
+# Default: the second cut's pair. Any other sets are named on the command line
+# as label=dir, e.g. analyse_stage_a.py open-xy=stage-a-3-open-xy-pr long=stage-a-3-long-closed-pr;
+# a bare directory name is its own label. The pairwise table at the end compares
+# every set against the first.
+import sys
+if len(sys.argv) > 1:
+    sets = []
+    for arg in sys.argv[1:]:
+        label, _, d = arg.partition('=')
+        d = d or label
+        sets.append((label, d if os.path.isabs(d) else f'{ROOT}/{d}'))
+else:
+    sets = [('plain semi-Lagrangian', f'{ROOT}/stage-a-dense-plain'),
+            ('BFECC + clamp',         f'{ROOT}/stage-a-dense-bfecc')]
 
 tabs = {}
 for label, root in sets:
@@ -83,13 +95,17 @@ for label, t in tabs.items():
                   f"   weak {b[key][0]:7.1f}+-{b[key][2]:.1f}"
                   f"   weak-strong {d:+7.1f} m = {k:5.1f}x sem  -> {verdict}")
 
-if len(tabs) == 2:
-    ta, tb = tabs['plain semi-Lagrangian'], tabs['BFECC + clamp']
-    print("\n--- what the theta scheme changes ---")
-    print(f"{'case':<20}{'width plain':>12}{'width bfecc':>12}{'d%':>8}"
-          f"{'maxdT plain':>13}{'maxdT bfecc':>12}{'bif p':>7}{'bif b':>7}")
-    for k in sorted(set(ta) & set(tb)):
-        wp, wb = ta[k]['width'][0], tb[k]['width'][0]
-        print(f"{k:<20}{wp:>12.1f}{wb:>12.1f}{(wb - wp) / wp * 100:>7.1f}%"
-              f"{ta[k]['dT'][0]:>13.2f}{tb[k]['dT'][0]:>12.2f}"
-              f"{ta[k]['bif']:>7.2f}{tb[k]['bif']:>7.2f}")
+labels = [l for l, _ in sets if l in tabs]
+if len(labels) >= 2:
+    base = tabs[labels[0]]
+    for other in labels[1:]:
+        tb = tabs[other]
+        print(f"\n--- {other} against {labels[0]}: split and width, with the separation in combined standard errors ---")
+        print(f"{'case':<20}{'split base':>11}{'split':>9}{'diff':>8}{'x sem':>7}"
+              f"{'width base':>12}{'width':>9}{'diff':>8}{'x sem':>7}{'maxdT b':>9}{'maxdT':>8}")
+        for k in sorted(set(base) & set(tb)):
+            a, b = base[k], tb[k]
+            ds, ks = sep(a['split'], b['split']) if a['split'][3] and b['split'][3] else (float('nan'), float('nan'))
+            dw, kw = sep(a['width'], b['width'])
+            print(f"{k:<20}{a['split'][0]:>11.1f}{b['split'][0]:>9.1f}{ds:>+8.1f}{ks:>7.1f}"
+                  f"{a['width'][0]:>12.1f}{b['width'][0]:>9.1f}{dw:>+8.1f}{kw:>7.1f}{a['dT'][0]:>9.2f}{b['dT'][0]:>8.2f}")

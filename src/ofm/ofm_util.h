@@ -65,4 +65,24 @@ void AdvectN2CAsync(DHMemory<float>& _dst, int3 _tile_dim, const DHMemory<float>
                     float _dx, float _dt, cudaStream_t _stream);
 
 void SetInletAsync(DHMemory<float>& _bc_val_x, DHMemory<float>& _bc_val_y, int3 _tile_dim, float _inlet_norm, float _inlet_angle, cudaStream_t _stream);
+
+// One whole domain face at a time: _axis is 0, 1 or 2 and _side is 0 for the
+// face at the grid origin or 1 for the far face. With _is_bc true the face's
+// normal velocity is prescribed at _bc_val, as SetWallBcAsync does for all six;
+// with it false the mark is cleared and the face is left open -- see the note on
+// open faces in ofm.h. Rebuild the Poisson coefficients afterwards.
+void SetDomainFaceAsync(DHMemory<uint8_t>& _is_bc_axis, DHMemory<float>& _bc_val_axis, int3 _tile_dim, int _axis, int _side, bool _is_bc, float _bc_val, cudaStream_t _stream);
+
+// Convective faces (see OFM::convective_face_): copy the advected velocity on
+// one domain face into its prescribed value ...
+void ConvectiveFaceUpdateAsync(DHMemory<float>& _bc_val_axis, const DHMemory<float>& _u_axis, int3 _tile_dim, int _axis, int _side, cudaStream_t _stream);
+// ... sum the outward flux through all six domain faces (prescribed value
+// where marked, advected value where open) into _sum[0], and the number of
+// convective face cells into _sum[1] ...
+void DomainFluxAsync(double* _sum, int3 _tile_dim, const DHMemory<uint8_t>& _is_bc_x, const DHMemory<uint8_t>& _is_bc_y, const DHMemory<uint8_t>& _is_bc_z,
+                     const DHMemory<float>& _bc_val_x, const DHMemory<float>& _bc_val_y, const DHMemory<float>& _bc_val_z,
+                     const DHMemory<float>& _u_x, const DHMemory<float>& _u_y, const DHMemory<float>& _u_z, const bool _convective[6], cudaStream_t _stream);
+// ... and shift one convective face's values by -_sum[0] / _sum[1] outward, so
+// that the boundary flux nets to zero.
+void ConvectiveFaceCorrectAsync(DHMemory<float>& _bc_val_axis, int3 _tile_dim, int _axis, int _side, const double* _sum, cudaStream_t _stream);
 }

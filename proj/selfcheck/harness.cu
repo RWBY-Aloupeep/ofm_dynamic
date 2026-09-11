@@ -221,6 +221,7 @@ __global__ void SetShearVelocityKernel(float* u_axis, int3 axis_tile_dim, int co
 
 void SetupSolver(ofm::OFM& solver, const SolverConfig& config, GPUTimer& profiler, cudaStream_t stream)
 {
+    solver.max_level_num_ = config.max_levels;
     solver.Alloc(config.tile_dim, config.reinit_every);
     solver.SetProfilier(&profiler);
 
@@ -1083,6 +1084,113 @@ __global__ void CanopyDragKernel(float* f_axis, int3 axis_tile_dim, int componen
     }
 }
 
+// The damping coefficient of the sponge at height z: Wang et al. 2023's
+// beta = (20 dt)^-1 sin^2(pi/2 zeta/zeta0) over the top zeta0 of the domain,
+// zero below it.
+__host__ __device__ inline float SpongeBeta(float z, float lz, float depth_frac, float dt)
+{
+    const float zeta0 = depth_frac * lz;
+    const float zeta  = z - (lz - zeta0);
+    if (zeta <= 0.0f)
+        return 0.0f;
+    const float sn = sinf(0.5f * 3.14159265359f * fminf(zeta / zeta0, 1.0f));
+    return sn * sn / (20.0f * dt);
+}
+
+// Adds -beta(z) (u_i - U_i) to the force on one staggered axis, with U = (U(z), 0, 0).
+__global__ void SpongeVelocityKernel(float* f_axis, int3 axis_tile_dim, int component, const float* u_axis,
+                                     float3 origin, float dx, float lz, selfcheck::PlumeSpec spec, float dt)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(axis_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        const float pz       = origin.z + (ijk.z + (component == 2 ? 0.0f : 0.5f)) * dx;
+        const float beta     = SpongeBeta(pz, lz, spec.sponge_depth, dt);
+        if (beta <= 0.0f)
+            continue;
+        const float target = component == 0 ? PlumeInletU(pz, spec.u0, spec.z0) : 0.0f;
+        f_axis[idx] -= beta * (u_axis[idx] - target);
+    }
+}
+
+__global__ void SpongeThetaKernel(float* theta, int3 tile_dim, float3 origin, float dx, float lz,
+                                  selfcheck::PlumeSpec spec, float dt)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        const float pz       = origin.z + (ijk.z + 0.5f) * dx;
+        const float beta     = SpongeBeta(pz, lz, spec.sponge_depth, dt);
+        if (beta > 0.0f)
+            theta[idx] *= (1.0f - beta * dt);
+    }
+}
+
+__global__ void AmbientInflowThetaKernel(float* theta, int3 tile_dim, const float* u_x, const float* u_y,
+                                         int outflow, float dt_over_dx)
+{
+    const int tile_idx    = blockIdx.x;
+    const int3 tile_ijk   = TileIdxToIjk(tile_dim, tile_idx);
+    const int t_id        = threadIdx.x;
+    const int3 cell_dim   = { tile_dim.x * 8, tile_dim.y * 8, tile_dim.z * 8 };
+    const int3 x_tile_dim = { tile_dim.x + 1, tile_dim.y, tile_dim.z };
+    const int3 y_tile_dim = { tile_dim.x, tile_dim.y + 1, tile_dim.z };
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        float inflow         = 0.0f; // inward normal speed summed over the cell's open faces
+        const bool open_x    = outflow >= 1;
+        const bool open_y    = outflow == 2 || outflow == 4;
+        if (open_x && ijk.x == cell_dim.x - 1)
+            inflow += fmaxf(0.0f, -u_x[IjkToIdx(x_tile_dim, { ijk.x + 1, ijk.y, ijk.z })]);
+        if (open_y && ijk.y == 0)
+            inflow += fmaxf(0.0f, u_y[IjkToIdx(y_tile_dim, ijk)]);
+        if (open_y && ijk.y == cell_dim.y - 1)
+            inflow += fmaxf(0.0f, -u_y[IjkToIdx(y_tile_dim, { ijk.x, ijk.y + 1, ijk.z })]);
+        if (inflow <= 0.0f)
+            continue;
+        const float frac = fminf(1.0f, inflow * dt_over_dx);
+        theta[idx] *= (1.0f - frac);
+    }
+}
+
+// Seven-point Laplacian of a cell-centred field with the neighbours beyond the
+// domain faces clamped onto the centre, i.e. zero-gradient there.
+__global__ void DiffuseCentredKernel(float* dst, int3 tile_dim, const float* src, float coef)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    const int3 cell_dim = { tile_dim.x * 8, tile_dim.y * 8, tile_dim.z * 8 };
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        const float c        = src[idx];
+        float lap            = 0.0f;
+        const int3 offs[6]   = { { -1, 0, 0 }, { 1, 0, 0 }, { 0, -1, 0 }, { 0, 1, 0 }, { 0, 0, -1 }, { 0, 0, 1 } };
+        for (int n = 0; n < 6; n++) {
+            const int3 nb = { ijk.x + offs[n].x, ijk.y + offs[n].y, ijk.z + offs[n].z };
+            const bool inside = nb.x >= 0 && nb.x < cell_dim.x && nb.y >= 0 && nb.y < cell_dim.y && nb.z >= 0 && nb.z < cell_dim.z;
+            lap += (inside ? src[IjkToIdx(tile_dim, nb)] : c) - c;
+        }
+        dst[idx] = c + coef * lap;
+    }
+}
+
 } // namespace
 
 void SetPlumeBcAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t stream)
@@ -1100,6 +1208,19 @@ void SetPlumeBcAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t strea
     SetPlumeInletXKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
         solver.is_bc_x_->dev_ptr_, solver.bc_val_x_->dev_ptr_, x_tile_dim,
         solver.grid_origin_, solver.dx_, spec);
+    // Open faces: clear the Dirichlet mark, which leaves the exterior pressure
+    // pinned at zero (ofm.h). The operator is then non-singular, so the pure
+    // Neumann recentering must be off.
+    if (spec.outflow == 1 || spec.outflow == 2)
+        ofm::SetDomainFaceAsync(*solver.is_bc_x_, *solver.bc_val_x_, td, 0, 1, false, 0.0f, stream);
+    if (spec.outflow == 2) {
+        ofm::SetDomainFaceAsync(*solver.is_bc_y_, *solver.bc_val_y_, td, 1, 0, false, 0.0f, stream);
+        ofm::SetDomainFaceAsync(*solver.is_bc_y_, *solver.bc_val_y_, td, 1, 1, false, 0.0f, stream);
+    }
+    solver.amgpcg_.pure_neumann_ = !(spec.outflow == 1 || spec.outflow == 2);
+    // Convective faces keep their marks; the projection refreshes their values.
+    solver.convective_face_[1] = (spec.outflow >= 3);
+    solver.convective_face_[2] = solver.convective_face_[3] = (spec.outflow == 4);
 
     ofm::SetCoefByIsBcAsync(*(solver.amgpcg_.poisson_vector_[0].is_dof_),
                             *(solver.amgpcg_.poisson_vector_[0].a_diag_),
@@ -1152,7 +1273,7 @@ PlumeVelocity PlumeVelocityAfter(ofm::OFM& solver)
 }
 
 void SetBuoyancyAndDragAsync(ofm::OFM& solver, const ofm::DHMemory<float>& theta,
-                             const PlumeSpec& spec, PlumeVelocity u, cudaStream_t stream)
+                             const PlumeSpec& spec, PlumeVelocity u, float dt, cudaStream_t stream)
 {
     const int3 td         = solver.tile_dim_;
     const int3 x_tile_dim = { td.x + 1, td.y, td.z };
@@ -1167,6 +1288,37 @@ void SetBuoyancyAndDragAsync(ofm::OFM& solver, const ofm::DHMemory<float>& theta
         solver.f_x_->dev_ptr_, x_tile_dim, 0, solver.u_->dev_ptr_, td, u.x->dev_ptr_, spec.cd_a);
     CanopyDragKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
         solver.f_y_->dev_ptr_, y_tile_dim, 1, solver.u_->dev_ptr_, td, u.y->dev_ptr_, spec.cd_a);
+
+    if (spec.sponge) {
+        const float lz = td.z * 8 * solver.dx_;
+        SpongeVelocityKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+            solver.f_x_->dev_ptr_, x_tile_dim, 0, u.x->dev_ptr_, solver.grid_origin_, solver.dx_, lz, spec, dt);
+        SpongeVelocityKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
+            solver.f_y_->dev_ptr_, y_tile_dim, 1, u.y->dev_ptr_, solver.grid_origin_, solver.dx_, lz, spec, dt);
+        SpongeVelocityKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(
+            solver.f_z_->dev_ptr_, z_tile_dim, 2, u.z->dev_ptr_, solver.grid_origin_, solver.dx_, lz, spec, dt);
+    }
+}
+
+void DiffuseThetaAsync(ofm::DHMemory<float>& dst, const ofm::DHMemory<float>& src, int3 tile_dim,
+                       float kappa, float dx, float dt, cudaStream_t stream)
+{
+    DiffuseCentredKernel<<<Prod(tile_dim), 128, 0, stream>>>(dst.dev_ptr_, tile_dim, src.dev_ptr_, kappa * dt / (dx * dx));
+}
+
+void AmbientInflowThetaAsync(ofm::DHMemory<float>& theta, int3 tile_dim, PlumeVelocity u, int outflow,
+                             float dx, float dt, cudaStream_t stream)
+{
+    if (outflow <= 0)
+        return;
+    AmbientInflowThetaKernel<<<Prod(tile_dim), 128, 0, stream>>>(theta.dev_ptr_, tile_dim, u.x->dev_ptr_, u.y->dev_ptr_, outflow, dt / dx);
+}
+
+void SpongeThetaAsync(ofm::DHMemory<float>& theta, int3 tile_dim, float3 grid_origin, float dx,
+                      const PlumeSpec& spec, float dt, cudaStream_t stream)
+{
+    const float lz = tile_dim.z * 8 * dx;
+    SpongeThetaKernel<<<Prod(tile_dim), 128, 0, stream>>>(theta.dev_ptr_, tile_dim, grid_origin, dx, lz, spec, dt);
 }
 
 namespace {
@@ -1485,6 +1637,250 @@ PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
         d.best_theta_split = bp.split;
         d.best_bifurcated  = bp.bifurcated;
     }
+    return d;
+}
+
+
+// ---------------------------------------------------------------------------
+// Outflow verification: the translating Gaussian vortex column.
+
+namespace {
+
+__host__ __device__ inline float2 GaussianVortexVelocity(float px, float py, float cx, float cy, float a, float gamma)
+{
+    const float rx = px - cx;
+    const float ry = py - cy;
+    const float r2 = rx * rx + ry * ry;
+    const float r  = sqrtf(r2);
+    if (r < 1e-6f)
+        return { 0.0f, 0.0f };
+    const float u_theta = gamma / (2.0f * 3.14159265359f * r) * (1.0f - expf(-r2 / (a * a)));
+    return { -u_theta * ry / r, u_theta * rx / r };
+}
+
+// Stream plus vortex on one staggered axis, everywhere.
+__global__ void SetTranslatingVortexKernel(float* u_axis, int3 axis_tile_dim, int component,
+                                           float3 origin, float dx, selfcheck::TranslatingVortexSpec spec, float t)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(axis_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    const float cx      = spec.x0 + spec.u_stream * t;
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (component == 2) {
+            u_axis[idx] = 0.0f;
+            continue;
+        }
+        const float px = origin.x + (ijk.x + (component == 0 ? 0.0f : 0.5f)) * dx;
+        const float py = origin.y + (ijk.y + (component == 1 ? 0.0f : 0.5f)) * dx;
+        const float2 v = GaussianVortexVelocity(px, py, cx, spec.y0, spec.core, spec.circulation);
+        u_axis[idx]    = component == 0 ? spec.u_stream + v.x : v.y;
+    }
+}
+
+// The exact normal velocity on the Dirichlet domain faces of one axis at time t.
+// x-: stream plus vortex. x+: with outflow off, the stream alone -- the mean
+// profile, which is what the plume's closed box prescribes -- and otherwise
+// untouched, since the face is open. y-, y+: the vortex alone.
+__global__ void SetTranslatingVortexFaceKernel(uint8_t* is_bc_axis, float* bc_val_axis, int3 axis_tile_dim, int component,
+                                               float3 origin, float dx, selfcheck::TranslatingVortexSpec spec, float t)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(axis_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    const float cx      = spec.x0 + spec.u_stream * t;
+    int3 grid_dim       = { axis_tile_dim.x * 8, axis_tile_dim.y * 8, axis_tile_dim.z * 8 };
+    if (component == 0)
+        grid_dim.x -= 8;
+    else if (component == 1)
+        grid_dim.y -= 8;
+    else
+        grid_dim.z -= 8;
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (component == 0) {
+            if (ijk.x == 0) {
+                const float py = origin.y + (ijk.y + 0.5f) * dx;
+                const float2 v = GaussianVortexVelocity(origin.x, py, cx, spec.y0, spec.core, spec.circulation);
+                is_bc_axis[idx]  = 1;
+                bc_val_axis[idx] = spec.u_stream + v.x;
+            } else if (ijk.x == grid_dim.x) {
+                if (spec.outflow == 0) {
+                    is_bc_axis[idx]  = 1;
+                    bc_val_axis[idx] = spec.u_stream;
+                } else if (spec.outflow == 1)
+                    is_bc_axis[idx] = 0;
+                else
+                    is_bc_axis[idx] = 1; // convective: the projection writes the value
+            }
+        } else if (component == 1) {
+            if (ijk.y == 0 || ijk.y == grid_dim.y) {
+                const float px = origin.x + (ijk.x + 0.5f) * dx;
+                const float py = origin.y + ijk.y * dx;
+                const float2 v = GaussianVortexVelocity(px, py, cx, spec.y0, spec.core, spec.circulation);
+                is_bc_axis[idx]  = 1;
+                bc_val_axis[idx] = v.y;
+            }
+        }
+        // z faces stay the free-slip walls SetWallBcAsync wrote.
+    }
+}
+
+} // namespace
+
+void SetTranslatingVortexAsync(ofm::OFM& solver, const TranslatingVortexSpec& spec, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const int3 y_tile_dim = { td.x, td.y + 1, td.z };
+    const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
+    SetTranslatingVortexKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+        solver.init_u_x_->dev_ptr_, x_tile_dim, 0, solver.grid_origin_, solver.dx_, spec, 0.0f);
+    SetTranslatingVortexKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
+        solver.init_u_y_->dev_ptr_, y_tile_dim, 1, solver.grid_origin_, solver.dx_, spec, 0.0f);
+    SetTranslatingVortexKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(
+        solver.init_u_z_->dev_ptr_, z_tile_dim, 2, solver.grid_origin_, solver.dx_, spec, 0.0f);
+}
+
+void SetTranslatingVortexBcAsync(ofm::OFM& solver, const TranslatingVortexSpec& spec, float t, bool build, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const int3 y_tile_dim = { td.x, td.y + 1, td.z };
+    if (build) {
+        const float3 zero = { 0.0f, 0.0f, 0.0f };
+        ofm::SetWallBcAsync(*solver.is_bc_x_, *solver.is_bc_y_, *solver.is_bc_z_,
+                            *solver.bc_val_x_, *solver.bc_val_y_, *solver.bc_val_z_, td, zero, zero, stream);
+        solver.use_uniform_inlet_ = false;
+    }
+    SetTranslatingVortexFaceKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+        solver.is_bc_x_->dev_ptr_, solver.bc_val_x_->dev_ptr_, x_tile_dim, 0, solver.grid_origin_, solver.dx_, spec, t);
+    SetTranslatingVortexFaceKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(
+        solver.is_bc_y_->dev_ptr_, solver.bc_val_y_->dev_ptr_, y_tile_dim, 1, solver.grid_origin_, solver.dx_, spec, t);
+    if (build) {
+        solver.amgpcg_.pure_neumann_ = (spec.outflow != 1);
+        solver.convective_face_[1]   = (spec.outflow == 2);
+        ofm::SetCoefByIsBcAsync(*(solver.amgpcg_.poisson_vector_[0].is_dof_),
+                                *(solver.amgpcg_.poisson_vector_[0].a_diag_),
+                                *(solver.amgpcg_.poisson_vector_[0].a_x_),
+                                *(solver.amgpcg_.poisson_vector_[0].a_y_),
+                                *(solver.amgpcg_.poisson_vector_[0].a_z_),
+                                td, *solver.is_bc_x_, *solver.is_bc_y_, *solver.is_bc_z_, stream);
+        solver.amgpcg_.BuildAsync(6.0f, -1.0f, stream);
+    }
+}
+
+TranslatingVortexDiag MeasureTranslatingVortex(ofm::OFM& solver, const TranslatingVortexSpec& spec, float t,
+                                               float x_out, float interior_margin, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const int3 y_tile_dim = { td.x, td.y + 1, td.z };
+    const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
+    solver.init_u_x_->DevToHostAsync(stream);
+    solver.init_u_y_->DevToHostAsync(stream);
+    solver.init_u_z_->DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+    const float* ux = solver.init_u_x_->host_ptr_;
+    const float* uy = solver.init_u_y_->host_ptr_;
+    const float* uz = solver.init_u_z_->host_ptr_;
+
+    const int nx_box = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const double dx = solver.dx_;
+    const float3 org = solver.grid_origin_;
+    // Corners with x < x_out: i from 1 to nx - 1 where nx * dx = x_out.
+    const int nx     = std::min(nx_box, static_cast<int>(std::lround((x_out - org.x) / dx)));
+    const double lx = nx * dx, ly = ny * dx;
+    const double cx = spec.x0 + spec.u_stream * t;
+    const double cy = spec.y0;
+    const double a  = spec.core;
+    const double pi = 3.14159265358979323846;
+
+    TranslatingVortexDiag d;
+    d.valid            = true;
+    d.gamma_in         = 0.0;
+    d.gamma_core       = 0.0;
+    d.gamma_walls = d.gamma_inflow = d.gamma_elsewhere = 0.0;
+    d.min_omega        = 1.0e30;
+    d.peak_omega       = -1.0e30;
+    const double half  = 6.0 * a;
+    d.peak_x = d.peak_y = 0.0;
+    d.max_w            = 0.0;
+    double err_all = 0.0, err_int = 0.0;
+
+    for (int i = 1; i < nx; i++)
+        for (int j = 1; j < ny; j++) {
+            const double px = org.x + i * dx;
+            const double py = org.y + j * dx;
+            double w = 0.0;
+            for (int k = 0; k < nz; k++) {
+                const float vy_r = uy[IjkToIdx(y_tile_dim, { i, j, k })];
+                const float vy_l = uy[IjkToIdx(y_tile_dim, { i - 1, j, k })];
+                const float ux_u = ux[IjkToIdx(x_tile_dim, { i, j, k })];
+                const float ux_d = ux[IjkToIdx(x_tile_dim, { i, j - 1, k })];
+                w += ((vy_r - vy_l) - (ux_u - ux_d)) / dx;
+            }
+            w /= nz;
+            if (!std::isfinite(w)) {
+                d.valid = false;
+                return d;
+            }
+            const double rx = px - cx, ry = py - cy;
+            const double w_exact = spec.circulation / (pi * a * a) * std::exp(-(rx * rx + ry * ry) / (a * a));
+            d.gamma_in += w * dx * dx;
+            const bool in_core = std::fabs(rx) < half && std::fabs(ry) < half;
+            if (in_core)
+                d.gamma_core += w * dx * dx;
+            else if (j <= 2 || j >= ny - 2)
+                d.gamma_walls += w * dx * dx;
+            else if (i <= 2)
+                d.gamma_inflow += w * dx * dx;
+            else
+                d.gamma_elsewhere += w * dx * dx;
+            if (w < d.min_omega)
+                d.min_omega = w;
+            const double e2 = (w - w_exact) * (w - w_exact) * dx * dx;
+            err_all += e2;
+            if (px < lx - interior_margin)
+                err_int += e2;
+            if (w > d.peak_omega) {
+                d.peak_omega = w;
+                d.peak_x     = px;
+                d.peak_y     = py;
+            }
+        }
+    for (int k = 0; k <= nz; k++)
+        for (int i = 0; i < nx_box; i++)
+            for (int j = 0; j < ny; j++) {
+                const double w = std::fabs(uz[IjkToIdx(z_tile_dim, { i, j, k })]);
+                if (w > d.max_w)
+                    d.max_w = w;
+            }
+
+    // The Gaussian's integral over the corner rectangle [dx, L-dx] x [dx, Ly-dx].
+    const double ex = 0.5 * (std::erf((lx - dx - cx) / a) - std::erf((dx - cx) / a));
+    const double ey = 0.5 * (std::erf((ly - dx - cy) / a) - std::erf((dx - cy) / a));
+    d.gamma_in_exact   = spec.circulation * ex * ey;
+    {
+        // The core box, clipped to the corner rectangle.
+        const double bx0 = std::max(dx, cx - half), bx1 = std::min(lx - dx, cx + half);
+        const double by0 = std::max(dx, cy - half), by1 = std::min(ly - dx, cy + half);
+        const double cex = bx1 > bx0 ? 0.5 * (std::erf((bx1 - cx) / a) - std::erf((bx0 - cx) / a)) : 0.0;
+        const double cey = by1 > by0 ? 0.5 * (std::erf((by1 - cy) / a) - std::erf((by0 - cy) / a)) : 0.0;
+        d.gamma_core_exact = spec.circulation * cex * cey;
+    }
+    d.peak_omega_exact = spec.circulation / (pi * a * a);
+    // ||omega_exact||_2 over the plane: Gamma / (a sqrt(2 pi)).
+    const double norm0 = spec.circulation / (a * std::sqrt(2.0 * pi));
+    d.l2_all      = std::sqrt(err_all) / norm0;
+    d.l2_interior = std::sqrt(err_int) / norm0;
     return d;
 }
 

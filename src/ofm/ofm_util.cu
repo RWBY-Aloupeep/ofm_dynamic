@@ -1,5 +1,6 @@
 #include "ofm_util.h"
 #include "util.h"
+#include <cub/cub.cuh>
 #include <iostream>
 
 namespace ofm {
@@ -1755,5 +1756,151 @@ void SetInletAsync(DHMemory<float>& _bc_val_x, DHMemory<float>& _bc_val_y, int3 
     float inlet_y      = _inlet_norm * sin(radian_angle);
     SetInletXKernel<<<_tile_dim.y * _tile_dim.z, 64, 0, _stream>>>(bc_val_x, _tile_dim, inlet_x);
     SetInletYKernel<<<_tile_dim.x * _tile_dim.z, 64, 0, _stream>>>(bc_val_y, _tile_dim, inlet_y);
+}
+
+__global__ void SetDomainFaceKernel(uint8_t* _is_bc_axis, float* _bc_val_axis, int3 _axis_tile_dim, int _axis, int _face_coord, uint8_t _is_bc, float _bc_val)
+{
+    int tile_idx  = blockIdx.x;
+    int3 tile_ijk = TileIdxToIjk(_axis_tile_dim, tile_idx);
+    int t_id      = threadIdx.x;
+    for (int i = 0; i < 4; i++) {
+        int voxel_idx  = t_id + i * 128;
+        int idx        = tile_idx * 512 + voxel_idx;
+        int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        int coord      = _axis == 0 ? ijk.x : (_axis == 1 ? ijk.y : ijk.z);
+        if (coord != _face_coord)
+            continue;
+        _is_bc_axis[idx] = _is_bc;
+        if (_is_bc)
+            _bc_val_axis[idx] = _bc_val;
+    }
+}
+
+void SetDomainFaceAsync(DHMemory<uint8_t>& _is_bc_axis, DHMemory<float>& _bc_val_axis, int3 _tile_dim, int _axis, int _side, bool _is_bc, float _bc_val, cudaStream_t _stream)
+{
+    int3 axis_tile_dim = _tile_dim;
+    int grid_extent    = 0;
+    if (_axis == 0) {
+        axis_tile_dim.x++;
+        grid_extent = _tile_dim.x * 8;
+    } else if (_axis == 1) {
+        axis_tile_dim.y++;
+        grid_extent = _tile_dim.y * 8;
+    } else {
+        axis_tile_dim.z++;
+        grid_extent = _tile_dim.z * 8;
+    }
+    // Staggered faces run from 0 to grid_extent inclusive; the far face is the
+    // one at grid_extent.
+    int face_coord = _side == 0 ? 0 : grid_extent;
+    SetDomainFaceKernel<<<Prod(axis_tile_dim), 128, 0, _stream>>>(_is_bc_axis.dev_ptr_, _bc_val_axis.dev_ptr_, axis_tile_dim, _axis, face_coord, _is_bc ? 1 : 0, _bc_val);
+}
+
+namespace {
+__device__ __forceinline__ int FaceCoord(int3 _ijk, int _axis) { return _axis == 0 ? _ijk.x : (_axis == 1 ? _ijk.y : _ijk.z); }
+__host__ __device__ __forceinline__ int3 AxisTileDim(int3 _tile_dim, int _axis)
+{
+    int3 d = _tile_dim;
+    if (_axis == 0) d.x++; else if (_axis == 1) d.y++; else d.z++;
+    return d;
+}
+__host__ __device__ __forceinline__ int FaceExtent(int3 _tile_dim, int _axis) { return (_axis == 0 ? _tile_dim.x : (_axis == 1 ? _tile_dim.y : _tile_dim.z)) * 8; }
+}
+
+__global__ void ConvectiveFaceUpdateKernel(float* _bc_val_axis, const float* _u_axis, int3 _axis_tile_dim, int _axis, int _face_coord)
+{
+    int tile_idx  = blockIdx.x;
+    int3 tile_ijk = TileIdxToIjk(_axis_tile_dim, tile_idx);
+    int t_id      = threadIdx.x;
+    for (int i = 0; i < 4; i++) {
+        int voxel_idx  = t_id + i * 128;
+        int idx        = tile_idx * 512 + voxel_idx;
+        int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (FaceCoord(ijk, _axis) == _face_coord)
+            _bc_val_axis[idx] = _u_axis[idx];
+    }
+}
+
+void ConvectiveFaceUpdateAsync(DHMemory<float>& _bc_val_axis, const DHMemory<float>& _u_axis, int3 _tile_dim, int _axis, int _side, cudaStream_t _stream)
+{
+    int3 axis_tile_dim = AxisTileDim(_tile_dim, _axis);
+    int face_coord     = _side == 0 ? 0 : FaceExtent(_tile_dim, _axis);
+    ConvectiveFaceUpdateKernel<<<Prod(axis_tile_dim), 128, 0, _stream>>>(_bc_val_axis.dev_ptr_, _u_axis.dev_ptr_, axis_tile_dim, _axis, face_coord);
+}
+
+// One launch per axis: every staggered face on the two domain faces of that
+// axis adds its outward flux. Block-reduced before the atomics.
+__global__ void DomainFluxKernel(double* _sum, int3 _axis_tile_dim, int _axis, int _extent, const uint8_t* _is_bc_axis, const float* _bc_val_axis, const float* _u_axis,
+                                 bool _conv_neg, bool _conv_pos)
+{
+    int tile_idx  = blockIdx.x;
+    int3 tile_ijk = TileIdxToIjk(_axis_tile_dim, tile_idx);
+    int t_id      = threadIdx.x;
+    double flux   = 0.0;
+    double count  = 0.0;
+    for (int i = 0; i < 4; i++) {
+        int voxel_idx  = t_id + i * 128;
+        int idx        = tile_idx * 512 + voxel_idx;
+        int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        int c          = FaceCoord(ijk, _axis);
+        if (c != 0 && c != _extent)
+            continue;
+        float v        = _is_bc_axis[idx] ? _bc_val_axis[idx] : _u_axis[idx];
+        flux += (c == 0) ? -double(v) : double(v);
+        if ((c == 0 && _conv_neg) || (c == _extent && _conv_pos))
+            count += 1.0;
+    }
+    using BlockReduce = cub::BlockReduce<double, 128>;
+    __shared__ typename BlockReduce::TempStorage temp_flux;
+    __shared__ typename BlockReduce::TempStorage temp_count;
+    double block_flux  = BlockReduce(temp_flux).Sum(flux);
+    double block_count = BlockReduce(temp_count).Sum(count);
+    if (t_id == 0) {
+        if (block_flux != 0.0)
+            atomicAdd(_sum, block_flux);
+        if (block_count != 0.0)
+            atomicAdd(_sum + 1, block_count);
+    }
+}
+
+void DomainFluxAsync(double* _sum, int3 _tile_dim, const DHMemory<uint8_t>& _is_bc_x, const DHMemory<uint8_t>& _is_bc_y, const DHMemory<uint8_t>& _is_bc_z,
+                     const DHMemory<float>& _bc_val_x, const DHMemory<float>& _bc_val_y, const DHMemory<float>& _bc_val_z,
+                     const DHMemory<float>& _u_x, const DHMemory<float>& _u_y, const DHMemory<float>& _u_z, const bool _convective[6], cudaStream_t _stream)
+{
+    const DHMemory<uint8_t>* is_bc[3]  = { &_is_bc_x, &_is_bc_y, &_is_bc_z };
+    const DHMemory<float>* bc_val[3]   = { &_bc_val_x, &_bc_val_y, &_bc_val_z };
+    const DHMemory<float>* u[3]        = { &_u_x, &_u_y, &_u_z };
+    for (int axis = 0; axis < 3; axis++) {
+        int3 axis_tile_dim = AxisTileDim(_tile_dim, axis);
+        DomainFluxKernel<<<Prod(axis_tile_dim), 128, 0, _stream>>>(_sum, axis_tile_dim, axis, FaceExtent(_tile_dim, axis),
+                                                                    is_bc[axis]->dev_ptr_, bc_val[axis]->dev_ptr_, u[axis]->dev_ptr_,
+                                                                    _convective[2 * axis], _convective[2 * axis + 1]);
+    }
+}
+
+__global__ void ConvectiveFaceCorrectKernel(float* _bc_val_axis, int3 _axis_tile_dim, int _axis, int _face_coord, float _outward_sign, const double* _sum)
+{
+    int tile_idx  = blockIdx.x;
+    int3 tile_ijk = TileIdxToIjk(_axis_tile_dim, tile_idx);
+    int t_id      = threadIdx.x;
+    float shift   = _sum[1] > 0.0 ? float(_sum[0] / _sum[1]) : 0.0f;
+    for (int i = 0; i < 4; i++) {
+        int voxel_idx  = t_id + i * 128;
+        int idx        = tile_idx * 512 + voxel_idx;
+        int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (FaceCoord(ijk, _axis) == _face_coord)
+            _bc_val_axis[idx] -= _outward_sign * shift;
+    }
+}
+
+void ConvectiveFaceCorrectAsync(DHMemory<float>& _bc_val_axis, int3 _tile_dim, int _axis, int _side, const double* _sum, cudaStream_t _stream)
+{
+    int3 axis_tile_dim = AxisTileDim(_tile_dim, _axis);
+    int face_coord     = _side == 0 ? 0 : FaceExtent(_tile_dim, _axis);
+    ConvectiveFaceCorrectKernel<<<Prod(axis_tile_dim), 128, 0, _stream>>>(_bc_val_axis.dev_ptr_, axis_tile_dim, _axis, face_coord, _side == 0 ? -1.0f : 1.0f, _sum);
 }
 }

@@ -38,6 +38,25 @@ resolve the GUI packages. Compute nodes on klone have no outbound network, so an
 package that is not already cached will fail there; configure on the login node if
 xmake ever needs to download something.
 
+## Cases
+
+`--test` selects one; `--help` lists the flags. The Stage 0 diagnostics are
+`burgers` (D1), `attribution` and `tilting` (D2), `coreradii` (D3) and
+`damkohler` (D4); `leapfrog3d` is the relative regression on the LFM ring pair.
+`plume` is the Stage A case after Cunningham et al. 2005, whose boundaries are
+chosen with `--outflow closed|x|xy` (the first cut's closed box, the downstream
+face open, or the downstream and both lateral faces open), whose `theta` diffuses
+at `kappa = mu/(rho Pr)` with `--pr` (0.7 by default, 0 for none), and which takes
+a Rayleigh damping layer under the lid with `--sponge`. `outflow` is the
+verification of the open face on a translating Gaussian vortex column, in an
+`--outflow open` box, an `--outflow closed` control, and a `--long` box the vortex
+never leaves; `analyse_outflow.py` reads the three together. What each case
+measured, and against what, is in `RESULTS.md`.
+
+The `*.sbatch` and `*.sh` files are the sweeps that produced the recorded
+numbers; submit the `.sbatch` ones from this directory, since they build here on
+the compute node before running.
+
 ## How it links against the solver
 
 Only the numerical stack is compiled: `src/ofm/ofm.cu`, `src/ofm/ofm_util.cu`, and

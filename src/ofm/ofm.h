@@ -33,6 +33,12 @@ public:
     // Order of the flow-map marching scheme: 2, 4, or anything else for TVD-RK3
     // (the order OFM shipped with, kept as the default).
     int rk_order_ = 3;
+    // Cap on the number of multigrid levels; 0 keeps Alloc's own choice,
+    // log2(min tile count) + 1. Some non-cubic tile counts give a coarsest
+    // level the AMGPCG solver returns non-finite values from (23 x 16 x 19
+    // tiles, five levels, coarsest 2 x 1 x 2; see proj/selfcheck/RESULTS.md),
+    // and one level fewer is the remedy until the submodule is fixed.
+    int max_level_num_ = 0;
 
     // boundary
     float inlet_norm_;
@@ -42,6 +48,33 @@ public:
     // inflow. Set this false to keep whatever the caller wrote there instead --
     // a sheared profile, say. Default true, so existing cases are unchanged.
     bool use_uniform_inlet_ = true;
+    // A staggered face marked in is_bc_* has its normal velocity prescribed at
+    // bc_val_*, and the pressure sees a homogeneous Neumann condition across it.
+    // A face on the domain boundary that is NOT marked is an open boundary: the
+    // Poisson matvec and ApplyPressureAsync both treat the cell beyond it as
+    // holding p = 0, so the projection sets its normal velocity from the pressure
+    // gradient -- a zero-gauge pressure outlet, as in a FLUENT pressure-outlet or
+    // FDS's OPEN boundary with p_ext = 0. That property was always there; it is
+    // just hidden as long as SetWallBcAsync marks all six faces. When any domain
+    // face is open the Poisson operator is no longer singular, and
+    // amgpcg_.pure_neumann_ has to be false: its recentering subtracts the mean
+    // of the right-hand side, which is wrong once the pressure level is pinned.
+    // See SetDomainFaceAsync in ofm_util.h.
+    //
+    // A second kind of open face, for a flow that carries its own pressure
+    // field through the boundary (a buoyant plume leaving under a lid): the
+    // face stays marked in is_bc_*, but at every projection its bc_val_* is
+    // taken from the velocity the advection has just delivered to it -- the
+    // convective condition du/dt + u_n du/dn = 0 that the semi-Lagrangian step
+    // computes anyway -- and the set of such faces is then shifted by one
+    // constant so that the net flux through the domain boundary is zero. The
+    // pressure sees Neumann across them, nothing is pinned, and pure_neumann_
+    // stays true. Index order: x-, x+, y-, y+, z-, z+.
+    bool convective_face_[6] = { false, false, false, false, false, false };
+    // Scratch for the flux correction: [0] net outward flux, [1] convective face
+    // count. A raw device pointer because the submodule's DHMemory is only
+    // instantiated for the types it uses itself, and double is not one of them.
+    double* flux_sum_ = nullptr;
     std::shared_ptr<DHMemory<uint8_t>> is_bc_x_;
     std::shared_ptr<DHMemory<uint8_t>> is_bc_y_;
     std::shared_ptr<DHMemory<uint8_t>> is_bc_z_;

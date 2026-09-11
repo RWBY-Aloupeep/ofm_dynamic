@@ -23,6 +23,8 @@ struct SolverConfig {
     int reinit_every = 1;
     // Flow-map marching order: 2, 4, or anything else for TVD-RK3.
     int rk_order     = 3;
+    // Cap on the multigrid levels, 0 for the solver's own choice (see ofm.h).
+    int max_levels   = 0;
 };
 
 // A circular vortex filament with a regularized (Rosenhead-Moore) core.
@@ -285,14 +287,34 @@ struct PlumeSpec {
     float cp     = 1005.0f; // J/(kg K)
     float g      = 9.81f;   // m/s^2
     float cd_a   = 0.025f;  // Cd*a = 0.1 * 0.25 1/m, lowest cell level only
+    // Which faces are open, and how (see ofm.h): 0 keeps the first cut's closed
+    // box with U(z) prescribed on both x faces; 1 and 2 make the downstream face,
+    // or the downstream and both lateral faces, zero-gauge pressure outlets;
+    // 3 and 4 make the same faces convective. The three-face set is the one
+    // Cunningham put their outflow condition on.
+    int outflow  = 0;
+    // Thermal diffusion of theta at kappa = mu / (rho Pr). Cunningham's direct
+    // runs tie the conductivity to the viscosity through Pr = 0.7; 0 turns the
+    // term off, which is what the first two cuts ran.
+    float pr     = 0.7f;
+    // Rayleigh damping layer under the lid, in the form Wang et al. 2023 give
+    // (after Klemp & Lilly 1978): beta(zeta) = (20 dt)^-1 sin^2(pi/2 zeta/zeta0)
+    // over the top zeta0 = sponge_depth * Lz, relaxing u to U(z), v and w to 0
+    // and theta to 0. Cunningham report such a layer but not its form.
+    bool sponge  = false;
+    float sponge_depth = 0.1f;
 };
 
-// Inflow and outflow both carry U(z), so mass balances exactly; the lateral and
-// top faces are free-slip walls. This is NOT what Cunningham used -- they put a
-// non-reflecting Orlanski outflow on the lateral and downstream faces and a
-// damping layer under the lid. The solver has no outflow condition, so the
-// downstream face is a prescribed profile instead. Keep the measurement plane
-// well clear of it.
+// The inflow face carries U(z). With outflow = 0 the downstream face carries the
+// same profile, so mass balances exactly and the box is closed with free-slip
+// walls elsewhere -- the first cut's configuration, and NOT what Cunningham
+// used. With outflow = 1 or 2 the downstream, or downstream and lateral, faces
+// are left open: the pressure is pinned to zero beyond them and the projection
+// sets their normal velocity, so the plume leaves (or entrains) at whatever
+// rate the interior asks for. This is the pressure-outlet condition of Barata
+// et al. 2024/2025 and FDS's OPEN boundary, not Cunningham's Orlanski radiation
+// condition, and is verified on its own by the translating-vortex case below.
+// The top and bottom stay free-slip walls in every mode.
 void SetPlumeBcAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t stream);
 void SetPlumeInitialVelocityAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t stream);
 
@@ -322,7 +344,28 @@ PlumeVelocity PlumeVelocityBefore(ofm::OFM& solver);
 PlumeVelocity PlumeVelocityAfter(ofm::OFM& solver);
 
 void SetBuoyancyAndDragAsync(ofm::OFM& solver, const ofm::DHMemory<float>& theta,
-                             const PlumeSpec& spec, PlumeVelocity u, cudaStream_t stream);
+                             const PlumeSpec& spec, PlumeVelocity u, float dt, cudaStream_t stream);
+
+// Explicit thermal diffusion of the cell-centred theta over one step:
+// dst = src + (kappa dt / dx^2) * seven-point Laplacian, zero-gradient at the
+// domain faces. Stable for kappa dt / dx^2 < 1/6.
+void DiffuseThetaAsync(ofm::DHMemory<float>& dst, const ofm::DHMemory<float>& src, int3 tile_dim,
+                       float kappa, float dx, float dt, cudaStream_t stream);
+
+// Air entering through an open face is ambient air. The semi-Lagrangian step
+// cannot know that -- its backtrace is clamped to the domain, so a cell next to
+// an open face that the flow is entering through would keep its own theta and
+// re-import the plume's buoyancy from outside. This replaces the fraction of
+// such a cell swept in over the step, |u_n| dt / dx, with ambient theta = 0.
+// Applied after the advection, with the same velocity.
+void AmbientInflowThetaAsync(ofm::DHMemory<float>& theta, int3 tile_dim, PlumeVelocity u, int outflow,
+                             float dx, float dt, cudaStream_t stream);
+
+// The sponge's relaxation of theta towards the ambient over one step, applied in
+// place; the velocity part goes through the external force in
+// SetBuoyancyAndDragAsync.
+void SpongeThetaAsync(ofm::DHMemory<float>& theta, int3 tile_dim, float3 grid_origin, float dx,
+                      const PlumeSpec& spec, float dt, cudaStream_t stream);
 
 // Advect theta one step. theta is the field every one of the paper's criteria is
 // read from, and in the first cut it was the only field in the case carrying no
@@ -379,6 +422,68 @@ struct PlumeDiag {
 // Measured on the y-z plane nearest plane_x, at the height nearest cvp_z, from
 // the cell-centred velocity. Cunningham report positive vertical vorticity on
 // the right-hand side looking downstream and negative on the left.
+// ---------------------------------------------------------------------------
+// Verification of the open (pressure-outlet) boundary: a columnar vortex with
+// the Gaussian vorticity omega = Gamma/(pi a^2) exp(-r^2/a^2) -- the profile of
+// Tohidi et al. 2018 Eq. 7 that the D1 and D3 cases already use -- carried by a
+// uniform stream U along +x through the downstream face. In an unbounded inviscid
+// fluid it translates unchanged, so the solution is known at every time. The
+// inflow and lateral faces prescribe that solution's normal velocity, updated
+// every step, and the top and bottom are free-slip walls the z-uniform field
+// satisfies exactly; only the downstream face carries the condition under test.
+// A vortex core has a low pressure, and the outlet pins the pressure to zero, so
+// the condition is not exact as the core crosses the face: the case measures
+// how much that costs, and a run in a domain twice as long, where the vortex
+// never reaches the face, supplies the solver's own error for comparison.
+struct TranslatingVortexSpec {
+    float u_stream    = 1.0f;
+    float x0          = 0.75f; // centre at t = 0
+    float y0          = 0.5f;
+    float core        = 0.05f; // a, 6.4 cells at dx = 1/128
+    float circulation = 0.25f; // peak swirl about half the stream
+    int outflow       = 1;     // 1: pressure outlet; 2: convective; 0: prescribed at u_stream (control)
+};
+
+// Stream plus vortex, written into the solver's velocity state.
+void SetTranslatingVortexAsync(ofm::OFM& solver, const TranslatingVortexSpec& spec, cudaStream_t stream);
+
+// The exact normal velocity at time t on the Dirichlet faces. Call with build
+// true once, so the Poisson coefficients match the face marks.
+void SetTranslatingVortexBcAsync(ofm::OFM& solver, const TranslatingVortexSpec& spec, float t, bool build, cudaStream_t stream);
+
+// Vertical vorticity at the cell corners from the face velocities directly, so
+// the sum over the corner set is the exact discrete circulation around the
+// rectangle half a cell in from the domain edge, and the analytic value is the
+// Gaussian's integral over that same rectangle.
+struct TranslatingVortexDiag {
+    double gamma_in;         // circulation inside the rectangle
+    double gamma_in_exact;
+    // The same sum restricted to a box of half-width six core radii about the
+    // exact centre, clipped to the domain. Vorticity that appears along the
+    // lateral walls counts in gamma_in but not here, which is how the two
+    // are told apart.
+    double gamma_core;
+    double gamma_core_exact;
+    double min_omega;        // most negative corner vorticity; the exact field has none
+    // Where the circulation outside the core box sits: the two corner rows
+    // next to each lateral wall, the two columns next to the inflow face, and
+    // everything else. Exact values are all zero to round-off once the core
+    // box holds the vortex.
+    double gamma_walls, gamma_inflow, gamma_elsewhere;
+    double peak_omega;       // largest corner vorticity
+    double peak_omega_exact; // Gamma / (pi a^2)
+    double peak_x, peak_y;   // where the peak sits; the exact centre is (x0 + U t, y0)
+    double l2_all;           // ||omega - omega_exact|| / ||omega_exact(t = 0)||, whole rectangle
+    double l2_interior;      // the same restricted to x < x_out - margin
+    double max_w;            // largest |w|, which the exact solution has at zero
+    bool valid;
+};
+// x_out is the face under test: the sums run over the corners with x < x_out,
+// so a longer box is measured on exactly the nodes of the short one and the
+// difference between the two is the boundary's doing alone.
+TranslatingVortexDiag MeasureTranslatingVortex(ofm::OFM& solver, const TranslatingVortexSpec& spec, float t,
+                                               float x_out, float interior_margin, cudaStream_t stream);
+
 PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
                        float plane_x, float cvp_z, cudaStream_t stream);
 

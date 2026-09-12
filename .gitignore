@@ -101,3 +101,4 @@ core.*
 # --- Claude Code local state (settings, scratch, and git worktrees) ---
 # Holds live worktrees; never let `git clean -fd` reach it.
 .claude/
+build-*/

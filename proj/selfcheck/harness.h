@@ -5,6 +5,7 @@
 #include "ofm.h"
 #include "timer.h"
 
+#include <cstdio>
 #include <vector>
 
 namespace selfcheck {
@@ -486,5 +487,14 @@ TranslatingVortexDiag MeasureTranslatingVortex(ofm::OFM& solver, const Translati
 
 PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
                        float plane_x, float cvp_z, cudaStream_t stream);
+
+// Append the theta anomaly on the y-z plane nearest plane_x to a raw binary
+// stream, so the paper's Fig. 6 can be drawn from the run and compared
+// panel for panel. Layout: once, the header "OFMSLICE", int32 ny, int32 nz,
+// float dx, float y0, float z0 (cell-centre origin), float plane_x actually
+// used; then per call float time followed by ny*nz floats, j outer, k inner.
+// Call after MeasurePlume, which leaves the host copy of theta current.
+void WritePlumeSlice(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
+                     float plane_x, float time, bool header, cudaStream_t stream);
 
 } // namespace selfcheck

@@ -971,6 +971,8 @@ struct PlumeRun {
     bool sponge      = false; // Rayleigh damping layer under the lid
     float src_y      = 600.0f; // m, heat-source centre; move it with the domain when widening
     int max_levels   = 0;      // multigrid level cap, 0 = automatic
+    std::string slice;         // if set, append the plane_x theta section here at every diagnostic
+    float cd_a       = 0.025f; // canopy drag Cd*a in the lowest cell level; 0 turns the drag off
 };
 
 // Verification of the open boundary on the translating Gaussian vortex column.
@@ -1009,6 +1011,7 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     spec.pr      = run.pr;
     spec.sponge  = run.sponge;
     spec.src_y   = run.src_y;
+    spec.cd_a    = run.cd_a;
     // Cunningham's direct runs: conductivity from the viscosity through Pr.
     const float kappa = run.pr > 0.0f ? run.mu / (spec.rho * run.pr) : 0.0f;
 
@@ -1101,6 +1104,16 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     printf("\n%6s %8s %10s %10s %8s %8s %10s %10s %12s\n",
            "step", "t", "max_dT", "top", "w_max", "u_max", "w_z(+)", "w_z(-)", "split");
 
+    FILE* slice = nullptr;
+    if (!run.slice.empty()) {
+        slice = fopen(run.slice.c_str(), "wb");
+        if (!slice) {
+            printf("cannot open %s\n", run.slice.c_str());
+            fclose(csv);
+            return 1;
+        }
+    }
+    bool slice_header = true;
     selfcheck::PlumeDiag last;
     last.valid = false;
     for (int step = 0; step < run.steps; step++) {
@@ -1141,6 +1154,10 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
                 return 1;
             }
             const selfcheck::PlumeDiag d = selfcheck::MeasurePlume(solver, *theta, run.plane_x, run.cvp_z, stream);
+            if (slice) {
+                selfcheck::WritePlumeSlice(slice, solver, *theta, run.plane_x, (step + 1) * run.dt, slice_header, stream);
+                slice_header = false;
+            }
             if (!std::isfinite(d.max_theta) || !std::isfinite(d.u_max) || d.u_max > 100.0f) {
                 printf("FAIL: the field is no longer finite (or u_max = %.1f m/s) at t = %.1f s\n", d.u_max, (step + 1) * run.dt);
                 fclose(csv);
@@ -1400,6 +1417,10 @@ int main(int argc, char** argv)
             plume.len_y = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--src-y" && i + 1 < argc)
             plume.src_y = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--slice" && i + 1 < argc)
+            plume.slice = argv[++i];
+        else if (arg == "--cd-a" && i + 1 < argc)
+            plume.cd_a = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--max-levels" && i + 1 < argc)
             plume.max_levels = std::atoi(argv[++i]);
         else if (arg == "--sponge")

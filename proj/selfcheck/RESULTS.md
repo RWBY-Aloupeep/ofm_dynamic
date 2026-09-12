@@ -1615,3 +1615,254 @@ the Boussinesq reduction, and the low-Mach question the plan lists first
 under Sec. 7 is where that goes; the lateral-face flux correction above;
 then the CVP attribution and the horseshoe vortex, unchanged from the second
 cut's list.
+
+## Stage A, fourth cut: the paper's figure read by pixel, `n` = 5 tried as the default, and the floor pinned with a `mu` = 0 control
+
+Four things were on the list after the third cut, none of them a new
+boundary condition: the `Q0` criterion was being compared against a sentence
+of the paper rather than against its figure; `n` = 5 was argued for as the
+default on dissipation grounds and had never been run past 600 s; the
+numerical-dissipation floor at 10 m had been located by saturation between
+sweep points but never by the `nu` = 0 control D1 uses; and nothing had ever
+drawn the paper's Fig. 6 from a run. All six Fig. 6 cases and the viscosity
+ladder were rerun to 1600 s, sampled every 30 s and averaged over the last
+1000 s (`END=1600 WINDOW=1000 analyse_stage_a.py`), with the third cut's
+configuration otherwise: 10 m grid, downstream convective face, lateral
+free-slip walls, `Pr` = 0.7, `theta` BFECC + clamp. Runs live under
+`stage-a-4-*`; `stage_a_n5.sbatch` is the sweep.
+
+### What Fig. 6 actually shows, measured
+
+The paper's `Q0` statement is one sentence in Results: "for a given cross
+flow, bifurcation is wider for the weak heat source than the strong heat
+source (compare Fig. 6e with Fig. 6f)", followed by "based on this limited
+set of results we conjecture". It cites one pair of panels. `read_fig6.py`
+renders the scanned page and measures every panel: the extent of the first
+plotted contour along `y`, and the distance between the two lobes' deepest-
+nested closed contours, which is the figure's counterpart of `theta_split`.
+Scan and contour crowding put a few tens of metres on each number.
+
+| panel | `z0` | `Q0` | outer width | peak split |
+|---|---|---|---|---|
+| a | 50 | 1.0 | 625 | 448 |
+| b | 50 | 0.5 | 511 | 313 |
+| c | 100 | 1.0 | 748 | 431 |
+| d | 100 | 0.5 | 684 | 465 |
+| e | 150 | 1.0 | 753 | 439 |
+| f | 150 | 0.5 | 765 | 532 |
+
+The sentence holds for the pair the paper cites, (e) against (f): 532 against
+439 on the split, and the outer widths are equal. It does not hold at
+`z0` = 50 m, where the weak source is narrower on both measures (313 against
+448), and at `z0` = 100 m the split differs by 34 m with the outer width the
+other way. The paper's Fig. 6 supports "weaker is wider" at one shear depth
+of three. The visual impression that (f) is narrower than (e) is the lobes
+themselves: they are smaller (`z` extent 350-585 m against 469-816 m) and
+have five contours instead of eleven, while their centres sit further apart.
+
+### The orderings at 1600 s, `n` = 1
+
+`theta_split` in metres, mean over the last 1000 s of a 1600 s run,
++- the standard error of that mean:
+
+| `z0` | `Q0` = 1 kW/m^3 | `Q0` = 0.5 kW/m^3 |
+|---|---|---|
+| 50 m | 368.8 +- 0.4 | 295.3 +- 0.4 |
+| 100 m | 439.7 +- 1.1 | 314.5 +- 0.4 |
+| 150 m | 526.5 +- 3.7 | 348.5 +- 1.6 |
+
+The longer window brings the standard errors down to metres: the plume is
+steady to within a few metres over the last 1000 s at `n` = 1. Deeper shear
+layer -> wider: monotone in both columns, 42.7x the pooled standard error
+end to end in the strong column and 32.0x in the weak. Weaker source ->
+wider: opposite at every `z0`, by 73, 125 and 178 m, 44 to 127 standard
+errors. The `theta_width` column agrees on every row.
+
+Against the figure's own numbers the disagreement narrows to one place. At
+`z0` = 50 m the run gives 369 against 295 and the figure gives 448 against
+313: the same direction, the same 20-25% narrowing. At `z0` = 100 m the
+figure is flat and the run is not. At `z0` = 150 m the figure widens (439 ->
+532) and the run narrows (527 -> 349), and the row that moved is the strong
+source: 527 in the run against 439 in the figure, while the weak source's 349
+sits closer to the figure's 313-465 range than the strong one does. So what
+the Boussinesq candidate has to explain is a strong-source, deep-shear plume
+that bifurcates too widely, not a weak-source plume that bifurcates too
+narrowly. That is a narrower target than the third cut's "opposite at every
+`z0`".
+
+### The numerical floor at 10 m, with the `nu` = 0 control
+
+The third cut's four-point sweep (`mu` = 4, 1, 0.15, 0.0015) saturated
+between consecutive points, and the floor was read as "between 0.15 and 1".
+Refitting those four points showed the danger of four points: the increments
+were also consistent with a response linear in `mu` all the way down, which
+would have meant a floor above 4. The ladder was extended to `mu` = 40, 12
+and 0, run to 1600 s:
+
+| `mu` kg/(m s) | peak abs `omega_z` | `theta_width` | `theta_split` | peak dT | bifurcated |
+|---|---|---|---|---|---|
+| 40 | 0.0126 | 597 | -- | 13.0 | 0.00 |
+| 12 | 0.0573 | 639 | 400 | 20.1 | 1.00 |
+| 4 | 0.0947 | 676 | 440 | 24.6 | 1.00 |
+| 1 | 0.1195 | 700 | 520 | 27.1 | 1.00 |
+| 0.15 | 0.1280 | 730 | 442 | 27.8 | 0.94 |
+| 0.0015 | 0.1286 | 739 | 406 | 27.9 | 0.91 |
+| 0 | 0.1292 | 737 | 455 | 27.9 | 1.00 |
+
+Ratios of consecutive peak vorticities: 4.5, 1.65, 1.26, 1.071, 1.005,
+1.005. The response is large above 4, real between 4 and 1, marginal from 1
+to 0.15, and gone below 0.15: the three lowest rows agree to 0.5%, which is
+the sampling noise of a 1000 s mean. The `mu` = 0 control reproduces
+`mu` = 0.0015. **The floor at 10 m, `n` = 1, lies between 0.15 and 1
+kg/(m s)**, as the third cut read it; the linear alternative is excluded by
+the `mu` = 12 and 40 rows, which bend. `mu` = 40 is a different flow: the
+plume never bifurcates and its peak anomaly halves, so the top row is a
+regime boundary, not a point on the same curve.
+
+For scale, air is 1.8e-5 kg/(m s). The paper's smallest `mu`, 0.0015, is 80x
+that; the solver's floor at this grid is four orders above it. The paper's
+Fig. 6 cases at `mu` = 4 sit above the floor by a factor of 4-25, which is
+why they are reproducible here at all.
+
+### `n` = 5 collapses the weak-source plume, and is not the default
+
+The fourth cut ran every case at `n` = 5 as well, on the argument that it
+dissipates a third less vorticity (second cut) and costs less per unit of
+simulated time. Over 600 s it had looked fine. Over 1600 s it does not: the
+weak-source, deep-shear plume loses its buoyancy.
+
+| `z0` = 150 m, `Q0` = 0.5 kW/m^3 | t = 300 s | 600 | 900 | 1200 | 1500 |
+|---|---|---|---|---|---|
+| `n` = 1: plume top (m) / `w_max` (m/s) / peak dT (K) | 915 / 7.6 / 14.9 | 605 / 5.8 / 14.8 | 635 / 5.8 / 14.8 | 635 / 5.8 / 14.8 | 635 / 5.8 / 14.8 |
+| `n` = 5: same | 865 / 7.9 / 13.6 | 575 / 4.6 / 11.9 | 375 / 3.0 / 9.9 | 145 / 2.1 / 9.2 | 95 / 1.6 / 8.8 |
+
+A 9 K anomaly with a 1.6 m/s updraught and a top below 100 m is not a plume
+that has become steadier; it is a plume whose buoyancy is not reaching the
+velocity. The strong-source cases hold (peak dT 25 K, top 815 m at 1500 s)
+and the `z0` = 50 m weak case only drifts (top 775 -> 565 m), so the effect
+scales with how bent-over and how weakly forced the plume is. The viscosity
+ladder at `n` = 5 is worse: `mu` = 1 goes non-finite at 570 s (`u_max`
+419 m/s), `mu` = 0.0015 loses its pair, and the rest send the plume top to
+the lid. The second and third cuts' `n` = 5 runs stopped at 600 s, inside the
+window where the collapse is only beginning, which is why "z0 ordering
+reproduced at `n` = 5" could be written then.
+
+`stage_a_n5_locate.sbatch` runs the collapsing case with one thing changed
+at a time, to 1500 s:
+
+| variant | peak dT at 1500 s | plume top | `w_max` |
+|---|---|---|---|
+| `n` = 2 | 14.4 | 605 | 5.4 |
+| `n` = 3 | 12.0 | 445 | 4.1 |
+| `n` = 5, closed box | 9.0 | 95 | 1.9 |
+| `n` = 5, `mu` = 0 | 11.1 | 465 | 6.8 |
+| `n` = 5, drag off | 8.6 | 175 | 2.9 |
+| `n` = 5, drag off and `mu` = 0 | 10.1 | 435 | 5.6 |
+
+The collapse survives closing the box, removing the viscous source and
+removing the drag, so it is not the open face, the viscous term or the
+velocity-dependent force. It grows with the cycle length: `n` = 2 is as
+steady as `n` = 1, `n` = 3 decays, `n` = 5 collapses. What is left is the
+buoyancy itself, the one source that remains, and the way the cycle carries
+it. The (`n`, `dt`) sweep measured a per-sub-step source deficit of 0.22% on
+the Burgers vortex, where the source is smooth; that is 1.1% at `n` = 5 and
+cannot do this. The difference here is the source's shape: the heating decays
+as `exp(-z/h)` with `h` = 25 m, two and a half cells, so the buoyancy the
+path integral contracts along the forward map is a field that changes by a
+factor `e` across 2.5 cells, and its interpolation at the marched positions
+is a different problem from a smooth source. That is a hypothesis; the test
+is a D1-style case with a body force confined to a few cells, or the plume
+with `h` widened at `n` = 5. Until it is run, `n` = 1 is the configuration
+the criteria are read on, and `n` = 5 is not a default.
+
+What the `n` = 5 runs do still say is what the second cut said: the peak
+vorticity is 70% higher at `n` = 5 in the strong-source cases (0.165 against
+0.095 at `z0` = 100 m). The floor is real and it is large; the lever to lower
+it is not yet usable on this case.
+
+### Reproducing
+
+```
+sbatch --array=0-25 stage_a_n5.sbatch        # Fig. 6 six + viscosity seven, at n = 1 and n = 5
+sbatch --array=0-5  stage_a_n5_locate.sbatch # the collapsing case, one thing changed at a time
+END=1600 WINDOW=1000 python3 analyse_stage_a.py n1=stage-a-4-fig6-n1 n5=stage-a-4-fig6-n5
+python3 read_fig6.py cunningham2005.pdf      # the PDF from Zotero, not committed
+```
+
+### Fig. 6, drawn from the run
+
+`--slice PATH` writes the `x` = 1750 m theta section at every diagnostic, and
+`plot_fig6.py` contours the time-mean section every 0.25 K from 0.25 K on the
+paper's axes and panel order; with `--pdf` it sets each of the paper's
+scanned panels beside ours. The figures are filed with the runs
+(`stage-a-4-slices-n1/fig6_ours.png`, `fig6_ours_vs_paper.png`,
+`fig6_ours_t600.png`). What they show, panel by panel:
+
+- The morphology is the paper's: two lobes, each with a tail hooking up and
+  inward from its top, the hook on the same side in every panel; the lobes
+  sit at the same `y`; the strong-source lobes carry ten to twelve contours
+  and the weak-source lobes five to seven, as in the scan.
+- Ours are smoother. The paper's strong-source lobes are tightly wound
+  spirals, the trace of a rolled-up mixing interface; ours are nested ovals.
+  That is the 10 m grid's dissipation floor drawn as a picture.
+- The strong-source lobes sit about 100 m lower than the paper's (centres
+  near `z` = 450-500 m against 550-650 m); the weak-source lobes sit at the
+  paper's height or slightly above.
+- In (a), (b) and (d) our first contour arches over between the lobes, a
+  bridge the scan shows only in (b).
+- The 600 s snapshot is indistinguishable from the 600-1600 s mean at
+  `n` = 1: the flow is steady, and the third cut's 200 s window was not too
+  short for that reason but because the plume was still settling before
+  600 s (next paragraph).
+
+### The 600 s window was inside the transient
+
+The third cut read the orderings over 400-600 s. The fourth cut's
+600-1600 s means are lower on every row: 369 / 440 / 527 m for the strong
+column against 403.5 / 478.7 / 608.6, and 295 / 315 / 349 against 312.4 /
+356.6 / 380.8 for the weak. The plume is steady to a few metres after about
+700 s, so the third cut's numbers carried the tail of the settling. Both
+orderings, and the reference-box comparison that excluded the outflow, were
+read as differences between cases sampled over the same window, and none of
+them changes; the absolute splits do, by 15 to 80 m, and the 1600 s values
+are the ones to quote.
+
+### How far from a Gaussian
+
+The paper says the sections, even time-averaged, are not self-similar
+Gaussians, and gives no number. `analyse_slices.py` fits one 2-D Gaussian
+(amplitude, centre, two widths) to the 600-1600 s mean section and reports
+the residual RMS as a fraction of the peak; a sum of two Gaussians is
+fitted alongside.
+
+| case | peak K | 1 Gaussian | 2 Gaussians | ratio |
+|---|---|---|---|---|
+| `z0` 50, `Q0` 1 | 3.03 | 0.079 | 0.021 | 3.8 |
+| `z0` 50, `Q0` 0.5 | 1.71 | 0.076 | 0.024 | 3.2 |
+| `z0` 100, `Q0` 1 | 2.88 | 0.082 | 0.020 | 4.1 |
+| `z0` 100, `Q0` 0.5 | 1.74 | 0.079 | 0.021 | 3.8 |
+| `z0` 150, `Q0` 1 | 2.73 | 0.086 | 0.022 | 3.9 |
+| `z0` 150, `Q0` 0.5 | 1.70 | 0.083 | 0.021 | 3.9 |
+
+A single Gaussian misses by 8% of the peak on every case and a pair by 2%,
+so the section is a pair of lobes and not one bump, four times over. No
+pass threshold is applied: the paper supplies none, and setting one is the
+author's decision. The scorecard row becomes "quantified, criterion pending".
+
+### Where Stage A stands after the fourth cut
+
+| the paper's claim | status |
+|---|---|
+| counter-rotating pair, positive `omega_z` on the right looking downstream | reproduced (first cut) |
+| plume cross-section bifurcates | reproduced, with `theta` error-compensated; Fig. 6 redrawn from the run, same morphology including the hooked tails |
+| deeper shear layer -> wider bifurcation | **reproduced**: 42.7x sem at `Q0` = 1 kW/m^3 over the last 1000 s of 1600 s |
+| weaker source -> wider bifurcation | **the paper's figure supports it at `z0` = 150 m only**; our runs are opposite at every `z0` (44-127x sem), agree with the figure at `z0` = 50 m, and differ at `z0` = 150 m on the strong source (527 vs 439 m) |
+| laminar-to-turbulent progression over `mu` | not reachable at 10 m: floor between `mu` = 0.15 and 1, now with the `mu` = 0 control |
+| `St` ~ 0.25 shedding | not tested (needs a configuration that sheds) |
+| cross-section not Gaussian | quantified: single-Gaussian residual 8% of peak, pair 2%; threshold pending |
+
+`n` = 5 is not a default: it collapses the weak-source plume (above). What
+is next, in order: localise the `n` > 1 buoyancy deficit (a body force
+confined to a few cells, in a case with a known answer); the lateral-face
+flux correction; the Boussinesq question, now aimed at the strong-source,
+deep-shear case; then the CVP attribution and the horseshoe vortex.

@@ -1,4 +1,5 @@
 #include "harness.h"
+#include <cstdint>
 
 #include "ofm_util.h"
 #include "util.h"
@@ -1882,6 +1883,37 @@ TranslatingVortexDiag MeasureTranslatingVortex(ofm::OFM& solver, const Translati
     d.l2_all      = std::sqrt(err_all) / norm0;
     d.l2_interior = std::sqrt(err_int) / norm0;
     return d;
+}
+
+
+void WritePlumeSlice(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
+                     float plane_x, float time, bool header, cudaStream_t stream)
+{
+    theta.DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+    const int3 td    = solver.tile_dim_;
+    const float dx   = solver.dx_;
+    const float3 org = solver.grid_origin_;
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    int ip = static_cast<int>(std::lround((plane_x - org.x) / dx - 0.5f));
+    ip = std::max(0, std::min(nx - 1, ip));
+    if (header) {
+        const char magic[8] = { 'O', 'F', 'M', 'S', 'L', 'I', 'C', 'E' };
+        fwrite(magic, 1, 8, f);
+        const int32_t dims[2] = { ny, nz };
+        fwrite(dims, sizeof(int32_t), 2, f);
+        const float geo[4] = { dx, org.y + 0.5f * dx, org.z + 0.5f * dx, org.x + (ip + 0.5f) * dx };
+        fwrite(geo, sizeof(float), 4, f);
+    }
+    fwrite(&time, sizeof(float), 1, f);
+    std::vector<float> row(nz);
+    const float* th = theta.host_ptr_;
+    for (int j = 0; j < ny; j++) {
+        for (int k = 0; k < nz; k++)
+            row[k] = th[IjkToIdx(td, { ip, j, k })];
+        fwrite(row.data(), sizeof(float), nz, f);
+    }
+    fflush(f);
 }
 
 } // namespace selfcheck

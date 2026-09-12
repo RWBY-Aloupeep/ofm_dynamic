@@ -14,7 +14,9 @@ add_requires("cuda", { system = true })
 
 target("selfcheck")
     set_kind("binary")
-    set_targetdir("build")
+    -- SELFCHECK_TARGETDIR lets a rebuild land beside a binary that jobs are
+    -- still executing (writing over a running executable fails with ETXTBSY).
+    set_targetdir(os.getenv("SELFCHECK_TARGETDIR") or "build")
     set_languages("cxx17")
     set_policy("build.intermediate_directory", false)
 

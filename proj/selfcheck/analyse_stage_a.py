@@ -1,6 +1,11 @@
 import csv, os, math, statistics as st
 
-WINDOW = 400.0  # last 200 s of a 600 s run
+import os as _os
+# The run length and the averaging window, in seconds. Defaults are the second
+# and third cuts' 600 s runs averaged over their last 200 s; the fourth cut runs
+# to 1600 s and averages the last 1000 s: END=1600 WINDOW=1000 analyse_stage_a.py ...
+END = float(_os.environ.get('END', 600))
+WINDOW = END - float(_os.environ.get('WINDOW', 200))
 
 def stats(vals):
     if not vals:
@@ -16,7 +21,7 @@ def load(root):
             continue
         with open(os.path.join(root, name)) as f:
             rs = list(csv.DictReader(f))
-        if not rs or abs(float(rs[-1]['time']) - 600.0) > 1e-6:
+        if not rs or abs(float(rs[-1]['time']) - END) > 1e-6:
             continue
         late = [r for r in rs if float(r['time']) >= WINDOW]
         out[name[:-4]] = {
@@ -55,7 +60,7 @@ for label, root in sets:
         continue
     t = load(root)
     tabs[label] = t
-    print(f"\n===== theta advection: {label} · mean over last 200 s =====")
+    print(f"\n===== theta advection: {label} · mean over last {END-WINDOW:.0f} s =====")
     print(f"{'case':<20}{'width':>10}{'+-':>7}{'split':>10}{'+-':>7}"
           f"{'bif':>6}{'|om|':>9}{'maxdT':>8}")
     for k in sorted(t):

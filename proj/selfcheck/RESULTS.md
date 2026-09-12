@@ -2252,3 +2252,70 @@ the weak source 93 m wider there. Everything else about the two columns
 is the figure's own shape. This is the configuration the Stage A
 criteria are read on from here: the 1.25 s cycle, 120 iterations,
 residual 0.03 1/s, peak vorticity 1.8x the one-step scheme's.
+
+### The 2.5 s cycle is not usable for the strong source yet
+
+`stage_a_c25.sbatch` 0-5: the six cases at `n` = 10, `dt` = 0.25, 120
+iterations. Residual 0.05-0.06 1/s on every case, the same level as the
+weak case's calibration. But `z0` = 50 m, `Q0` = 1 kW/m^3 goes non-finite
+at 570 s (`u_max` 860 m/s), and the strong-source splits that survive are
+140-170 m narrower than at the 1.25 s cycle (254 and 244 m against 395
+and 412) with the peak anomaly unchanged (24.6 K) and the peak vorticity
+at 0.22-0.26 -- while the weak sources move by 9-54 m. With the strong
+column narrowed like that the weak source reads wider than the strong at
+`z0` = 100 and 150 m (+60 and +106 m), which is the paper's ordering, but
+a column that narrows by a third when the cycle doubles, in a set where
+one member blows up, is not a reading; whether the strong plume at 2.5 s
+is oscillating (Cunningham's 200 s period), has an unsteady pair the
+1000 s mean smears, or is at the edge of the map's stability is not
+settled here. The criterion configuration stays at the 1.25 s cycle. The
+2.5 s row is recorded as "holds for the weak source, not for the strong".
+
+### The lateral-face tail is not the flux correction
+
+`stage_a_lateral.sbatch`: six cases at the criterion configuration with
+the lateral faces convective, the correction shared over all three open
+faces (`cxy`) and the correction on the downstream face only (`cxy-d`,
+`OFM::flux_correct_face_`), against lateral walls (`cx`):
+
+| case | `cx` | `cxy` | `cxy-d` |
+|---|---|---|---|
+| `z0` 50, strong / weak | 385.9 / 276.3 | 385.7 / 275.5 | 380.4 / 274.8 |
+| `z0` 100, strong / weak | 395.3 / 339.7 | 374.3 / 336.8 | 375.7 / 336.3 |
+| `z0` 150, strong / weak | 411.9 / 403.4 | 407.8 / 394.0 | 407.2 / 395.2 |
+
+`cxy` and `cxy-d` agree to 6 m on every row: where the correction goes
+does not matter, and the third cut's suspect is cleared. Against the walls
+the lateral faces move five of six splits by 0-9 m and one, `z0` = 100 m
+strong, by 21 m (17 sem); at the unconverged one-step configuration the
+same comparison gave 10-25 m on every row. The lateral convective face is
+usable for Stage B with that 21 m on record.
+
+### The viscosity ladder at the criterion configuration reaches the paper's transition
+
+`stage_a_c25.sbatch` 6-12: the ladder at the 1.25 s cycle, 120 iterations
+(`z0` = 100 m, `Q0` = 1 kW/m^3), last 1000 s of 1600 s:
+
+| `mu` kg/(m s) | peak abs `omega_z` | ratio to next | `theta_width` | `theta_split` | bifurcated | plume top | `w_max` |
+|---|---|---|---|---|---|---|---|
+| 40 | 0.014 | | 581 | -- | 0.00 | 789 | 4.1 |
+| 12 | 0.085 | 5.9 | 591 | 348 | 1.00 | 834 | 7.4 |
+| 4 | 0.169 | 2.0 | 674 | 395 | 1.00 | 730 | 8.6 |
+| 1 | 0.239 | 1.42 | 534 | 152 | 0.77 | 1341 | 13.4 |
+| 0.15 | 0.274 | 1.14 | 742 | 122 | 0.51 | 1502 | 16.0 |
+| 0 | 0.275 | 1.006 | 656 | 114 | 0.54 | 1460 | 16.5 |
+
+(`mu` = 0.0015 is a failed run -- the pair left the plane and the driver
+stopped it; rerun.) Two things the one-step ladder could not show. The
+response to `mu` now reaches further down: 4 -> 1 is +42% (was +26%),
+1 -> 0.15 is +14% (was +7%), and only 0.15 -> 0 is flat, so the floor at
+this configuration sits between 0.15 and 1 as before but lower within
+that decade. And below `mu` = 4 the plume changes character: at `mu` = 1
+and 0.15 the plume top reaches the lid, `w_max` doubles, the bifurcation
+is present in only half the samples and the split narrows to 120-150 m --
+an unsteady, asymmetric plume. That is the transition Cunningham describe
+between their `mu` = 4 and `mu` = 1 direct runs (transverse vortices at
+the top of the laminar base, then an asymmetric wake); the one-step
+scheme never got there. Whether the unsteadiness is the paper's, with its
+200 s period, is what the shedding criterion (`St` ~ 0.25) now has a
+configuration to be measured on.

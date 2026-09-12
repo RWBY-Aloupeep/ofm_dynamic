@@ -2858,3 +2858,38 @@ already below it. The criterion configuration is not changed here --
 the reading to compare across cuts stays the standard 120 -- but the
 six cases must be re-read once the projection converges properly, and
 the numbers above are the size of the correction to expect.
+
+### The coarsest level's sweep count is not the bottleneck
+
+`stage_a_amgbottom.sbatch`: `--amg-bottom N` sets `AMGPCG::bottom_smoothing_`
+(the coarsest level, 3 x 2 x 3 tiles = 9216 cells on the plume grid, gets
+`N` Gauss-Seidel sweeps instead of 10). `--test amg-sym`, flexible CG, 120
+iterations:
+
+| coarsest sweeps | `M` asymmetry | random right-hand side, last / first | smooth right-hand side, last / first |
+|---|---|---|---|
+| 10 | 0.225 | 0.036 | 0.80 |
+| 100 | 0.199 | 0.038 | 0.79 |
+| 400 | 0.094 | 0.036 | 0.75 |
+
+Forty times more work on the coarsest level halves the preconditioner's
+asymmetry (the incomplete bottom solve was half of it; the rest is the
+smoother's colour order) and moves the smooth mode's reduction from 0.80
+to 0.75. The V-cycle's coarse correction does not act on the lowest
+modes of this pure-Neumann problem, whatever the bottom solve; the
+residual the plume runs leave (domain-wide, zero-mean, smooth) is what
+that looks like, and no count of fine-level iterations or coarse sweeps
+tried here reaches it. That is a property of the trimmed-multigrid cycle
+as shipped (the coarse operator or its transfer, not investigated here)
+and a solver-development item, not a Stage A one.
+
+On the plume the same: flexible 120 with 400 coarse sweeps against 10,
+weak case (reinitialization projection at step 40: last / first 0.99
+against 1.03, field l2 1.00 against 1.12; 600 s trend rms 1.7-2.8e-3,
+max 0.03-0.11, no better) and the criterion configuration (`theta_split`
+405.8 +- 1.3 against 408.8 +- 1.5, `theta_width` 683 against 686, peak
+`omega_z` 0.00532 against 0.00534, residual max 0.010, rms 3.8e-4). The
+two flexible readings agree with each other to within their standard
+errors and both sit 10-13 m above the standard 120's 395.4 m: the
+projection correction to the criteria is reproducible, and it is the
+recurrence, not the coarse solve, that produced it.

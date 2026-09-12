@@ -487,6 +487,85 @@ int RunBurgersViscous(int total_steps, int diag_every, const char* csv_path, Bur
 //
 // budget vs direct is the dual-path check; budget vs analytic is the attribution
 // error the plan puts a 1% bound on.
+
+// The flow map's reconstruction under accumulated strain, against Kelvin: a
+// Gaussian vortex column in a planar shear, inviscid, with the circulation of
+// a fixed circle enclosing the core compared with its exact constant value at
+// every cycle end. The map accumulates S n dt of strain per cycle.
+int RunShear(int total_steps, int diag_every, const char* csv_path, selfcheck::ShearVortexSpec spec,
+             float dt, int reinit_every, int rk_order, int res_tiles, float loop_radius)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim     = { res_tiles, res_tiles, 2 };
+    config.len_y        = 1.0f;
+    config.cg_iter      = 15;
+    config.reinit_every = reinit_every;
+    config.rk_order     = rk_order;
+
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+    solver.use_source_term_ = false;
+    solver.viscosity_       = 0.0f;
+
+    selfcheck::SetShearVortexBcAsync(solver, spec, stream);
+    selfcheck::SetShearVortexAsync(solver, spec, stream);
+    selfcheck::ProjectCurrentVelocityAsync(solver, stream);
+    cudaStreamSynchronize(stream);
+
+    const float r_loop   = loop_radius > 0.0f ? loop_radius : 0.3f;
+    const int samples    = 1024;
+    const double pi      = 3.14159265358979;
+    const double g_vortex = spec.circulation * (1.0 - std::exp(-double(r_loop) * r_loop / (double(spec.core) * spec.core)));
+    const double g_exact  = g_vortex - spec.shear * pi * double(r_loop) * r_loop;
+    const double gamma0   = selfcheck::CirculationOnCircle(solver, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_,
+                                                           spec.x0, spec.y0, r_loop, samples, stream);
+    printf("shear: grid %dx%dx%d  S=%.3f  core=%.4f (%.1f cells)  Gamma=%.4f  n=%d dt=%.5f  S*n*dt=%.4f\n",
+           res_tiles * 8, res_tiles * 8, 16, spec.shear, spec.core, spec.core / solver.dx_, spec.circulation,
+           reinit_every, dt, spec.shear * reinit_every * dt);
+    printf("       loop r=%.3f: seeded Gamma = %.6f, exact %.6f (vortex part %.6f)\n\n", r_loop, gamma0, g_exact, g_vortex);
+
+    FILE* csv = fopen(csv_path, "w");
+    if (!csv) {
+        printf("cannot open %s\n", csv_path);
+        return 1;
+    }
+    fprintf(csv, "step,time,gamma,gamma_exact,err_over_vortex,strain_per_cycle,max_speed,max_vorticity\n");
+    printf("%6s %8s %11s %11s %10s\n", "step", "t", "Gamma", "err/Gv", "max|u|");
+
+    int step = 0, next_diag = 0;
+    while (step < total_steps) {
+        for (int i = 0; i < reinit_every; i++)
+            solver.AdvanceAsync(dt, stream);
+        solver.ReinitAsync(dt, stream);
+        step += reinit_every;
+        if (step >= next_diag || step >= total_steps) {
+            cudaStreamSynchronize(stream);
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                printf("CUDA error at step %d: %s\n", step, cudaGetErrorString(err));
+                fclose(csv);
+                return 1;
+            }
+            const selfcheck::FieldStats fs = selfcheck::ComputeFieldStats(solver, stream);
+            const double g = selfcheck::CirculationOnCircle(solver, *solver.init_u_x_, *solver.init_u_y_, *solver.init_u_z_,
+                                                            spec.x0, spec.y0, r_loop, samples, stream);
+            const double e = (g - g_exact) / g_vortex;
+            printf("%6d %8.4f %11.6f %+10.5f %10.4f%s\n", step, step * dt, g, e, fs.max_speed, fs.finite ? "" : "  NON-FINITE");
+            fprintf(csv, "%d,%.6f,%.8f,%.8f,%.8f,%.6f,%.6f,%.6f\n", step, step * dt, g, g_exact, e,
+                    spec.shear * reinit_every * dt, fs.max_speed, fs.max_vorticity);
+            if (!fs.finite) {
+                fclose(csv);
+                return 1;
+            }
+            next_diag += diag_every;
+        }
+    }
+    fclose(csv);
+    return 0;
+}
+
 int RunAttribution(int total_steps, int diag_every, const char* csv_path, BurgersParams bp,
                    float dt, int reinit_every, int rk_order, int res_tiles, float loop_radius)
 {
@@ -976,6 +1055,11 @@ struct PlumeRun {
     float h          = 25.0f;  // m, vertical decay scale of the heating; the paper's value
     bool velocity_clamp = true; // the solver's BFECC clamp on the reconstructed velocity
     bool direct_force = false;  // add dt*f to the velocity directly instead of the impulse path integral (n = 1)
+    // Adaptive reinitialization: reinitialize when the accumulated strain
+    // bound sum(max|grad u|) dt over the cycle reaches this, or when the cycle
+    // reaches reinit_every steps, whichever first. 0 = fixed cycles.
+    float adapt_eps  = 0.0f;
+    bool log_strain  = false;   // fixed cycles, but report the strain bound per cycle
 };
 
 // Verification of the open boundary on the translating Gaussian vortex column.
@@ -1128,6 +1212,9 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         }
     }
     bool slice_header = true;
+    // Adaptive-reinitialization bookkeeping, reported per diagnostic.
+    float strain_acc = 0.0f, smax_seen = 0.0f, strain_cycle_max = 0.0f;
+    int cycles_done = 0, cycle_steps_sum = 0;
     selfcheck::PlumeDiag last;
     last.valid = false;
     for (int step = 0; step < run.steps; step++) {
@@ -1159,14 +1246,36 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         if (run.sponge)
             selfcheck::SpongeThetaAsync(*theta, td, solver.grid_origin_, dx, spec, run.dt, stream);
         // Once per cycle, not once per step: ReinitAsync re-marches the flow map
-        // through the whole cycle's velocity history.
-        if ((step + 1) % run.reinit_every == 0)
+        // through the whole cycle's velocity history. With --adaptive-reinit the
+        // cycle ends when the strain bound reaches eps, when the history buffer
+        // is full, or at a diagnostic step (so init_u_ is current there).
+        bool reinit_now;
+        if (run.adapt_eps > 0.0f) {
+            const float smax = selfcheck::MaxVelocityGradient(solver, step_u, stream);
+            strain_acc += smax * run.dt;
+            smax_seen = std::max(smax_seen, smax);
+            reinit_now = strain_acc >= run.adapt_eps || solver.cycle_len_ >= run.reinit_every
+                         || (step + 1) % run.diag_every == 0 || step + 1 == run.steps;
+        } else {
+            reinit_now = (step + 1) % run.reinit_every == 0;
+            if (run.log_strain) {
+                const float smax = selfcheck::MaxVelocityGradient(solver, step_u, stream);
+                strain_acc += smax * run.dt;
+                smax_seen = std::max(smax_seen, smax);
+            }
+        }
+        if (reinit_now) {
+            cycles_done++;
+            cycle_steps_sum += solver.cycle_len_;
+            strain_cycle_max = std::max(strain_cycle_max, strain_acc);
+            strain_acc = 0.0f;
             solver.ReinitAsync(run.dt, stream);
+        }
 
         // Only ever at a cycle boundary, which the diag_every check above
         // guarantees; the final step is added when it happens to be one.
-        if ((step + 1) % run.diag_every == 0
-            || (step + 1 == run.steps && (step + 1) % run.reinit_every == 0)) {
+        const bool at_cycle_end = solver.cycle_len_ == 0;
+        if (at_cycle_end && ((step + 1) % run.diag_every == 0 || step + 1 == run.steps)) {
             const cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess) {
                 printf("CUDA error at step %d: %s\n", step + 1, cudaGetErrorString(err));
@@ -1192,6 +1301,11 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
                    d.theta_width, d.theta_split, d.bifurcated ? "" : " [single lobe]",
                    d.theta_peak, d.theta_saddle,
                    d.best_theta_width, d.best_theta_split, d.best_bifurcated ? "" : " [single lobe]");
+            if (run.adapt_eps > 0.0f || run.log_strain)
+                printf("       cycles: %d since last diagnostic, mean %.2f steps (%.3f s); max sum(S dt) per cycle %.4f; max S %.4f 1/s\n",
+                       cycles_done, cycles_done ? double(cycle_steps_sum) / cycles_done : 0.0,
+                       cycles_done ? double(cycle_steps_sum) / cycles_done * run.dt : 0.0, strain_cycle_max, smax_seen);
+            cycles_done = 0; cycle_steps_sum = 0; strain_cycle_max = 0.0f; smax_seen = 0.0f;
             fprintf(csv, "%d,%.3f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e,%.3f,%.3f,%.3f,%.3f,%.6e,%.3f,"
                          "%.3f,%.3f,%.6f,%.6f,%d,%.3f,%.3f,%d\n",
                     step + 1, (step + 1) * run.dt, d.max_theta, d.plume_top, d.w_max, d.u_max, d.plane_theta,
@@ -1354,6 +1468,7 @@ int main(int argc, char** argv)
     int reinit_every = 1; // 1 = one-step (OFM); LFM runs its Figure 14 at 10
     int res_tiles    = 16; // burgers only: 16 tiles per side = 128^3
     float loop_radius = 0.0f; // attribution only: 0 means use the core radius
+    float shear_rate  = 1.0f; // shear only: S in u_x = S (y - y0)
     int rk_order     = 3; // TVD-RK3, the order OFM shipped with
     PlumeRun plume;       // stage A only
     OutflowRun outflow;   // open-boundary verification only
@@ -1396,6 +1511,8 @@ int main(int argc, char** argv)
             rk_order = std::atoi(argv[++i]);
         else if (arg == "--res-tiles" && i + 1 < argc)
             res_tiles = std::atoi(argv[++i]);
+        else if (arg == "--shear" && i + 1 < argc)
+            shear_rate = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--loop-radius" && i + 1 < argc)
             loop_radius = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--z0" && i + 1 < argc)
@@ -1447,6 +1564,10 @@ int main(int argc, char** argv)
             plume.velocity_clamp = false;
         else if (arg == "--direct-force")
             plume.direct_force = true;
+        else if (arg == "--adaptive-reinit" && i + 1 < argc)
+            plume.adapt_eps = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--log-strain")
+            plume.log_strain = true;
         else if (arg == "--max-levels" && i + 1 < argc)
             plume.max_levels = std::atoi(argv[++i]);
         else if (arg == "--sponge")
@@ -1528,6 +1649,13 @@ int main(int argc, char** argv)
         return RunPlume(plume, csv_path.c_str());
     }
 
+    if (test == "shear") {
+        selfcheck::ShearVortexSpec sv;
+        sv.shear       = shear_rate;
+        sv.core        = bp.core;
+        sv.circulation = bp.circulation;
+        return RunShear(total_steps, diag_every, csv_path.c_str(), sv, dt, reinit_every, rk_order, res_tiles, loop_radius);
+    }
     if (test == "outflow") {
         if (csv_path == "leapfrog3d.csv")
             csv_path = "outflow.csv";

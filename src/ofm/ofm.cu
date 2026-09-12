@@ -144,7 +144,7 @@ void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
     // across 2*dt using the velocity of the previous step. With reinit_every_ == 1
     // only the first branch is ever reached, which is exactly the one-step scheme
     // OFM shipped; the leapfrog steps proper require a cycle of at least three.
-    int cycle_step = step_ % reinit_every_;
+    int cycle_step = cycle_len_;
     float mid_dt;
     std::shared_ptr<DHMemory<float>> last_proj_u_x;
     std::shared_ptr<DHMemory<float>> last_proj_u_y;
@@ -210,6 +210,7 @@ void OFM::AdvanceAsync(float _dt, cudaStream_t _stream)
     mid_u_z_[cycle_step].swap(tmp_u_z_);
 
     step_++;
+    cycle_len_++;
 }
 
 void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
@@ -234,7 +235,8 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Marching Backward flowmap");
         // Walk the cycle's velocity history backwards in time.
-        for (int i = reinit_every_ - 1; i >= 0; i--) {
+        const int cycle = cycle_len_ > 0 ? cycle_len_ : reinit_every_;
+        for (int i = cycle - 1; i >= 0; i--) {
             RKAxisAsync(rk_order_, *psi_x_, *T_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, _dt, _stream);
             RKAxisAsync(rk_order_, *psi_y_, *T_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, _dt, _stream);
             RKAxisAsync(rk_order_, *psi_z_, *T_z_, tile_dim_, z_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, _dt, _stream);
@@ -252,7 +254,8 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
         // the initial-time impulse. That accumulation has to happen here, before
         // the pullback below reads init_u_.
         const float half_dt = 0.5f * _dt;
-        for (int i = 0; i < reinit_every_; i++) {
+        const int cycle = cycle_len_ > 0 ? cycle_len_ : reinit_every_;
+        for (int i = 0; i < cycle; i++) {
             if (!use_source_term_) {
                 RKAxisAsync(rk_order_, *phi_x_, *F_x_, tile_dim_, x_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
                 RKAxisAsync(rk_order_, *phi_y_, *F_y_, tile_dim_, y_tile_dim, *mid_u_x_[i], *mid_u_y_[i], *mid_u_z_[i], grid_origin_, dx_, -_dt, _stream);
@@ -335,6 +338,7 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
     init_u_x_.swap(tmp_u_x_);
     init_u_y_.swap(tmp_u_y_);
     init_u_z_.swap(tmp_u_z_);
+    cycle_len_ = 0;
 }
 
 void OFM::ResetForwardFlowMapAsync(cudaStream_t _stream)

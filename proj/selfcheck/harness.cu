@@ -1,4 +1,6 @@
 #include "harness.h"
+#include <cub/cub.cuh>
+#include <cstring>
 #include <cstdint>
 
 #include "ofm_util.h"
@@ -227,6 +229,7 @@ void SetupSolver(ofm::OFM& solver, const SolverConfig& config, GPUTimer& profile
     solver.SetProfilier(&profiler);
 
     solver.step_        = 0;
+    solver.cycle_len_   = 0;
     solver.rk_order_    = config.rk_order;
     solver.dx_          = config.len_y / static_cast<float>(8 * config.tile_dim.y);
     solver.grid_origin_ = { 0.0f, 0.0f, 0.0f };
@@ -1253,13 +1256,13 @@ void AddPlumeHeatAsync(ofm::DHMemory<float>& theta, int3 tile_dim, float3 grid_o
         theta.dev_ptr_, tile_dim, grid_origin, dx, spec, t, dt);
 }
 
-// AdvanceAsync stores the step it has just taken in mid_u_[step_ % reinit_every_]
-// and then increments step_, so the cycle index is read differently on the two
+// AdvanceAsync stores the step it has just taken in mid_u_[cycle_len_] and then
+// increments cycle_len_, so the cycle index is read differently on the two
 // sides of the call. On the first step of a cycle there is no history yet and
 // the cycle's start, init_u_, is the answer.
 PlumeVelocity PlumeVelocityBefore(ofm::OFM& solver)
 {
-    const int cycle_step = solver.step_ % solver.reinit_every_;
+    const int cycle_step = solver.cycle_len_;
     if (cycle_step == 0)
         return { solver.init_u_x_.get(), solver.init_u_y_.get(), solver.init_u_z_.get() };
     return { solver.mid_u_x_[cycle_step - 1].get(), solver.mid_u_y_[cycle_step - 1].get(),
@@ -1268,7 +1271,7 @@ PlumeVelocity PlumeVelocityBefore(ofm::OFM& solver)
 
 PlumeVelocity PlumeVelocityAfter(ofm::OFM& solver)
 {
-    const int cycle_step = (solver.step_ - 1) % solver.reinit_every_;
+    const int cycle_step = solver.cycle_len_ - 1;
     return { solver.mid_u_x_[cycle_step].get(), solver.mid_u_y_[cycle_step].get(),
              solver.mid_u_z_[cycle_step].get() };
 }
@@ -1734,7 +1737,82 @@ __global__ void SetTranslatingVortexFaceKernel(uint8_t* is_bc_axis, float* bc_va
     }
 }
 
+__global__ void SetShearVortexKernel(float* u_axis, int3 axis_tile_dim, int component,
+                                     float3 origin, float dx, selfcheck::ShearVortexSpec spec)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(axis_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (component == 2) {
+            u_axis[idx] = 0.0f;
+            continue;
+        }
+        const float px = origin.x + (ijk.x + (component == 0 ? 0.0f : 0.5f)) * dx;
+        const float py = origin.y + (ijk.y + (component == 1 ? 0.0f : 0.5f)) * dx;
+        const float2 v = GaussianVortexVelocity(px, py, spec.x0, spec.y0, spec.core, spec.circulation);
+        u_axis[idx]    = component == 0 ? spec.shear * (py - spec.y0) + v.x : v.y;
+    }
+}
+
+// x faces: the shear profile alone (the vortex's induced velocity there is the
+// image-effect price of a closed box). Other faces keep SetWallBcAsync's walls.
+__global__ void SetShearVortexFaceKernel(uint8_t* is_bc_x, float* bc_val_x, int3 x_tile_dim,
+                                         float3 origin, float dx, selfcheck::ShearVortexSpec spec)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(x_tile_dim, tile_idx);
+    const int t_id      = threadIdx.x;
+    const int nx        = x_tile_dim.x * 8 - 8;
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = t_id + i * 128;
+        const int idx        = tile_idx * 512 + voxel_idx;
+        const int3 voxel_ijk = VoxelIdxToIjk(voxel_idx);
+        const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
+        if (ijk.x == 0 || ijk.x == nx) {
+            const float py   = origin.y + (ijk.y + 0.5f) * dx;
+            is_bc_x[idx]     = 1;
+            bc_val_x[idx]    = spec.shear * (py - spec.y0);
+        }
+    }
+}
+
 } // namespace
+
+void SetShearVortexAsync(ofm::OFM& solver, const ShearVortexSpec& spec, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const int3 y_tile_dim = { td.x, td.y + 1, td.z };
+    const int3 z_tile_dim = { td.x, td.y, td.z + 1 };
+    SetShearVortexKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(solver.init_u_x_->dev_ptr_, x_tile_dim, 0, solver.grid_origin_, solver.dx_, spec);
+    SetShearVortexKernel<<<Prod(y_tile_dim), 128, 0, stream>>>(solver.init_u_y_->dev_ptr_, y_tile_dim, 1, solver.grid_origin_, solver.dx_, spec);
+    SetShearVortexKernel<<<Prod(z_tile_dim), 128, 0, stream>>>(solver.init_u_z_->dev_ptr_, z_tile_dim, 2, solver.grid_origin_, solver.dx_, spec);
+}
+
+void SetShearVortexBcAsync(ofm::OFM& solver, const ShearVortexSpec& spec, cudaStream_t stream)
+{
+    const int3 td         = solver.tile_dim_;
+    const int3 x_tile_dim = { td.x + 1, td.y, td.z };
+    const float3 zero     = { 0.0f, 0.0f, 0.0f };
+    ofm::SetWallBcAsync(*solver.is_bc_x_, *solver.is_bc_y_, *solver.is_bc_z_,
+                        *solver.bc_val_x_, *solver.bc_val_y_, *solver.bc_val_z_, td, zero, zero, stream);
+    solver.use_uniform_inlet_ = false;
+    SetShearVortexFaceKernel<<<Prod(x_tile_dim), 128, 0, stream>>>(
+        solver.is_bc_x_->dev_ptr_, solver.bc_val_x_->dev_ptr_, x_tile_dim, solver.grid_origin_, solver.dx_, spec);
+    solver.amgpcg_.pure_neumann_ = true;
+    ofm::SetCoefByIsBcAsync(*(solver.amgpcg_.poisson_vector_[0].is_dof_),
+                            *(solver.amgpcg_.poisson_vector_[0].a_diag_),
+                            *(solver.amgpcg_.poisson_vector_[0].a_x_),
+                            *(solver.amgpcg_.poisson_vector_[0].a_y_),
+                            *(solver.amgpcg_.poisson_vector_[0].a_z_),
+                            td, *solver.is_bc_x_, *solver.is_bc_y_, *solver.is_bc_z_, stream);
+    solver.amgpcg_.BuildAsync(6.0f, -1.0f, stream);
+}
 
 void SetTranslatingVortexAsync(ofm::OFM& solver, const TranslatingVortexSpec& spec, cudaStream_t stream)
 {
@@ -1914,6 +1992,66 @@ void WritePlumeSlice(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
         fwrite(row.data(), sizeof(float), nz, f);
     }
     fflush(f);
+}
+
+
+// Largest velocity-gradient component in the domain, from the staggered
+// velocity: along-axis differences of neighbouring faces for the diagonal
+// entries, differences of neighbouring faces across the other two axes for the
+// off-diagonal ones (both over one dx). This bounds the strain the flow map
+// accumulates per unit time, which is what the adaptive reinitialization
+// integrates: ||F - I|| <= exp(int S dt) - 1.
+__global__ void MaxVelocityGradientKernel(unsigned int* _out, int3 _tile_dim, const float* _u_x, const float* _u_y, const float* _u_z, float _inv_dx)
+{
+    const int tile_idx  = blockIdx.x;
+    const int3 tile_ijk = TileIdxToIjk(_tile_dim, tile_idx);
+    const int3 xd = { _tile_dim.x + 1, _tile_dim.y, _tile_dim.z };
+    const int3 yd = { _tile_dim.x, _tile_dim.y + 1, _tile_dim.z };
+    const int3 zd = { _tile_dim.x, _tile_dim.y, _tile_dim.z + 1 };
+    const int nx = _tile_dim.x * 8, ny = _tile_dim.y * 8, nz = _tile_dim.z * 8;
+    float best = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        const int voxel_idx  = threadIdx.x + i * 128;
+        const int3 v         = VoxelIdxToIjk(voxel_idx);
+        const int3 c         = { tile_ijk.x * 8 + v.x, tile_ijk.y * 8 + v.y, tile_ijk.z * 8 + v.z };
+        const int3 cx = { c.x + 1, c.y, c.z }, cy = { c.x, c.y + 1, c.z }, cz = { c.x, c.y, c.z + 1 };
+        // diagonal: face differences across the cell
+        const float ux = _u_x[IjkToIdx(xd, c)], uxr = _u_x[IjkToIdx(xd, cx)];
+        const float uy = _u_y[IjkToIdx(yd, c)], uyu = _u_y[IjkToIdx(yd, cy)];
+        const float uz = _u_z[IjkToIdx(zd, c)], uzf = _u_z[IjkToIdx(zd, cz)];
+        best = fmaxf(best, fabsf(uxr - ux));
+        best = fmaxf(best, fabsf(uyu - uy));
+        best = fmaxf(best, fabsf(uzf - uz));
+        // off-diagonal: the same face against its neighbour along the other axes
+        if (c.y + 1 < ny) best = fmaxf(best, fabsf(_u_x[IjkToIdx(xd, { c.x, c.y + 1, c.z })] - ux));
+        if (c.z + 1 < nz) best = fmaxf(best, fabsf(_u_x[IjkToIdx(xd, { c.x, c.y, c.z + 1 })] - ux));
+        if (c.x + 1 < nx) best = fmaxf(best, fabsf(_u_y[IjkToIdx(yd, { c.x + 1, c.y, c.z })] - uy));
+        if (c.z + 1 < nz) best = fmaxf(best, fabsf(_u_y[IjkToIdx(yd, { c.x, c.y, c.z + 1 })] - uy));
+        if (c.x + 1 < nx) best = fmaxf(best, fabsf(_u_z[IjkToIdx(zd, { c.x + 1, c.y, c.z })] - uz));
+        if (c.y + 1 < ny) best = fmaxf(best, fabsf(_u_z[IjkToIdx(zd, { c.x, c.y + 1, c.z })] - uz));
+    }
+    best *= _inv_dx;
+    using BlockReduce = cub::BlockReduce<float, 128>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    const float block_max = BlockReduce(temp).Reduce(best, cub::Max());
+    if (threadIdx.x == 0)
+        atomicMax(_out, __float_as_uint(fmaxf(block_max, 0.0f)));
+}
+
+float MaxVelocityGradient(ofm::OFM& solver, const PlumeVelocity& u, cudaStream_t stream)
+{
+    static unsigned int* d_out = nullptr;
+    if (!d_out)
+        cudaMalloc(&d_out, sizeof(unsigned int));
+    cudaMemsetAsync(d_out, 0, sizeof(unsigned int), stream);
+    MaxVelocityGradientKernel<<<Prod(solver.tile_dim_), 128, 0, stream>>>(
+        d_out, solver.tile_dim_, u.x->dev_ptr_, u.y->dev_ptr_, u.z->dev_ptr_, 1.0f / solver.dx_);
+    unsigned int bits = 0;
+    cudaMemcpyAsync(&bits, d_out, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    float v;
+    std::memcpy(&v, &bits, sizeof(float));
+    return v;
 }
 
 } // namespace selfcheck

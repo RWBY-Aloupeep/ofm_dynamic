@@ -448,6 +448,24 @@ struct TranslatingVortexSpec {
 // Stream plus vortex, written into the solver's velocity state.
 void SetTranslatingVortexAsync(ofm::OFM& solver, const TranslatingVortexSpec& spec, cudaStream_t stream);
 
+// A Gaussian vortex column in a planar shear u_x = S (y - y0), the
+// known-answer case for the flow map's reconstruction under accumulated
+// strain. The flow is two-dimensional and inviscid, so omega_z is conserved
+// along particles and the circulation of any fixed circle that keeps the
+// whole core inside it is exactly Gamma - S pi r^2 for all time. The strain
+// the map accumulates per cycle is S n dt, uniform, which is the quantity
+// the adaptive reinitialization bounds. x faces prescribe the shear profile
+// (net flux zero), y and z faces are free-slip walls.
+struct ShearVortexSpec {
+    float shear       = 1.0f;  // S, 1/s
+    float x0          = 0.5f;
+    float y0          = 0.5f;
+    float core        = 0.05f;
+    float circulation = 0.25f;
+};
+void SetShearVortexAsync(ofm::OFM& solver, const ShearVortexSpec& spec, cudaStream_t stream);
+void SetShearVortexBcAsync(ofm::OFM& solver, const ShearVortexSpec& spec, cudaStream_t stream);
+
 // The exact normal velocity at time t on the Dirichlet faces. Call with build
 // true once, so the Poisson coefficients match the face marks.
 void SetTranslatingVortexBcAsync(ofm::OFM& solver, const TranslatingVortexSpec& spec, float t, bool build, cudaStream_t stream);
@@ -496,5 +514,9 @@ PlumeDiag MeasurePlume(ofm::OFM& solver, ofm::DHMemory<float>& theta,
 // Call after MeasurePlume, which leaves the host copy of theta current.
 void WritePlumeSlice(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
                      float plane_x, float time, bool header, cudaStream_t stream);
+
+// Largest velocity-gradient component in the domain (1/s), the per-step
+// strain bound the adaptive reinitialization integrates. Synchronizes the stream.
+float MaxVelocityGradient(ofm::OFM& solver, const PlumeVelocity& u, cudaStream_t stream);
 
 } // namespace selfcheck

@@ -30,6 +30,13 @@ public:
     // projected velocity of every step in the cycle and marches the flow map
     // through that history at reinitialization.
     int reinit_every_ = 1;
+    // Steps taken since the last reinitialization. AdvanceAsync's leapfrog
+    // schedule and ReinitAsync's marches read this rather than
+    // step_ % reinit_every_, so a caller may reinitialize before the cycle is
+    // full (adaptive cycle length); reinit_every_ is then the longest cycle the
+    // velocity history can hold. Calling ReinitAsync every reinit_every_ steps
+    // reproduces the fixed-cycle behaviour exactly.
+    int cycle_len_ = 0;
     // Order of the flow-map marching scheme: 2, 4, or anything else for TVD-RK3
     // (the order OFM shipped with, kept as the default).
     int rk_order_ = 3;

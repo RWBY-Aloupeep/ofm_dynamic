@@ -1958,3 +1958,103 @@ different solver. The criteria therefore stay at `n` = 1, `dt` = 0.25, and
 vorticity, 6-13% less thermal anomaly, orderings intact. Understanding the
 long-map loss on a case with a known answer is the first item in the
 queue; until then the floor is what `n` = 1 gives.
+
+### Adaptive reinitialization: the cycle ends when the accumulated strain bound reaches eps
+
+The lever that lowers the floor is the cycle duration, and what breaks the
+weak plume is also the cycle duration, so the cycle length should be set by
+what the flow is doing rather than fixed. `OFM` now keeps `cycle_len_`, the
+steps taken since the last reinitialization; `AdvanceAsync`'s leapfrog
+schedule and `ReinitAsync`'s marches read it instead of
+`step_ % reinit_every_`, so a caller may reinitialize early, and
+`reinit_every_` becomes the longest cycle the velocity history holds.
+Calling `ReinitAsync` every `reinit_every_` steps reproduces the fixed
+cycle exactly (regression below). The maps are only marched at
+reinitialization, so there is no `F` to read mid-cycle; the driver
+integrates the bound instead: every step it takes the largest
+velocity-gradient component in the domain (`MaxVelocityGradient`, one
+block-reduced kernel and one 4-byte copy) and accumulates
+`sum(max|grad u|) dt`, which bounds `||F - I||` through
+`exp(int S dt) - 1`. `--adaptive-reinit EPS` ends the cycle when the sum
+reaches `EPS`, when the buffer is full, or at a diagnostic step;
+`--log-strain` reports the sum per cycle under fixed cycles.
+
+Calibration on the collapsing case, the largest per-cycle sum over the last
+1000 s:
+
+| fixed cycle | `n*dt` | max `sum(S dt)` per cycle | max `S` (1/s) | plume |
+|---|---|---|---|---|
+| `n` = 1, `dt` = 0.25 | 0.25 s | 0.043 | 0.17 | holds |
+| `n` = 5, `dt` = 0.125 | 0.625 s | 0.095 | 0.16 | holds, drifts |
+| `n` = 5, `dt` = 0.25 | 1.25 s | 0.25-0.28 | 0.32 | collapses |
+
+The controller at `dt` = 0.25 with a ten-step buffer, three guesses of
+`eps`, 1500 s:
+
+| `eps` | cycle it settles to | peak dT at 1500 s | top | `w_max` | peak abs `omega_z` | `theta_split` |
+|---|---|---|---|---|---|---|
+| (`n` = 1 fixed) | 1 step, 0.25 s | 14.8 | 635 | 5.85 | 0.065 | 346 |
+| 0.05 | 2 steps, 0.5 s | 14.3 | 615 | 5.40 | 0.077 | 329 |
+| 0.10 | 3 steps, 0.75 s | 12.3 | 465 | 4.31 | 0.078 | 212 |
+| 0.20 | 5 steps, 1.2 s | 8.9 | 85 | 1.45 | 0.081 | -- |
+
+`eps` = 0.05 holds: 3% less peak anomaly, 17% more peak vorticity, the
+split 5% narrower. It settles to two-step cycles here because the near-
+source strain is what the global maximum sees, and it ran 5-6 step cycles
+during the first 300 s while the strain was small, which is the point of
+the controller: the cycle follows the flow. `eps` = 0.10 is the same slow
+loss the 0.625 s fixed cycle showed and 0.20 collapses, so the threshold on
+the bound sits near 0.05, and the loss is already under way at 0.1.
+
+### The inference tested where the answer is known: the shear vortex
+
+The mechanism proposed for the collapse was that the covector
+reconstruction `T^T u0(psi)` amplifies interpolation error by the strain
+the map has accumulated, which would make the loss a function of `S n dt`.
+`--test shear` isolates that: a Gaussian vortex column (core 0.05, 6.4
+cells, `Gamma` 0.25) in a planar shear `u_x = S (y - 1/2)`, inviscid,
+128 x 128 x 16, x faces prescribing the shear profile. The flow is
+two-dimensional, `omega_z` is conserved along particles, and the
+circulation of the fixed `r` = 0.3 circle about the core is exactly
+`Gamma - S pi r^2` as long as the core stays inside it. Error in units of
+the vortex's circulation, at `t` = 4 s, `dt` = 1/384:
+
+| `S` | `n` = 1 | 4 | 16 | 64 | 128 |
+|---|---|---|---|---|---|
+| `S n dt` at `S` = 1 | 0.0026 | 0.010 | 0.042 | 0.167 | 0.333 |
+| 0 | -0.00005 | -0.00003 | -0.00003 | -0.00002 | -0.00003 |
+| 1 | +0.0062 | -0.0015 | -0.0017 | -0.0049 | -0.0084 |
+| 4 | -0.929 | -0.920 | -0.908 | -0.916 | -0.922 |
+
+`S` = 4 is not a valid row: the loss is the same at every `n`, including
+`n` = 1, because at `S / omega_peak` = 0.125 the shear strips the vortex
+and its vorticity leaves the circle -- physics, not the map, and the test
+telling the two apart is what it is for. `S` = 0 loses nothing at any `n`:
+plain dissipation does not move the circulation of a compact vortex.
+`S` = 1 is the measurement: the loss grows with the strain accumulated per
+cycle, 0.17% at 0.04, 0.49% at 0.17, 0.84% at 0.33, roughly linearly once
+past `n` = 16 -- and it is small. Per cycle it is about 0.07% at
+`S n dt` = 0.33.
+
+So the direction of the inference holds and its magnitude does not. The
+plume's collapsing cycles carry a strain bound of 0.25-0.28, at which the
+two-dimensional shear test loses a tenth of a percent per cycle; over the
+480 cycles of a 600 s collapse that compounds to tens of percent only if
+nothing else intervenes, and the plume is a forced, feedback-bearing flow,
+so the order of magnitude is not absurd -- but the shear test alone does
+not reproduce a collapse, and it has none of the things the plume has: a
+bottom wall with the heating layer against it, vertical transport through
+the map, a body force. The next place to look is the near-wall layer: the
+map's backtrace for cells in the heated bottom rows, where the plume is
+fed, and what the clamp to the wall does to it over a longer cycle.
+
+### Regression of the `cycle_len_` refactor
+
+The Burgers `nu` = 0 floor with fixed cycles, `n` = 1 at `dt` = 1/480 and
+`n` = 4 at `dt` = 1/1920 (the (n, dt) sweep's pair that must agree): the
+refactored solver returns 8.5873e-5 and 8.5588e-5, agreeing with each
+other to 0.3% as the `n*dt` law says they should. The pre-refactor binary
+run on the identical command gives the identical 8.587309e-5 and 8.558805e-5, bit for bit: the fixed-cycle path is unchanged. (The sweep's
+own 7.0246e-5 was measured on the `feat/reinit-dt-sweep` branch; the
+difference between branches, not between binaries, is what the control
+run separates.)

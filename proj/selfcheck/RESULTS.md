@@ -2058,3 +2058,147 @@ run on the identical command gives the identical 8.587309e-5 and 8.558805e-5, bi
 own 7.0246e-5 was measured on the `feat/reinit-dt-sweep` branch; the
 difference between branches, not between binaries, is what the control
 run separates.)
+
+### The cause of the collapse: the projection is not converged
+
+Two probes after the shear test, both on the weak case. First the wall:
+`--z-src` centres the heating at a height with the same total heat
+(`Q0/2 exp(-|z - z_src|/h)`), so the plume's root sits away from the
+ground. The elevated source at the 1.25 s cycle still decays (top 665 ->
+425 m over 900 s, peak anomaly 5.8 -> 5.2 K, against 735 -> 645 and 5.9 ->
+5.9 at 0.25 s), so the wall clamp of near-ground backtraces is not it.
+Second the profile: `--profile` writes horizontal means of `w` and `theta`
+over the source column (x 300-600 m, y 450-750 m) per level. The
+horizontally averaged `w` there is negative -- above a bent-over plume the
+column sees compensating subsidence -- and at the 0.25 s cycle it holds at
+about -0.5 m/s; at the 1.25 s cycle it grows monotonically, -0.5 at 300 s,
+-1.2 at 600 s, -1.85 m/s at 900 s, nearly uniform from 100 m to 600 m.
+That is a field of mass sinks over the source, not a transport error.
+
+A residual divergence would do exactly that, and the pressure solve is
+run for a fixed 15 AMGPCG iterations (`SetupSolver`: `solve_by_tol_ =
+false`, `max_iter_ = cg_iter = 15`), not to a tolerance. The impulse's
+gauge part grows with the cycle, so the right-hand side the projection has
+to remove grows with it, and 15 iterations leave more behind. `--log-div`
+reports max |div u| over the cells after the last projection, `--cg-iter`
+sets the count. Weak case, 1.25 s cycle, 900 s:
+
+| iterations | max abs div u (1/s), 300 / 600 / 900 s | peak dT at 900 s | top | `w_max` | peak abs `omega_z` | `theta_split` |
+|---|---|---|---|---|---|---|
+| 15 | 0.09 / 0.29 / 0.38 | 9.9 | 345 | 2.9 | 0.084 | 168 |
+| 30 | 0.09 / 0.20 / 0.15 | 14.86 | 615 | 6.0 | 0.107 | 384 |
+| 60 | 0.06 / 0.08 / 0.06 | 14.75 | 605 | 6.3 | 0.114 | 392 |
+| 120 | 0.04 / 0.03 / 0.03 | 14.75 | 605 | 6.5 | 0.113 | 395 |
+| `n` = 1, 15 | 0.04 / 0.06 / 0.06 | 14.76 | 635 | 5.8 | 0.065 | 346 |
+| `n` = 1, 60 | 0.015 / 0.013 / 0.014 | 14.66 | 605 | 6.1 | 0.063 | 371 |
+
+At 15 iterations the residual divergence at the 1.25 s cycle reaches
+0.38 1/s -- 4 m/s across a 10 m cell -- and the plume collapses. At 30 it
+holds; at 60 and 120 the 1.25 s cycle reproduces `n` = 1's peak anomaly to
+the second decimal and carries 75% more peak vorticity, which is the floor
+gain the longer cycle was supposed to buy, intact. Doubling the count from
+60 to 120 changes nothing but the residual, so 60 is converged for this
+case at this cycle.
+
+That is the cause. It explains every localisation result: the loss followed
+the cycle's duration because the gauge part does; it survived closing the
+box, `mu` = 0, drag off, the clamp off and the direct force because none of
+those touch the solve; `n` = 1 at `dt` = 1.25 collapsed because a long
+step is a long cycle; the elevated source did not help because the sinks
+sit wherever the gauge is large, not at the wall; the two-dimensional shear
+vortex could not see it because an irrotational residual leaves the
+circulation of a loop alone -- which is also why the `S` = 1 rows there
+were so small; and the weak plume went first because a fixed sink field
+costs it a larger fraction of its updraught.
+
+The fixed 15 is upstream's choice (OFM ships `cg_iter = 15`), and it is
+enough for the flows OFM shows. Here even the criterion configuration
+carries a 0.06 1/s residual, and converging it moves the weak `z0` = 150 m
+split from 346 to 371 m (7%) with the peak anomaly 0.1 K lower: **the
+criterion numbers reported above were read with an unconverged projection**
+and are re-read below with 60 iterations. D1-D4 and the (n, dt) floor sweep
+were all run at 15; whether any of their numbers move is a regression to
+run (a columnar vortex has no gauge growth to speak of, so probably not, but
+it has to be measured, not assumed).
+
+`--cg-tol REL` (with `--cg-iter` as the cap) switches the solve to a
+relative residual, so a long cycle's larger gauge part gets the iterations
+it needs and a short one does not pay for them.
+
+### The six cases with the projection converged: the paper's pattern appears
+
+`stage_a_cg60.sbatch`: the six Fig. 6 cases at 60 iterations, 1600 s, last
+1000 s averaged, at the criterion cycle (`n` = 1) and at the 1.25 s cycle
+(`n` = 5, `dt` = 0.25) that collapsed under 15. `theta_split` in metres.
+
+| `z0` | `n` = 1, 15 it. | `n` = 1, 60 it. | 1.25 s cycle, 60 it. | paper's Fig. 6 (pixel) |
+|---|---|---|---|---|
+| 50, strong / weak | 369 / 295 | 355 / 278 | 394 / 270 | 448 / 313 |
+| 100, strong / weak | 440 / 315 | 430 / 310 | 397 / 329 | 431 / 465 |
+| 150, strong / weak | 527 / 349 | 516 / 372 | 409 / 394 | 439 / 532 |
+| peak abs `omega_z`, strong / weak | 0.095 / 0.063 | 0.093 / 0.063 | 0.17-0.18 / 0.10-0.11 | -- |
+| max abs div u (1/s) | 0.06 | 0.014 | 0.06-0.07 | -- |
+
+Converging the projection at `n` = 1 moves the splits by -14 to +23 m and
+nothing else: both orderings read as before (32.1x and 19.9x sem for `z0`;
+weak narrower at every `z0`, 21-441x), the peak anomalies agree to 0.2 K.
+The numbers quoted for the criteria from here on are the 60-iteration
+ones.
+
+The 1.25 s cycle with the projection converged is a different picture.
+The strong column goes flat -- 394, 397, 409 m, 7.2x sem end to end -- and
+the weak column rises steeply, 270 -> 329 -> 394 m (28.5x). That is the
+shape of the paper's own figure: its strong column is flat too (448, 431,
+439) and its weak column rises (313, 465, 532). At `z0` = 150 m the weak
+source is 15 m narrower than the strong one, 3.1x sem, where the 15-
+iteration `n` = 1 runs had it 178 m narrower at 44x. The peak vorticity is
+80% higher than at `n` = 1, the residual divergence is the same 0.06 the
+`n` = 1, 15-iteration criterion runs carried, and the peak anomalies match
+`n` = 1 to 0.5 K.
+
+What changed between the two columns of this solver is only how much
+vorticity the scheme dissipates: the physics, the grid and the boundary
+conditions are identical. So the third cut's "weaker source is narrower at
+every `z0`, opposite to the paper" was in large part a statement about the
+one-step scheme's dissipation, and the Boussinesq reduction it named as the
+only remaining candidate is not the only one -- it may not be needed at
+all. The residual disagreement at `z0` = 150 m (the weak source 15 m
+narrower here against 93 m wider in the figure) is what remains to be
+explained, and the cycle-length sweep below says the lever is not
+exhausted.
+
+### How long can the cycle be, once the projection is converged
+
+`stage_a_cycle_cg60.sbatch`, weak case, `dt` = 0.25, 1500 s:
+
+| cycle | iterations | max abs div u (1/s), late | peak dT | top | `w_max` | peak abs `omega_z` | `theta_split` |
+|---|---|---|---|---|---|---|---|
+| 0.25 s (`n` = 1) | 60 | 0.014 | 14.7 | 605 | 6.1 | 0.063 | 372 |
+| 1.25 s (`n` = 5) | 60 | 0.06 | 14.75 | 605 | 6.3 | 0.114 | 392 |
+| 2.5 s (`n` = 10) | 60 | 0.13 | 14.96 | 635 | 6.5 | 0.140 | 337 |
+| 2.5 s (`n` = 10) | 120 | 0.055 | 14.95 | 635 | 6.7 | 0.136 | 341 |
+| 5 s (`n` = 20) | 60 | 0.27 | 15.05 | 705 | 6.9 | 0.177 | 256 |
+| 10 s (`n` = 40) | 60 | 0.56-0.76 | 14.8 | 775 | 7.9 | 0.28 | 215 |
+
+Nothing collapses any more, at any cycle: the thermal field holds to 15 K
+throughout. But the residual divergence at a fixed 60 iterations climbs
+with the cycle -- 0.13 at 2.5 s, 0.27 at 5 s, 0.7 at 10 s -- because the
+gauge part the projection has to remove grows with it, and 120 iterations
+at 2.5 s bring it back to 0.055. The vorticity keeps rising with the cycle
+(0.28 at 10 s, 4.4x the `n` = 1 value) while the split narrows, and at
+0.7 1/s of residual neither number is trustworthy. The usable regime with
+a fixed count is a cycle of about 2.5 s at 120 iterations, residual
+0.055, peak vorticity 2.2x `n` = 1's. The right control is not a count
+at all but a residual tolerance (`--cg-tol`, below), so that the
+iterations follow the gauge.
+
+### Stage 0 does not move with the projection count
+
+`regress_cg.sbatch`: D1 (viscous Burgers, 128^3, `n` = 1 and 5) and D2
+(attribution, 128^3, `n` = 5) at 15 and at 60 iterations return the same
+numbers to every printed digit (D1 `nu` recovered 1.027296e-3 and
+9.407688e-4; D2 dual-path 1.66%, attribution 3.79%). A columnar vortex
+grows no gauge part to speak of, so 15 iterations were already converged
+there. The Stage 0 results stand; the projection count only bites where
+the impulse's gauge part is large, which the sheared buoyant plume is the
+first case here to have.

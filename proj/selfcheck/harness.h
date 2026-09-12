@@ -282,6 +282,10 @@ struct PlumeSpec {
     float r2     = 150.0f;  // m, outer radius of the heated area
     float dwidth = 12.5f;   // m, scale width of the smoothed edge
     float h      = 25.0f;   // m, vertical decay scale in Q ~ exp(-z/h)
+    // Elevated source for localisation: when > 0 the heating is
+    // Q0/2 exp(-|z - z_src|/h), centred at z_src with the same total heat as
+    // the ground-based profile, so the plume's root sits away from the wall.
+    float z_src  = 0.0f;
     float t_ramp = 10.0f;   // s, ramp-up in Q ~ tanh(t/t_ramp)
     float theta0 = 300.0f;  // K, ambient potential temperature
     float rho    = 1.177f;  // kg/m^3 at 300 K, 1000 hPa
@@ -518,5 +522,16 @@ void WritePlumeSlice(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
 // Largest velocity-gradient component in the domain (1/s), the per-step
 // strain bound the adaptive reinitialization integrates. Synchronizes the stream.
 float MaxVelocityGradient(ofm::OFM& solver, const PlumeVelocity& u, cudaStream_t stream);
+
+// Horizontal means of w and theta over the column [x0, x1] x [y0, y1], one line
+// per z level: "time z w_mean theta_mean w_max". Reads the host copies that
+// MeasurePlume has just refreshed (call after it). For finding where a plume
+// loses its updraught: at the wall or aloft.
+void WritePlumeProfile(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
+                       float x0, float x1, float y0, float y1, float time);
+
+// Largest |div u| over the cells (1/s) of the staggered velocity init_u_, i.e.
+// what the last projection left behind. Downloads the three components.
+float MaxDivergence(ofm::OFM& solver, cudaStream_t stream);
 
 } // namespace selfcheck

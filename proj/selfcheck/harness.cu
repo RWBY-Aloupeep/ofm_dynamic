@@ -1024,7 +1024,9 @@ __global__ void AddPlumeHeatKernel(float* theta, int3 tile_dim, float3 origin, f
         const float shape = PlumeHeatShape(px, py, spec);
         if (shape <= 0.0f)
             continue;
-        const float q = spec.q0 * ramp * expf(-pz / spec.h) * shape;
+        const float q = spec.z_src > 0.0f
+                            ? 0.5f * spec.q0 * ramp * expf(-fabsf(pz - spec.z_src) / spec.h) * shape
+                            : spec.q0 * ramp * expf(-pz / spec.h) * shape;
         theta[idx] += q / (spec.rho * spec.cp) * dt;
     }
 }
@@ -2052,6 +2054,65 @@ float MaxVelocityGradient(ofm::OFM& solver, const PlumeVelocity& u, cudaStream_t
     float v;
     std::memcpy(&v, &bits, sizeof(float));
     return v;
+}
+
+
+void WritePlumeProfile(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
+                       float x0, float x1, float y0, float y1, float time)
+{
+    const int3 td    = solver.tile_dim_;
+    const float dx   = solver.dx_;
+    const float3 org = solver.grid_origin_;
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const float* th  = theta.host_ptr_;
+    const float3* uc = solver.u_->host_ptr_;
+    for (int k = 0; k < nz; k++) {
+        double sw = 0.0, st = 0.0, wmax = -1e30;
+        int n = 0;
+        for (int i = 0; i < nx; i++) {
+            const float px = org.x + (i + 0.5f) * dx;
+            if (px < x0 || px > x1)
+                continue;
+            for (int j = 0; j < ny; j++) {
+                const float py = org.y + (j + 0.5f) * dx;
+                if (py < y0 || py > y1)
+                    continue;
+                const int id = IjkToIdx(td, { i, j, k });
+                sw += uc[id].z;
+                st += th[id];
+                wmax = std::max(wmax, double(uc[id].z));
+                n++;
+            }
+        }
+        fprintf(f, "%.1f %.1f %.5f %.5f %.5f\n", time, org.z + (k + 0.5f) * dx, n ? sw / n : 0.0, n ? st / n : 0.0, n ? wmax : 0.0);
+    }
+    fflush(f);
+}
+
+
+float MaxDivergence(ofm::OFM& solver, cudaStream_t stream)
+{
+    const int3 td = solver.tile_dim_;
+    const int3 xd = { td.x + 1, td.y, td.z }, yd = { td.x, td.y + 1, td.z }, zd = { td.x, td.y, td.z + 1 };
+    solver.init_u_x_->DevToHostAsync(stream);
+    solver.init_u_y_->DevToHostAsync(stream);
+    solver.init_u_z_->DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+    const float* ux = solver.init_u_x_->host_ptr_;
+    const float* uy = solver.init_u_y_->host_ptr_;
+    const float* uz = solver.init_u_z_->host_ptr_;
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const float inv_dx = 1.0f / solver.dx_;
+    float best = 0.0f;
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++)
+            for (int k = 0; k < nz; k++) {
+                const float d = (ux[IjkToIdx(xd, { i + 1, j, k })] - ux[IjkToIdx(xd, { i, j, k })]
+                               + uy[IjkToIdx(yd, { i, j + 1, k })] - uy[IjkToIdx(yd, { i, j, k })]
+                               + uz[IjkToIdx(zd, { i, j, k + 1 })] - uz[IjkToIdx(zd, { i, j, k })]) * inv_dx;
+                best = std::max(best, std::fabs(d));
+            }
+    return best;
 }
 
 } // namespace selfcheck

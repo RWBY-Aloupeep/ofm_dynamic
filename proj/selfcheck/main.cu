@@ -144,13 +144,18 @@ struct RingParams {
     float x_start     = 0.30f;
 };
 
+// AMGPCG iterations per projection for every test. 15 is LFM Table 4's count
+// for the leapfrog ring (upstream OFM's own apps use 6); neither is a tolerance,
+// and the Stage A plume showed a long cycle needs more. --cg-iter overrides it.
+static int g_cg_iter = 15;
+
 int RunLeapfrogRings(int total_steps, int diag_every, const char* csv_path, RingParams rp, float dt, int reinit_every, int rk_order)
 {
     cudaStream_t stream = 0;
     selfcheck::SolverConfig config;
     config.tile_dim = { 32, 16, 16 }; // 256 x 128 x 128, matching LFM Table 4 for Figure 14
     config.len_y    = 1.0f;
-    config.cg_iter  = 15;             // LFM Table 4 reports 15 CG iterations for this case
+    config.cg_iter  = g_cg_iter;             // LFM Table 4 reports 15 CG iterations for this case
     config.reinit_every = reinit_every;
     config.rk_order     = rk_order;
 
@@ -350,7 +355,7 @@ int RunBurgersViscous(int total_steps, int diag_every, const char* csv_path, Bur
     selfcheck::SolverConfig config;
     config.tile_dim     = { res_tiles, res_tiles, res_tiles }; // res_tiles*8 cubed, unit cube
     config.len_y        = 1.0f;
-    config.cg_iter      = 15;
+    config.cg_iter      = g_cg_iter;
     config.reinit_every = reinit_every;
     config.rk_order     = rk_order;
 
@@ -499,7 +504,7 @@ int RunShear(int total_steps, int diag_every, const char* csv_path, selfcheck::S
     selfcheck::SolverConfig config;
     config.tile_dim     = { res_tiles, res_tiles, 2 };
     config.len_y        = 1.0f;
-    config.cg_iter      = 15;
+    config.cg_iter      = g_cg_iter;
     config.reinit_every = reinit_every;
     config.rk_order     = rk_order;
 
@@ -573,7 +578,7 @@ int RunAttribution(int total_steps, int diag_every, const char* csv_path, Burger
     selfcheck::SolverConfig config;
     config.tile_dim     = { res_tiles, res_tiles, res_tiles };
     config.len_y        = 1.0f;
-    config.cg_iter      = 15;
+    config.cg_iter      = g_cg_iter;
     config.reinit_every = reinit_every;
     config.rk_order     = rk_order;
 
@@ -704,7 +709,7 @@ int RunTiltingStretching(int res_tiles, float core, float circulation)
     selfcheck::SolverConfig config;
     config.tile_dim = { res_tiles, res_tiles, res_tiles };
     config.len_y    = 1.0f;
-    config.cg_iter  = 15;
+    config.cg_iter  = g_cg_iter;
 
     ofm::OFM solver;
     GPUTimer profiler(64);
@@ -778,7 +783,7 @@ int RunCoreRadii(int res_tiles, float core, float circulation, const char* csv_p
     selfcheck::SolverConfig config;
     config.tile_dim = { res_tiles, res_tiles, res_tiles };
     config.len_y    = 1.0f;
-    config.cg_iter  = 15;
+    config.cg_iter  = g_cg_iter;
 
     ofm::OFM solver;
     GPUTimer profiler(64);
@@ -934,7 +939,7 @@ int RunDamkohler(int res_tiles, float core, float circulation, const char* csv_p
     selfcheck::SolverConfig config;
     config.tile_dim = { res_tiles, res_tiles, res_tiles };
     config.len_y    = 1.0f;
-    config.cg_iter  = 15;
+    config.cg_iter  = g_cg_iter;
 
     ofm::OFM solver;
     GPUTimer profiler(64);
@@ -1060,6 +1065,11 @@ struct PlumeRun {
     // reaches reinit_every steps, whichever first. 0 = fixed cycles.
     float adapt_eps  = 0.0f;
     bool log_strain  = false;   // fixed cycles, but report the strain bound per cycle
+    float z_src      = 0.0f;    // > 0: elevated heat source centred here (localisation)
+    std::string profile;        // if set, write the source-column w/theta profile here at every diagnostic
+    int cg_iter      = 15;      // AMGPCG iterations per projection; the solver's fixed count, not a tolerance
+    bool log_div     = false;   // report max |div u| after the last projection at every diagnostic
+    float cg_tol     = 0.0f;    // > 0: solve the projection to this relative residual, cg_iter as the cap
 };
 
 // Verification of the open boundary on the translating Gaussian vortex column.
@@ -1082,11 +1092,12 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     selfcheck::SolverConfig config;
     config.tile_dim     = run.tiles;
     config.len_y        = run.len_y;
-    config.cg_iter      = 15;
+    config.cg_iter      = g_cg_iter;
     config.reinit_every = run.reinit_every;
     config.rk_order     = run.rk_order;
     config.max_levels   = run.max_levels;
     config.bfecc_clamp  = run.velocity_clamp;
+    config.cg_iter      = run.cg_iter;
 
     ofm::OFM solver;
     GPUTimer profiler(64);
@@ -1101,6 +1112,7 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     spec.src_y   = run.src_y;
     spec.cd_a    = run.cd_a;
     spec.h       = run.h;
+    spec.z_src   = run.z_src;
     // Cunningham's direct runs: conductivity from the viscosity through Pr.
     const float kappa = run.pr > 0.0f ? run.mu / (spec.rho * run.pr) : 0.0f;
 
@@ -1111,6 +1123,15 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     // advected only at a cycle start. A localisation switch, not a mode.
     solver.use_source_term_ = !run.direct_force;
     solver.viscosity_       = run.mu / spec.rho;
+    // The projection runs a fixed iteration count by default (SetupSolver
+    // sets solve_by_tol_ false). With --cg-tol it runs to a relative residual
+    // instead, capped at cg_iter, so a long cycle's larger gauge part gets
+    // the iterations it needs and a short one does not pay for them.
+    if (run.cg_tol > 0.0f) {
+        solver.amgpcg_.solve_by_tol_ = true;
+        solver.amgpcg_.rel_tol_      = run.cg_tol;
+        solver.amgpcg_.max_iter_     = run.cg_iter;
+    }
     if (run.direct_force && run.reinit_every != 1) {
         printf("--direct-force needs --reinit-every 1\n");
         return 1;
@@ -1212,6 +1233,16 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         }
     }
     bool slice_header = true;
+    FILE* prof = nullptr;
+    if (!run.profile.empty()) {
+        prof = fopen(run.profile.c_str(), "w");
+        if (!prof) {
+            printf("cannot open %s\n", run.profile.c_str());
+            fclose(csv);
+            return 1;
+        }
+        fprintf(prof, "# time z w_mean theta_mean w_max  over x in [300, 600] m, y in [450, 750] m\n");
+    }
     // Adaptive-reinitialization bookkeeping, reported per diagnostic.
     float strain_acc = 0.0f, smax_seen = 0.0f, strain_cycle_max = 0.0f;
     int cycles_done = 0, cycle_steps_sum = 0;
@@ -1287,6 +1318,8 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
                 selfcheck::WritePlumeSlice(slice, solver, *theta, run.plane_x, (step + 1) * run.dt, slice_header, stream);
                 slice_header = false;
             }
+            if (prof)
+                selfcheck::WritePlumeProfile(prof, solver, *theta, 300.0f, 600.0f, 450.0f, 750.0f, (step + 1) * run.dt);
             if (!std::isfinite(d.max_theta) || !std::isfinite(d.u_max) || d.u_max > 100.0f) {
                 printf("FAIL: the field is no longer finite (or u_max = %.1f m/s) at t = %.1f s\n", d.u_max, (step + 1) * run.dt);
                 fclose(csv);
@@ -1301,6 +1334,8 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
                    d.theta_width, d.theta_split, d.bifurcated ? "" : " [single lobe]",
                    d.theta_peak, d.theta_saddle,
                    d.best_theta_width, d.best_theta_split, d.best_bifurcated ? "" : " [single lobe]");
+            if (run.log_div)
+                printf("       max |div u| after projection: %.3e 1/s\n", selfcheck::MaxDivergence(solver, stream));
             if (run.adapt_eps > 0.0f || run.log_strain)
                 printf("       cycles: %d since last diagnostic, mean %.2f steps (%.3f s); max sum(S dt) per cycle %.4f; max S %.4f 1/s\n",
                        cycles_done, cycles_done ? double(cycle_steps_sum) / cycles_done : 0.0,
@@ -1345,7 +1380,7 @@ int RunOutflow(const OutflowRun& run, const char* csv_path)
     if (run.long_domain)
         config.tile_dim.x *= 2;
     config.len_y        = 1.0f;
-    config.cg_iter      = 15;
+    config.cg_iter      = g_cg_iter;
     config.reinit_every = run.reinit_every;
     config.rk_order     = run.rk_order;
 
@@ -1568,6 +1603,18 @@ int main(int argc, char** argv)
             plume.adapt_eps = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--log-strain")
             plume.log_strain = true;
+        else if (arg == "--z-src" && i + 1 < argc)
+            plume.z_src = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--profile" && i + 1 < argc)
+            plume.profile = argv[++i];
+        else if (arg == "--cg-iter" && i + 1 < argc) {
+            plume.cg_iter = std::atoi(argv[++i]);
+            g_cg_iter     = plume.cg_iter;
+        }
+        else if (arg == "--log-div")
+            plume.log_div = true;
+        else if (arg == "--cg-tol" && i + 1 < argc)
+            plume.cg_tol = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--max-levels" && i + 1 < argc)
             plume.max_levels = std::atoi(argv[++i]);
         else if (arg == "--sponge")

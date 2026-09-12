@@ -2202,3 +2202,53 @@ grows no gauge part to speak of, so 15 iterations were already converged
 there. The Stage 0 results stand; the projection count only bites where
 the impulse's gauge part is large, which the sheared buoyant plume is the
 first case here to have.
+
+### The residual-tolerance mode works, and costs 3-5x a fixed 60
+
+`stage_a_cgtol.sbatch`, weak case, 900 s, `/usr/bin/time` wall clock on
+one RTX 6000:
+
+| cycle | mode | max abs div u, late | peak dT at 900 s | wall |
+|---|---|---|---|---|
+| 1.25 s | fixed 15 | 0.38 | 9.9 (collapsed) | 175 s |
+| 1.25 s | fixed 60 | 0.06 | 14.75 | 382 s |
+| 1.25 s | fixed 120 | 0.03 | 14.75 | 677 s |
+| 1.25 s | tol 1e-2, cap 200 | 0.02 | 14.75 | 1130 s |
+| 1.25 s | tol 1e-3, cap 200 | 0.02 | 14.75 | 1136 s |
+| 1.25 s | tol 1e-4, cap 400 | 0.012 | 14.78 | 2131 s |
+| 0.25 s | fixed 15 | 0.06 | 14.76 | 239 s |
+| 0.25 s | tol 1e-3, cap 200 | 0.005 | 14.67 | 1811 s |
+
+The tolerance mode converges further than any fixed count tried, and the
+plume is the same one at every setting from fixed 60 on. But it is
+expensive: 1e-2 and 1e-3 cost the same and three times a fixed 60, which
+says the solver is running to its cap rather than stopping at the
+tolerance, and at `n` = 1 it costs eight times the fixed 15. The
+tolerance is applied to the squared residual (`tol = max(abs_tol_,
+rel_tol_ * initial_rTr)`, `amgpcg.cu`), and the per-iteration check
+synchronizes the host; which of the two makes it slow, or whether the
+AMG cycle stalls on this pure-Neumann problem after the first decade, is
+not investigated here. For now the criterion runs use a fixed count, 60 at
+the 1.25 s cycle and 120 at 2.5 s, with `--log-div` reporting what it
+leaves; the tolerance mode is the right design and the cost is a solver
+question to take up separately.
+
+### The six cases at the 1.25 s cycle with 120 iterations
+
+`CG=120 sbatch --array=6-11 stage_a_cg60.sbatch`. Against 60 iterations
+the splits move by -8 to +10 m, the peak anomalies by 0.1 K, and the
+residual halves (0.03 1/s):
+
+| `z0` | strong | weak | weak - strong |
+|---|---|---|---|
+| 50 m | 385.9 +- 0.3 | 276.3 +- 0.1 | -110 (389x sem) |
+| 100 m | 395.3 +- 0.7 | 339.7 +- 1.8 | -56 (28x) |
+| 150 m | 411.9 +- 2.5 | 403.4 +- 4.3 | -8.5 (1.7x) |
+
+Strong column flat and rising slightly (10.2x end to end), weak column
+rising steeply (29.6x), and at `z0` = 150 m the two sources are 1.7
+standard errors apart, which is not a difference. The paper's figure has
+the weak source 93 m wider there. Everything else about the two columns
+is the figure's own shape. This is the configuration the Stage A
+criteria are read on from here: the 1.25 s cycle, 120 iterations,
+residual 0.03 1/s, peak vorticity 1.8x the one-step scheme's.

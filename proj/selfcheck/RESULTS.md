@@ -1866,3 +1866,95 @@ is next, in order: localise the `n` > 1 buoyancy deficit (a body force
 confined to a few cells, in a case with a known answer); the lateral-face
 flux correction; the Boussinesq question, now aimed at the strong-source,
 deep-shear case; then the CVP attribution and the horseshoe vortex.
+
+### The collapse localised: it is the reinitialisation cycle's duration, not `n`, and not the force channel
+
+Three more rounds of one-change-at-a-time runs on the collapsing case
+(`z0` = 150 m, `Q0` = 0.5 kW/m^3), all to 1500 s, with two switches added to
+the driver for the purpose: `--h` (the heating's vertical decay scale) and
+`--no-velocity-clamp`, then `--direct-force`, which bypasses the impulse-form
+path integral and adds `dt*f` to the cycle-start velocity the way a
+velocity-form solver would (`n` = 1 only; the viscous channel goes with it).
+`stage_a_n5_locate{2,3,4}.sbatch`.
+
+| variant | cycle `n*dt` | peak dT at 1500 s | top | `w_max` | verdict |
+|---|---|---|---|---|---|
+| `n` = 1, `dt` = 0.25 (baseline) | 0.25 s | 14.8 | 635 | 5.8 | holds |
+| `n` = 2, `dt` = 0.25 | 0.5 s | 14.4 | 605 | 5.4 | holds |
+| `n` = 5, `dt` = 0.125 | 0.625 s | 12.6 | 625 | 5.3 | holds, slow drift |
+| `n` = 10, `dt` = 0.0625 | 0.625 s | 11.7 | 735 | 5.7 | holds |
+| `n` = 3, `dt` = 0.25 | 0.75 s | 12.0 | 445 | 4.1 | decays |
+| `n` = 5, `dt` = 0.25 | 1.25 s | 8.8 | 95 | 1.6 | collapses |
+| `n` = 2, `dt` = 0.625 | 1.25 s | 9.7 | 75 | 1.4 | collapses |
+| **`n` = 1, `dt` = 1.25** | 1.25 s | 10.1 | 85 | 1.3 | **collapses** |
+| `n` = 1, `dt` = 1.25, `mu` = 0 | 1.25 s | 12.4 | 185 | 3.4 | collapses |
+| **`n` = 1, `dt` = 1.25, direct force** | 1.25 s | 10.5 | 285 | 4.0 | **collapses** |
+| `n` = 1, `dt` = 0.25, direct force | 0.25 s | 14.9 | 655 | 6.2 | holds |
+| `n` = 5, `dt` = 0.25, velocity clamp off | 1.25 s | 8.9 | 95 | 2.0 | collapses |
+| `n` = 5, `dt` = 0.25, `h` = 50 m, `Q0` = 250 (same heat) | 1.25 s | 7.4 | 165 | 2.4 | collapses |
+| `n` = 5, `dt` = 0.25, `h` = 100 m, `Q0` = 125 (same heat) | 1.25 s | 4.8 | 265 | 2.7 | decays |
+| `n` = 1, `dt` = 0.25, `h` = 100 m, `Q0` = 125 | 0.25 s | 6.8 | 685 | 4.5 | holds |
+| `n` = 5, `dt` = 0.25, `Q0` = 750 | 1.25 s | 18.5 | 665 | 6.5 | mild decay |
+
+Read down the cycle column: everything at 0.625 s or less holds, 0.75 s
+decays, everything at 1.25 s collapses, whatever `n` is. `n` = 1 at
+`dt` = 1.25 collapses with no sub-steps, no leapfrog branch and no
+multi-step path integral in play at all. The direct-force run collapses
+too, so the loss is not in how the body force enters the impulse; the
+force channel at `dt` = 0.25 agrees with the impulse route to within what
+dropping the viscous term explains (peak `|omega_z|` 0.090 against 0.065,
+the same 30-40% the `mu` = 0 rows of the ladder show). A thicker heating
+layer at the same total heat does not help, which retires the thin-source
+hypothesis the previous section proposed; the earlier "h = 100 holds" was
+the 4x extra heat, since `Q = Q0 exp(-z/h)` integrates to `Q0*h`. The clamp
+is not it. `Q0` = 750 only drifts, so at a 1.25 s cycle the threshold sits
+between 500 and 750 W/m^3.
+
+What is left is the flow-map transport and reconstruction over the cycle
+itself: the pullback through `T` and `psi`, and the BFECC pass, over an
+interval the weak plume cannot survive. That is the "numerical instability
+inherent in long-time flow map evolution" OFM gives as its reason for
+reinitialising every step (OFM Sec. 3.2); on this configuration a 1.25 s map
+is already long. Why a buoyant plume in shear degrades the map that fast,
+and why the weak one goes first, is not localised further here: it needs a
+case with a known answer, and none of the analytic ones so far carries a
+body force in a wall-bounded shear flow.
+
+**The practical consequence.** The lever that lowers the floor is the
+cycle's duration `n*dt`, and it is capped here at about 0.6 s. That still
+buys a factor of 2.5 over `n` = 1, `dt` = 0.25: `n` = 5 at `dt` = 0.125
+(or `n` = 10 at `dt` = 0.0625), for about 1.5-2x the wall clock per unit of
+simulated time. Whether the orderings read the same there is the next
+table. The mild drift at 0.625 s (peak dT 12.6 against 14.8, though with a
+20% higher peak vorticity) is recorded and not explained.
+
+### The six cases at `n` = 5, `dt` = 0.125: the orderings survive, the thermal field does not quite
+
+`stage_a_n5_dt0125.sbatch`, 1600 s, last 1000 s averaged, otherwise the
+criterion configuration. `theta_split` in metres; `n` = 1 in brackets.
+
+| `z0` | `Q0` = 1 kW/m^3 | `Q0` = 0.5 kW/m^3 | peak dT strong / weak (K) | peak abs `omega_z` strong / weak |
+|---|---|---|---|---|
+| 50 m | 417.3 +- 1.4 (368.8) | 286.5 +- 0.6 (295.3) | 22.1 / 12.0 (23.5 / 13.1) | 0.137 / 0.081 (0.094 / 0.062) |
+| 100 m | 509.4 +- 3.4 (439.7) | 290.4 +- 0.7 (314.5) | 23.0 / 12.4 (24.6 / 14.2) | 0.139 / 0.080 (0.095 / 0.063) |
+| 150 m | 583.1 +- 9.2 (526.5) | 303.2 +- 1.7 (348.5) | 23.3 / 12.8 (24.8 / 14.8) | 0.140 / 0.080 (0.096 / 0.065) |
+
+Both orderings read the same: deeper shear -> wider, monotone in both
+columns (17.9x and 9.3x sem end to end); weaker -> wider, opposite at every
+`z0` (30-87x sem). All six bifurcate (rate 0.91-1.00). Peak vorticity is
+45% higher on every row, which is the floor coming down by the expected
+2.5x in cycle duration.
+
+But the peak anomaly is 1.5-2 K lower on every row, strong and weak alike
+(6-13%), the strong splits are 40-70 m wider and the weak splits 5-45 m
+narrower than at `n` = 1. Set beside the localisation table, the weak
+case's peak anomaly falls monotonically with the cycle's duration -- 14.8 K
+at 0.25 s, 12.6 at 0.625 s, 8.8 at 1.25 s -- so the collapse is not a
+threshold phenomenon but a continuous loss that the 0.625 s cycle already
+pays a small dose of. Which of the two settings is closer to the truth
+cannot be read from the plume alone; the paper's figure is a scan of a
+different solver. The criteria therefore stay at `n` = 1, `dt` = 0.25, and
+`n` = 5, `dt` = 0.125 is recorded as what the floor lever costs: 45% more
+vorticity, 6-13% less thermal anomaly, orderings intact. Understanding the
+long-map loss on a case with a known answer is the first item in the
+queue; until then the floor is what `n` = 1 gives.

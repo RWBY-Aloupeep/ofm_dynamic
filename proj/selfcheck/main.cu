@@ -973,6 +973,9 @@ struct PlumeRun {
     int max_levels   = 0;      // multigrid level cap, 0 = automatic
     std::string slice;         // if set, append the plane_x theta section here at every diagnostic
     float cd_a       = 0.025f; // canopy drag Cd*a in the lowest cell level; 0 turns the drag off
+    float h          = 25.0f;  // m, vertical decay scale of the heating; the paper's value
+    bool velocity_clamp = true; // the solver's BFECC clamp on the reconstructed velocity
+    bool direct_force = false;  // add dt*f to the velocity directly instead of the impulse path integral (n = 1)
 };
 
 // Verification of the open boundary on the translating Gaussian vortex column.
@@ -999,6 +1002,7 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     config.reinit_every = run.reinit_every;
     config.rk_order     = run.rk_order;
     config.max_levels   = run.max_levels;
+    config.bfecc_clamp  = run.velocity_clamp;
 
     ofm::OFM solver;
     GPUTimer profiler(64);
@@ -1012,11 +1016,21 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     spec.sponge  = run.sponge;
     spec.src_y   = run.src_y;
     spec.cd_a    = run.cd_a;
+    spec.h       = run.h;
     // Cunningham's direct runs: conductivity from the viscosity through Pr.
     const float kappa = run.pr > 0.0f ? run.mu / (spec.rho * run.pr) : 0.0f;
 
-    solver.use_source_term_ = true;
+    // --direct-force bypasses the impulse-form path integral: the buoyancy and
+    // drag are added to the cycle-start velocity as dt*f before each advance,
+    // the way a velocity-form solver would, and the viscous term is dropped
+    // with the source channel. n = 1 only, since init_u_ is the velocity being
+    // advected only at a cycle start. A localisation switch, not a mode.
+    solver.use_source_term_ = !run.direct_force;
     solver.viscosity_       = run.mu / spec.rho;
+    if (run.direct_force && run.reinit_every != 1) {
+        printf("--direct-force needs --reinit-every 1\n");
+        return 1;
+    }
 
     const float dx = solver.dx_;
     const int3 td  = solver.tile_dim_;
@@ -1125,6 +1139,12 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         // its second-order transport. Neither reads init_u_, which is what lets
         // this run at n > 1.
         selfcheck::SetBuoyancyAndDragAsync(solver, *theta, spec, selfcheck::PlumeVelocityBefore(solver), run.dt, stream);
+        if (run.direct_force) {
+            const int3 xd = { td.x + 1, td.y, td.z }, yd = { td.x, td.y + 1, td.z }, zd = { td.x, td.y, td.z + 1 };
+            ofm::AddFieldsAsync(*solver.init_u_x_, xd, *solver.init_u_x_, *solver.f_x_, run.dt, stream);
+            ofm::AddFieldsAsync(*solver.init_u_y_, yd, *solver.init_u_y_, *solver.f_y_, run.dt, stream);
+            ofm::AddFieldsAsync(*solver.init_u_z_, zd, *solver.init_u_z_, *solver.f_z_, run.dt, stream);
+        }
         solver.AdvanceAsync(run.dt, stream);
         const selfcheck::PlumeVelocity step_u = selfcheck::PlumeVelocityAfter(solver);
         selfcheck::AdvectThetaAsync(*next, theta_fwd, theta_err, td, *theta, step_u, dx, run.dt,
@@ -1421,6 +1441,12 @@ int main(int argc, char** argv)
             plume.slice = argv[++i];
         else if (arg == "--cd-a" && i + 1 < argc)
             plume.cd_a = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--h" && i + 1 < argc)
+            plume.h = static_cast<float>(std::atof(argv[++i]));
+        else if (arg == "--no-velocity-clamp")
+            plume.velocity_clamp = false;
+        else if (arg == "--direct-force")
+            plume.direct_force = true;
         else if (arg == "--max-levels" && i + 1 < argc)
             plume.max_levels = std::atoi(argv[++i]);
         else if (arg == "--sponge")

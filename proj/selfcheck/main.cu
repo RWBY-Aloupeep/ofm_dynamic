@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -1056,6 +1057,13 @@ struct PlumeRun {
     float src_y      = 600.0f; // m, heat-source centre; move it with the domain when widening
     int max_levels   = 0;      // multigrid level cap, 0 = automatic
     std::string slice;         // if set, append the plane_x theta section here at every diagnostic
+    std::string slice_xz;      // if set, append the centreline x-z section (theta, u, w) here at every diagnostic
+    std::string probes;        // if set, write u v w theta at a fixed set of wake probes every step to this file
+    bool cg_verbose  = false;  // print the AMGPCG residual per iteration for the first few projections
+    bool face_projected = false; // convective faces at Projection 2 read the last projected velocity (--face-projected)
+    int  cg_restart  = 0;      // restart the CG recurrence every this many iterations (--cg-restart K)
+    bool cg_flexible = false;  // flexible CG, Polak-Ribiere beta (--cg-flexible)
+    int  amg_bottom  = 0;      // Gauss-Seidel sweeps on the coarsest level, 0 = the solver's 10 (--amg-bottom N)
     float cd_a       = 0.025f; // canopy drag Cd*a in the lowest cell level; 0 turns the drag off
     float h          = 25.0f;  // m, vertical decay scale of the heating; the paper's value
     bool velocity_clamp = true; // the solver's BFECC clamp on the reconstructed velocity
@@ -1086,6 +1094,113 @@ struct OutflowRun {
     float margin     = 0.2f;          // interior = x < x_out - margin, four core radii
 };
 
+
+// Is the multigrid preconditioner a symmetric positive-definite operator on
+// the plume's Poisson problem? Conjugate gradient assumes it. With two random
+// zero-mean vectors r1, r2 the test compares r2 . (M r1) with r1 . (M r2)
+// (equal for a symmetric M), checks r . (M r) > 0, and does the same for the
+// Laplacian A. A relative asymmetry at the level of single precision (1e-6)
+// is symmetric; 1e-2 and above is not, and then the conjugate-gradient
+// recurrence has no convergence theory on this problem.
+int RunAmgSymmetry(const PlumeRun& run)
+{
+    cudaStream_t stream = 0;
+    selfcheck::SolverConfig config;
+    config.tile_dim     = run.tiles;
+    config.len_y        = run.len_y;
+    config.cg_iter      = run.cg_iter;
+    config.reinit_every = run.reinit_every;
+    config.max_levels   = run.max_levels;
+    ofm::OFM solver;
+    GPUTimer profiler(64);
+    selfcheck::SetupSolver(solver, config, profiler, stream);
+    selfcheck::PlumeSpec spec;
+    spec.outflow = run.outflow;
+    selfcheck::SetPlumeBcAsync(solver, spec, stream);
+    cudaStreamSynchronize(stream);
+    ofm::AMGPCG& amg = solver.amgpcg_;
+    if (run.amg_bottom > 0)
+        amg.bottom_smoothing_ = run.amg_bottom;
+    const int n = amg.b_->size_;
+    {
+        const int3 ct = amg.poisson_vector_[amg.level_num_ - 1].tile_dim_;
+        printf("amg-sym: coarsest level %d x %d x %d tiles = %d cells, solved by %d Gauss-Seidel sweeps\n",
+               ct.x, ct.y, ct.z, ct.x * ct.y * ct.z * 512, amg.bottom_smoothing_);
+    }
+    printf("amg-sym: %d x %d x %d tiles, %d cells, %d levels, pure_neumann %d, bottom smoothing %d\n",
+           run.tiles.x, run.tiles.y, run.tiles.z, n, amg.level_num_, int(amg.pure_neumann_), amg.bottom_smoothing_);
+
+    std::mt19937 rng(12345);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    std::vector<std::vector<float>> r(2, std::vector<float>(n)), z(2, std::vector<float>(n)), a(2, std::vector<float>(n));
+    for (int k = 0; k < 2; k++) {
+        double mean = 0.0;
+        for (int i = 0; i < n; i++) { r[k][i] = gauss(rng); mean += r[k][i]; }
+        mean /= n;
+        for (int i = 0; i < n; i++) r[k][i] -= float(mean);
+    }
+    auto dot = [&](const std::vector<float>& x, const std::vector<float>& y) {
+        double s = 0.0;
+        for (int i = 0; i < n; i++) s += double(x[i]) * y[i];
+        return s;
+    };
+    for (int k = 0; k < 2; k++) {
+        // z = M r: one V-cycle from x = 0 on b = r (what each CG iteration applies)
+        std::copy(r[k].begin(), r[k].end(), amg.b_->host_ptr_);
+        amg.b_->HostToDevAsync(stream);
+        amg.poisson_vector_[0].x_->ClearDevAsync(stream);
+        amg.VcycleDotAsync(stream);
+        amg.poisson_vector_[0].x_->DevToHostAsync(stream);
+        cudaStreamSynchronize(stream);
+        std::copy(amg.poisson_vector_[0].x_->host_ptr_, amg.poisson_vector_[0].x_->host_ptr_ + n, z[k].begin());
+        // a = A r
+        std::copy(r[k].begin(), r[k].end(), amg.p_->host_ptr_);
+        amg.p_->HostToDevAsync(stream);
+        amg.poisson_vector_[0].LaplacianDotAsync(amg.Ap_, amg.dot_buffer_, amg.p_, stream);
+        amg.Ap_->DevToHostAsync(stream);
+        cudaStreamSynchronize(stream);
+        std::copy(amg.Ap_->host_ptr_, amg.Ap_->host_ptr_ + n, a[k].begin());
+    }
+    const double m12 = dot(r[1], z[0]), m21 = dot(r[0], z[1]);
+    const double a12 = dot(r[1], a[0]), a21 = dot(r[0], a[1]);
+    const double m11 = dot(r[0], z[0]), m22 = dot(r[1], z[1]);
+    const double a11 = dot(r[0], a[0]), a22 = dot(r[1], a[1]);
+    double asum = 0.0;
+    for (int i = 0; i < n; i++) asum += a[0][i];
+    printf("  A: r2.A r1 = %.6e, r1.A r2 = %.6e, asymmetry %.2e; r1.A r1 = %.3e, r2.A r2 = %.3e; sum(A r1) = %.3e\n",
+           a12, a21, std::fabs(a12 - a21) / std::max(std::fabs(a12), std::fabs(a21)), a11, a22, asum);
+    printf("  M: r2.M r1 = %.6e, r1.M r2 = %.6e, asymmetry %.2e; r1.M r1 = %.3e, r2.M r2 = %.3e\n",
+           m12, m21, std::fabs(m12 - m21) / std::max(std::fabs(m12), std::fabs(m21)), m11, m22);
+    // How much of the residual one V-cycle removes on a random right-hand side,
+    // and on a smooth one (a single low mode), as a residual norm ratio.
+    for (int variant = 0; variant < 4; variant++) {
+        const int smooth = variant / 2;
+        amg.flexible_    = (variant % 2 == 1);
+        std::vector<float> b(n);
+        if (smooth) {
+            const int3 td = solver.tile_dim_;
+            const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+            for (int i = 0; i < nx; i++)
+                for (int j = 0; j < ny; j++)
+                    for (int kk = 0; kk < nz; kk++)
+                        b[ofm::IjkToIdx(td, { i, j, kk })] = std::cos(3.14159265f * (i + 0.5f) / nx) * std::cos(3.14159265f * (j + 0.5f) / ny);
+        } else {
+            b = r[0];
+        }
+        std::copy(b.begin(), b.end(), amg.b_->host_ptr_);
+        amg.b_->HostToDevAsync(stream);
+        amg.x_->ClearDevAsync(stream);
+        amg.solve_by_tol_ = true;
+        amg.rel_tol_      = 1e-30f;
+        amg.iter_info_    = true;
+        amg.max_iter_     = run.cg_iter;
+        printf("  %s CG on a %s right-hand side, %d iterations:\n", amg.flexible_ ? "flexible" : "standard", smooth ? "smooth" : "random", run.cg_iter);
+        amg.SolveAsync(stream);
+        cudaStreamSynchronize(stream);
+    }
+    return 0;
+}
+
 int RunPlume(const PlumeRun& run, const char* csv_path)
 {
     cudaStream_t stream = 0;
@@ -1107,6 +1222,7 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
     spec.z0      = run.z0;
     spec.q0      = run.q0;
     spec.outflow = run.outflow;
+    spec.conv_face_projected = run.face_projected;
     spec.pr      = run.pr;
     spec.sponge  = run.sponge;
     spec.src_y   = run.src_y;
@@ -1233,6 +1349,50 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
         }
     }
     bool slice_header = true;
+    FILE* slice_xz = nullptr;
+    if (!run.slice_xz.empty()) {
+        slice_xz = fopen(run.slice_xz.c_str(), "wb");
+        if (!slice_xz) {
+            printf("cannot open %s\n", run.slice_xz.c_str());
+            fclose(csv);
+            return 1;
+        }
+    }
+    bool slice_xz_header = true;
+    FILE* probe_file = nullptr;
+    selfcheck::ProbeSet probes;
+    if (!run.probes.empty()) {
+        // Wake probes on the centreline: x downstream of the source (450 m) at
+        // three heights, plus two off-centre pairs at x = 1000 m to see the
+        // alternation of a shed pair. y = src_y is the centreline.
+        std::vector<float3> pos;
+        for (float x : { 700.0f, 900.0f, 1100.0f, 1300.0f })
+            for (float z : { 55.0f, 155.0f, 305.0f })
+                pos.push_back({ x, run.src_y, z });
+        for (float dy : { -150.0f, 150.0f })
+            for (float z : { 55.0f, 155.0f })
+                pos.push_back({ 1000.0f, run.src_y + dy, z });
+        selfcheck::SetupProbes(probes, solver, pos);
+        probe_file = fopen(run.probes.c_str(), "w");
+        if (!probe_file) {
+            printf("cannot open %s\n", run.probes.c_str());
+            fclose(csv);
+            return 1;
+        }
+        fprintf(probe_file, "# time");
+        for (size_t q = 0; q < pos.size(); q++)
+            fprintf(probe_file, " u%zu v%zu w%zu th%zu", q, q, q, q);
+        fprintf(probe_file, "\n# probes (x y z):");
+        for (const float3& q : pos)
+            fprintf(probe_file, " (%.0f %.0f %.0f)", q.x, q.y, q.z);
+        fprintf(probe_file, "\n");
+    }
+    if (run.cg_verbose)
+        solver.amgpcg_.iter_info_ = true;
+    solver.amgpcg_.restart_every_ = run.cg_restart;
+    solver.amgpcg_.flexible_      = run.cg_flexible;
+    if (run.amg_bottom > 0)
+        solver.amgpcg_.bottom_smoothing_ = run.amg_bottom;
     FILE* prof = nullptr;
     if (!run.profile.empty()) {
         prof = fopen(run.profile.c_str(), "w");
@@ -1269,6 +1429,15 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
                                     run.theta_bfecc, run.theta_clamp, stream);
         std::swap(theta, next);
         selfcheck::AmbientInflowThetaAsync(*theta, td, step_u, run.outflow, dx, run.dt, stream);
+        if (probe_file) {
+            selfcheck::SampleProbes(probes, solver, step_u, *theta, stream);
+            fprintf(probe_file, "%.3f", (step + 1) * run.dt);
+            for (float v : probes.h_buf)
+                fprintf(probe_file, " %.5f", v);
+            fprintf(probe_file, "\n");
+        }
+        if (run.cg_verbose && step == 40)
+            solver.amgpcg_.iter_info_ = false;
         // Operator split: diffusion after the advection, over the same step.
         if (kappa > 0.0f) {
             selfcheck::DiffuseThetaAsync(*next, *theta, td, kappa, dx, run.dt, stream);
@@ -1320,7 +1489,14 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
             }
             if (prof)
                 selfcheck::WritePlumeProfile(prof, solver, *theta, 300.0f, 600.0f, 450.0f, 750.0f, (step + 1) * run.dt);
-            if (!std::isfinite(d.max_theta) || !std::isfinite(d.u_max) || d.u_max > 100.0f) {
+            if (slice_xz) {
+                selfcheck::WritePlumeSliceXZ(slice_xz, solver, *theta, run.src_y, (step + 1) * run.dt, slice_xz_header);
+                slice_xz_header = false;
+            }
+            // The max reductions use fmaxf, which drops NaN, so a field that
+            // has gone non-finite reports every maximum as 0 rather than NaN;
+            // in a 4.5 m/s wind u_max = 0 after the first step is that case.
+            if (!std::isfinite(d.max_theta) || !std::isfinite(d.u_max) || d.u_max > 100.0f || (step > 0 && d.u_max == 0.0f)) {
                 printf("FAIL: the field is no longer finite (or u_max = %.1f m/s) at t = %.1f s\n", d.u_max, (step + 1) * run.dt);
                 fclose(csv);
                 return 1;
@@ -1334,8 +1510,14 @@ int RunPlume(const PlumeRun& run, const char* csv_path)
                    d.theta_width, d.theta_split, d.bifurcated ? "" : " [single lobe]",
                    d.theta_peak, d.theta_saddle,
                    d.best_theta_width, d.best_theta_split, d.best_bifurcated ? "" : " [single lobe]");
-            if (run.log_div)
-                printf("       max |div u| after projection: %.3e 1/s\n", selfcheck::MaxDivergence(solver, stream));
+            if (run.log_div) {
+                const selfcheck::DivStats ds = selfcheck::DivergenceStats(solver, stream);
+                printf("       max |div u| after projection: %.3e 1/s at cell (%d %d %d) = (%.0f %.0f %.0f) m; "
+                       "rms %.3e, interior rms %.3e, l2 %.3e, boundary-layer share %.3f, mean %+.3e, rms about the mean %.3e\n",
+                       ds.max, ds.at.x, ds.at.y, ds.at.z,
+                       (ds.at.x + 0.5f) * dx, (ds.at.y + 0.5f) * dx, (ds.at.z + 0.5f) * dx,
+                       ds.rms, ds.rms_interior, ds.l2, ds.boundary_share, ds.mean, ds.rms_zero_mean);
+            }
             if (run.adapt_eps > 0.0f || run.log_strain)
                 printf("       cycles: %d since last diagnostic, mean %.2f steps (%.3f s); max sum(S dt) per cycle %.4f; max S %.4f 1/s\n",
                        cycles_done, cycles_done ? double(cycle_steps_sum) / cycles_done : 0.0,
@@ -1593,6 +1775,20 @@ int main(int argc, char** argv)
             plume.src_y = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--slice" && i + 1 < argc)
             plume.slice = argv[++i];
+        else if (arg == "--slice-xz" && i + 1 < argc)
+            plume.slice_xz = argv[++i];
+        else if (arg == "--probes" && i + 1 < argc)
+            plume.probes = argv[++i];
+        else if (arg == "--cg-verbose")
+            plume.cg_verbose = true;
+        else if (arg == "--face-projected")
+            plume.face_projected = true;
+        else if (arg == "--cg-restart" && i + 1 < argc)
+            plume.cg_restart = std::atoi(argv[++i]);
+        else if (arg == "--cg-flexible")
+            plume.cg_flexible = true;
+        else if (arg == "--amg-bottom" && i + 1 < argc)
+            plume.amg_bottom = std::atoi(argv[++i]);
         else if (arg == "--cd-a" && i + 1 < argc)
             plume.cd_a = static_cast<float>(std::atof(argv[++i]));
         else if (arg == "--h" && i + 1 < argc)
@@ -1698,6 +1894,8 @@ int main(int argc, char** argv)
         return RunPlume(plume, csv_path.c_str());
     }
 
+    if (test == "amg-sym")
+        return RunAmgSymmetry(plume);
     if (test == "shear") {
         selfcheck::ShearVortexSpec sv;
         sv.shear       = shear_rate;

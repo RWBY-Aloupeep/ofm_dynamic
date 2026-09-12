@@ -332,7 +332,13 @@ void OFM::ReinitAsync(float _dt, cudaStream_t _stream)
 
     {
         CUDA_PROFILE_SCOPE(*profiler_, _stream, "Projection 2");
+        if (convective_face_from_projected_ && cycle_len_ > 0) {
+            conv_face_src_[0] = mid_u_x_[cycle_len_ - 1].get();
+            conv_face_src_[1] = mid_u_y_[cycle_len_ - 1].get();
+            conv_face_src_[2] = mid_u_z_[cycle_len_ - 1].get();
+        }
         ProjectAsync(_stream);
+        conv_face_src_[0] = conv_face_src_[1] = conv_face_src_[2] = nullptr;
     }
 
     init_u_x_.swap(tmp_u_x_);
@@ -417,7 +423,8 @@ void OFM::ProjectAsync(cudaStream_t _stream)
         DHMemory<float>* tmp_u[3]  = { tmp_u_x_.get(), tmp_u_y_.get(), tmp_u_z_.get() };
         for (int f = 0; f < 6; f++)
             if (convective_face_[f])
-                ConvectiveFaceUpdateAsync(*bc_val[f / 2], *tmp_u[f / 2], tile_dim_, f / 2, f % 2, _stream);
+                ConvectiveFaceUpdateAsync(*bc_val[f / 2], conv_face_src_[f / 2] ? *conv_face_src_[f / 2] : *tmp_u[f / 2],
+                                          tile_dim_, f / 2, f % 2, _stream);
         bool any_absorb = false;
         for (int f = 0; f < 6; f++)
             any_absorb = any_absorb || flux_correct_face_[f];

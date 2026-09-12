@@ -1232,6 +1232,7 @@ void SetPlumeBcAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t strea
     for (int f = 0; f < 6; f++)
         solver.flux_correct_face_[f] = false;
     solver.flux_correct_face_[1] = (spec.outflow == 5);
+    solver.convective_face_from_projected_ = spec.conv_face_projected;
 
     ofm::SetCoefByIsBcAsync(*(solver.amgpcg_.poisson_vector_[0].is_dof_),
                             *(solver.amgpcg_.poisson_vector_[0].a_diag_),
@@ -2118,6 +2119,124 @@ float MaxDivergence(ofm::OFM& solver, cudaStream_t stream)
                 best = std::max(best, std::fabs(d));
             }
     return best;
+}
+
+DivStats DivergenceStats(ofm::OFM& solver, cudaStream_t stream)
+{
+    const int3 td = solver.tile_dim_;
+    const int3 xd = { td.x + 1, td.y, td.z }, yd = { td.x, td.y + 1, td.z }, zd = { td.x, td.y, td.z + 1 };
+    solver.init_u_x_->DevToHostAsync(stream);
+    solver.init_u_y_->DevToHostAsync(stream);
+    solver.init_u_z_->DevToHostAsync(stream);
+    cudaStreamSynchronize(stream);
+    const float* ux = solver.init_u_x_->host_ptr_;
+    const float* uy = solver.init_u_y_->host_ptr_;
+    const float* uz = solver.init_u_z_->host_ptr_;
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    const float inv_dx = 1.0f / solver.dx_;
+    DivStats s;
+    double sum = 0.0, sum_int = 0.0, sum_bnd = 0.0, sum1 = 0.0;
+    long n_int = 0;
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++)
+            for (int k = 0; k < nz; k++) {
+                const float d = (ux[IjkToIdx(xd, { i + 1, j, k })] - ux[IjkToIdx(xd, { i, j, k })]
+                               + uy[IjkToIdx(yd, { i, j + 1, k })] - uy[IjkToIdx(yd, { i, j, k })]
+                               + uz[IjkToIdx(zd, { i, j, k + 1 })] - uz[IjkToIdx(zd, { i, j, k })]) * inv_dx;
+                const double d2 = double(d) * d;
+                sum += d2;
+                sum1 += d;
+                const bool bnd = i == 0 || j == 0 || k == 0 || i == nx - 1 || j == ny - 1 || k == nz - 1;
+                const bool interior = i >= 2 && j >= 2 && k >= 2 && i < nx - 2 && j < ny - 2 && k < nz - 2;
+                if (bnd) sum_bnd += d2;
+                if (interior) { sum_int += d2; n_int++; }
+                if (std::fabs(d) > s.max) { s.max = std::fabs(d); s.at = { i, j, k }; }
+            }
+    const double n_all = double(nx) * ny * nz;
+    s.l2 = std::sqrt(sum);
+    s.rms = float(std::sqrt(sum / n_all));
+    s.mean = sum1 / n_all;
+    s.rms_zero_mean = float(std::sqrt(std::max(0.0, sum / n_all - s.mean * s.mean)));
+    s.rms_interior = n_int ? float(std::sqrt(sum_int / n_int)) : 0.0f;
+    s.boundary_share = sum > 0.0 ? sum_bnd / sum : 0.0;
+    return s;
+}
+
+
+void WritePlumeSliceXZ(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
+                       float plane_y, float time, bool header)
+{
+    const int3 td    = solver.tile_dim_;
+    const float dx   = solver.dx_;
+    const float3 org = solver.grid_origin_;
+    const int nx = td.x * 8, ny = td.y * 8, nz = td.z * 8;
+    int jp = static_cast<int>(std::lround((plane_y - org.y) / dx - 0.5f));
+    jp = std::max(0, std::min(ny - 1, jp));
+    if (header) {
+        const char magic[8] = { 'O', 'F', 'M', 'S', 'L', 'X', 'Z', '\0' };
+        fwrite(magic, 1, 8, f);
+        const int32_t dims[2] = { nx, nz };
+        fwrite(dims, sizeof(int32_t), 2, f);
+        const float geo[4] = { dx, org.x + 0.5f * dx, org.z + 0.5f * dx, org.y + (jp + 0.5f) * dx };
+        fwrite(geo, sizeof(float), 4, f);
+    }
+    fwrite(&time, sizeof(float), 1, f);
+    const float* th  = theta.host_ptr_;
+    const float3* uc = solver.u_->host_ptr_;
+    std::vector<float> row(nz);
+    for (int pass = 0; pass < 3; pass++)
+        for (int i = 0; i < nx; i++) {
+            for (int k = 0; k < nz; k++) {
+                const int id = IjkToIdx(td, { i, jp, k });
+                row[k] = pass == 0 ? th[id] : pass == 1 ? uc[id].x : uc[id].z;
+            }
+            fwrite(row.data(), sizeof(float), nz, f);
+        }
+    fflush(f);
+}
+
+
+__global__ void ProbeGatherKernel(float* out, const int3* cells, int n, int3 td,
+                                  const float* ux, const float* uy, const float* uz, const float* th)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int3 c = cells[i];
+    const int3 xd = { td.x + 1, td.y, td.z }, yd = { td.x, td.y + 1, td.z }, zd = { td.x, td.y, td.z + 1 };
+    out[4 * i + 0] = 0.5f * (ux[IjkToIdx(xd, c)] + ux[IjkToIdx(xd, { c.x + 1, c.y, c.z })]);
+    out[4 * i + 1] = 0.5f * (uy[IjkToIdx(yd, c)] + uy[IjkToIdx(yd, { c.x, c.y + 1, c.z })]);
+    out[4 * i + 2] = 0.5f * (uz[IjkToIdx(zd, c)] + uz[IjkToIdx(zd, { c.x, c.y, c.z + 1 })]);
+    out[4 * i + 3] = th[IjkToIdx(td, c)];
+}
+
+void SetupProbes(ProbeSet& p, ofm::OFM& solver, const std::vector<float3>& positions)
+{
+    const int3 td = solver.tile_dim_;
+    const float dx = solver.dx_;
+    const float3 org = solver.grid_origin_;
+    p.cells.clear();
+    for (const float3& q : positions) {
+        int3 c = { int((q.x - org.x) / dx), int((q.y - org.y) / dx), int((q.z - org.z) / dx) };
+        c.x = std::max(0, std::min(td.x * 8 - 1, c.x));
+        c.y = std::max(0, std::min(td.y * 8 - 1, c.y));
+        c.z = std::max(0, std::min(td.z * 8 - 1, c.z));
+        p.cells.push_back(c);
+    }
+    cudaMalloc(&p.d_buf, (4 * p.cells.size() + p.cells.size() * 3 + 8) * sizeof(float));
+    // cells stored after the sample buffer, as int3 -> reuse the same allocation tail
+    cudaMemcpy(reinterpret_cast<int3*>(p.d_buf + 4 * p.cells.size()), p.cells.data(), p.cells.size() * sizeof(int3), cudaMemcpyHostToDevice);
+    p.h_buf.assign(4 * p.cells.size(), 0.0f);
+}
+
+void SampleProbes(ProbeSet& p, ofm::OFM& solver, const PlumeVelocity& u, ofm::DHMemory<float>& theta, cudaStream_t stream)
+{
+    const int n = int(p.cells.size());
+    if (!n) return;
+    const int3* cells = reinterpret_cast<const int3*>(p.d_buf + 4 * n);
+    ProbeGatherKernel<<<(n + 127) / 128, 128, 0, stream>>>(p.d_buf, cells, n, solver.tile_dim_,
+                                                             u.x->dev_ptr_, u.y->dev_ptr_, u.z->dev_ptr_, theta.dev_ptr_);
+    cudaMemcpyAsync(p.h_buf.data(), p.d_buf, 4 * n * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
 }
 
 } // namespace selfcheck

@@ -298,6 +298,9 @@ struct PlumeSpec {
     // 3 and 4 make the same faces convective. The three-face set is the one
     // Cunningham put their outflow condition on.
     int outflow  = 0;
+    // Convective faces at the reinitialization's projection read the last
+    // projected velocity, not the impulse-reconstructed one (see ofm.h).
+    bool conv_face_projected = false;
     // Thermal diffusion of theta at kappa = mu / (rho Pr). Cunningham's direct
     // runs tie the conductivity to the viscosity through Pr = 0.7; 0 turns the
     // term off, which is what the first two cuts ran.
@@ -530,8 +533,46 @@ float MaxVelocityGradient(ofm::OFM& solver, const PlumeVelocity& u, cudaStream_t
 void WritePlumeProfile(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
                        float x0, float x1, float y0, float y1, float time);
 
+// The x-z section through the plume's centreline (the j plane nearest
+// plane_y): theta anomaly, cell-centred u and w, so the transverse (omega_y)
+// structure on the plume's upstream face can be drawn. Layout: once, the
+// header "OFMSLXZ", int32 nx, int32 nz, float dx, float x0, float z0 (cell
+// centres), float y actually used; then per call float time followed by
+// theta, u, w, each nx*nz floats, i outer, k inner. Call after MeasurePlume,
+// which leaves the host copies current.
+void WritePlumeSliceXZ(FILE* f, ofm::OFM& solver, ofm::DHMemory<float>& theta,
+                       float plane_y, float time, bool header);
+
+// Point probes for time series: u, v, w (from the staggered faces) and theta
+// at each of n cell positions, gathered on the device into one small buffer
+// and copied back, so they can be sampled every step. For the shedding
+// criterion: a wake probe's v(t) spectrum gives the shedding frequency.
+struct ProbeSet {
+    std::vector<int3> cells;
+    float* d_buf = nullptr;     // 4 floats per probe
+    std::vector<float> h_buf;
+};
+void SetupProbes(ProbeSet& p, ofm::OFM& solver, const std::vector<float3>& positions);
+// Reads u from the given velocity buffers (init_u_ at a cycle start, mid_u_ otherwise).
+void SampleProbes(ProbeSet& p, ofm::OFM& solver, const PlumeVelocity& u, ofm::DHMemory<float>& theta, cudaStream_t stream);
+
 // Largest |div u| over the cells (1/s) of the staggered velocity init_u_, i.e.
 // what the last projection left behind. Downloads the three components.
 float MaxDivergence(ofm::OFM& solver, cudaStream_t stream);
+// The same divergence, summarised: where the maximum sits, the rms over all
+// cells and over the interior (two or more cells from every boundary), and
+// the share of the sum of squares in the one-cell boundary layer. The 2-norm
+// is what AMGPCG's tolerance test sees; the maximum is what --log-div reports.
+struct DivStats {
+    float max = 0.0f;
+    int3 at = { 0, 0, 0 };
+    float rms = 0.0f, rms_interior = 0.0f;
+    double boundary_share = 0.0;   // fraction of sum(div^2) within one cell of a boundary
+    double l2 = 0.0;               // sqrt(sum div^2) over all cells, the solver's norm up to a scale
+    double mean = 0.0;             // signed mean of div over all cells: a net flux imbalance the
+                                   // pure-Neumann recentering drops from the right-hand side
+    float rms_zero_mean = 0.0f;    // rms of div - mean, what the solver can act on
+};
+DivStats DivergenceStats(ofm::OFM& solver, cudaStream_t stream);
 
 } // namespace selfcheck

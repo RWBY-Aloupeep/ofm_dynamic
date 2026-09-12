@@ -84,6 +84,17 @@ public:
     // downstream face keeps lateral convective faces from being handed a
     // normal flux that is the downstream face's deficit.
     bool flux_correct_face_[6] = { false, false, false, false, false, false };
+    // At the reinitialization's projection the velocity that reaches a
+    // convective face is the impulse pulled back through the cycle's map, which
+    // carries a gauge (gradient) part the projection removes in the interior
+    // but cannot remove from a face whose normal velocity is prescribed. With
+    // this set, that projection takes the face value from the last per-step
+    // projected velocity of the cycle instead (mid_u_[cycle_len_ - 1]), which
+    // is divergence-free and already convectively updated. Off by default.
+    bool convective_face_from_projected_ = false;
+    // Set for the duration of one ProjectAsync to override where convective
+    // faces read their value from (nullptr: tmp_u_, the field being projected).
+    const DHMemory<float>* conv_face_src_[3] = { nullptr, nullptr, nullptr };
     // Scratch for the flux correction: [0] net outward flux, [1] convective face
     // count. A raw device pointer because the submodule's DHMemory is only
     // instantiated for the types it uses itself, and double is not one of them.

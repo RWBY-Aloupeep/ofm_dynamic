@@ -2514,9 +2514,347 @@ this configuration sits between 0.15 and 1 as before but lower within
 that decade. And below `mu` = 4 the plume changes character: at `mu` = 1
 and 0.15 the plume top reaches the lid, `w_max` doubles, the bifurcation
 is present in only half the samples and the split narrows to 120-150 m --
-an unsteady, asymmetric plume. That is the transition Cunningham describe
-between their `mu` = 4 and `mu` = 1 direct runs (transverse vortices at
-the top of the laminar base, then an asymmetric wake); the one-step
-scheme never got there. Whether the unsteadiness is the paper's, with its
+an unsteady plume (whether it is also asymmetric is measured in the next
+section: it is not). That is the transition Cunningham describe between
+their `mu` = 4 and `mu` = 1 direct runs (transverse vortices at the top
+of the laminar base, then an asymmetric wake); the one-step scheme never
+got there. Whether the unsteadiness is the paper's, with its
 200 s period, is what the shedding criterion (`St` ~ 0.25) now has a
 configuration to be measured on.
+
+### The unsteady plume at `mu` = 1: unsteady yes, asymmetric no, and not the lid
+
+`stage_a_mu1.sbatch`, criterion configuration, `z0` = 100 m,
+`Q0` = 1 kW/m^3, 1600 s. Sample-to-sample scatter over the last 1000 s
+(34 samples, 30 s apart) is what "unsteady" means here:
+
+| `mu` | `theta_split` sd | `theta_width` sd | `w_max` sd | bifurcated | plume top |
+|---|---|---|---|---|---|
+| 12 | 4 m | 6 m | 0.01 m/s | 1.00 | 834 m |
+| 4 | 4 m | 12 m | 0.01 | 1.00 | 730 |
+| 1 | 69 m | 59 m | 0.09 | 0.77 | 1341 |
+| 0.15 | 88 m | 145 m | 0.65 | 0.51 | 1502 |
+| 0 | 108 m | 77 m | 0.72 | 0.54 | 1460 |
+
+At `mu` >= 4 every diagnostic is steady to a few metres; at `mu` <= 1 the
+split wanders by 70-110 m between samples and the section is two-lobed in
+only half to three quarters of them. The `mu` = 1 sections (`--slice`,
+`mu1_sections.png`) show a convoluted, mushroom-like plume between 800 and
+1250 m at `x` = 1750 m that changes shape every 120 s -- the plume at this
+viscosity rises to twice the height it does at `mu` = 4 and arrives at the
+plane still churning.
+
+Two things the ladder alone could not say. The asymmetry Cunningham
+describe below `mu` = 4 is not there: the ratio of the left and right
+lobe peaks of `P(y)` over the last 1000 s is 1.01 +- 0.04 (range 0.91 to
+1.08); the plume is unsteady and symmetric. Their asymmetric wake comes
+with vertically oriented wake vortices further downstream and at lower
+`mu`; whether we reach it is the `mu` = 0.15 section's question. And it
+is not the lid: with the Rayleigh sponge in the top 10% (`--sponge`) the
+scatter (sd 52 against 55 m), the bifurcation rate (0.89 against 0.83)
+and the top (1355 against 1343 m) are the same. The plume top sits just
+below the sponge zone (1368 m) either way.
+
+`mu` = 0.0015 at this configuration goes non-finite at 570 s (`u_max`
+4e17), the second time this member fails while `mu` = 0 runs to 1600 s;
+the lowest-viscosity rows at the 1.25 s cycle are at a stability edge that
+is not understood and is on the list.
+
+### The transition seen in the centreline section: rollers at the top of a laminar base
+
+`stage_a_xz.sbatch`: `--slice-xz` writes the centreline `x`-`z` section
+(`theta`, `u`, `w`) every 30 s; `plot_xz.py` draws `omega_y` = du/dz -
+dw/dx (red is clockwise seen from +`y`, the sense of the shear between
+the rising plume and the faster air above it) under `theta` contours,
+and `xz_rollers.py` counts the rollers: the local maxima along `x` of the
+strongest clockwise `omega_y` inside the 0.5 K contour, above 0.15 1/s
+and 40% of the strongest. Criterion configuration, `z0` = 100 m, `Q0` =
+1 kW/m^3, 900 s; the figure is `xz_transition.png` in the run directory
+(rows `mu` = 4, 1, 0.15; columns 300, 600, 900 s):
+
+| `mu` | rollers (450 / 600 / 750 / 900 s) | onset `x` | plume upper edge at onset | mean spacing | strongest `omega_y` |
+|---|---|---|---|---|---|
+| 4 | 0 / 0 / 0 / 0 | -- | -- | -- | 0.07-0.10 1/s |
+| 1 | 6 / 4 / 5 / 8 | 1035-1065 m | 605-665 m | 100-150 m | 0.29-0.70 |
+| 0.15 | 13 / 8 / 6 / 9 | 845-1065 m | 505-725 m | 67-170 m | 0.43-1.29 |
+
+At `mu` = 4 the plume is a smooth sheet at every time after the starting
+head has left (the 300 s column still shows the head, a large clockwise /
+anticlockwise pair at 1000-1200 m, the transient the criteria's window
+excludes); its shear layer carries a tenth of the vorticity of the
+others' rollers and never rolls up. At `mu` = 1 the plume is the same
+smooth sheet up to `x` ~ 1040 m, where its upper edge is at 600-650 m, and
+from there on its upper face carries a chain of discrete clockwise
+rollers 100-150 m apart that grow downstream, with the `theta` contours
+below them folded into the mushroom lobes the `y`-`z` sections showed;
+the onset sits at the same `x` to within 30 m at all four times, i.e. it
+is a spatial instability of the sheared upper face, not a temporal one of
+the whole plume. At `mu` = 0.15 the onset moves upstream (845 m at 450 s)
+and lower, the rollers are closer, stronger and less regular, and the
+plume above them is broken into structures on every scale down to the
+grid. This is the picture Cunningham et al. describe for the transition
+between their `mu` = 4 and `mu` = 1 runs -- transverse (spanwise) vortices
+at the top of a laminar base, and a turbulent plume above them at lower
+viscosity -- with the laminar base's height and the roller spacing now
+measured. The rollers are also what the wake probe in the plume at
+(900, 600, 305) m sees at `mu` = 1: a 50 s period in `v` and `theta`
+(`St` = 1.0 on the source diameter), which is the roller passage, not
+the 200 s wake shedding the `St` criterion looks for; the shedding
+reading is in the next section.
+
+### The shedding criterion: no wake line at `St` 0.25, at either viscosity
+
+`stage_a_sec8.sbatch` 0-1: criterion configuration, `z0` = 100 m, `Q0` =
+1 kW/m^3, `mu` = 1 and 0.15, 3000 s, with `--probes` writing `u`, `v`,
+`w`, `theta` every step at 16 points: the centreline at `x` = 700, 900,
+1100, 1300 m and `z` = 55, 155, 305 m, and two off-centre pairs at `x` =
+1000 m, `y` = 450 and 750 m, `z` = 55 and 155 m. `analyse_probes.py`
+detrends each record over 1000-3000 s, averages Hann-windowed
+periodograms over 800 s segments (Welch; resolution 1/800 Hz, `St`
+0.06), and reports the spectral peak in 1/600-1/20 Hz. Cunningham et
+al.'s shedding is `St` = f D / U ~ 0.25 with `D` = 225 m, `U` = 4.5 m/s:
+f = 0.005 Hz, a 200 s period.
+
+| | `mu` = 1 | `mu` = 0.15 |
+|---|---|---|
+| rms `v` at the 12 wake probes | 0.003-0.016 m/s | 0.016-0.045 m/s |
+| rms `v` as a fraction of `U` | 0.1-0.4% | 0.4-1.0% |
+| peak of the `v` spectrum | lowest bin (400 s) at 8 probes, 160 s (`St` 0.31) at 4 near-ground probes | lowest bin at all 12 |
+| a line at 0.005 Hz | none | none |
+
+The spectra are red: the power sits in the lowest bin and falls
+monotonically, with one slow excursion of the whole wake between 1750
+and 2300 s (visible at every probe, once, in `probes_mu1.png`), not a
+periodic signal. The 160 s peak at the `mu` = 1 near-ground probes is at
+5-9 mm/s rms, 0.1-0.2% of `U`. The only lines in the records are at
+0.020-0.025 Hz (40-50 s, `St` 1.0-1.1) in `w` and `theta` at the probes
+inside the plume ((900, 600, 305) m and (1100, 600, 305) m): that is the
+passage of the transverse rollers of the previous section, 100-150 m
+apart, carried at 2-3 m/s. So the wake behind this plume does not shed
+at the paper's frequency, at `mu` = 1 or at 0.15, on the 10 m grid in the
+long box; whether their shedding needs the lower viscosities of their
+direct runs (the `mu` = 0.0015 row is the one that goes non-finite here)
+or a feature this configuration lacks is not settled. The `St` criterion
+is recorded as not met, with the lateral velocity in the wake at or
+below 1% of the wind.
+
+The per-step records also show what the cycle-end diagnostics cannot: a
+component locked to the reinitialization cycle. At the near-ground probe
+(700, 600, 55) m the fast part of `w` (the record minus its 5 s running
+mean) has rms 0.09 m/s at `mu` = 1, its spectral peak is at 0.800 Hz --
+the 1.25 s cycle -- and its mean by sub-step within the cycle is +0.09,
+-0.16, -0.01, -0.02, +0.10 m/s (`mu` = 0.15: +0.10, -0.19, -0.01, -0.02,
++0.11). At the plume's base (900, 600, 305) m the same pattern is at
+0.07 m/s in `w` and 0.22 m/s in `u`. The per-step velocities are the
+leapfrog's intermediate states (`mid_u_`, `PlumeVelocityAfter`): the
+first sub-step is advected over half a step from the cycle start, the
+second over a full step, the rest over two steps from two back, and each
+carries its own phase of error. It is zero-mean over the cycle, 2-4% of
+`U` where the shear is strongest, and it is what the `theta` advection
+and any per-step sampling see; the criteria, sampled at cycle ends, do
+not.
+
+### The 2.5 s strong-source blow-up is the downstream face, and a projected face value removes it
+
+`stage_a_sec8.sbatch` 3-4 rerun the member that went non-finite (`z0` =
+50 m, `Q0` = 1 kW/m^3, 2.5 s cycle) at 120 and 200 iterations with the
+residual, the source-column profile and the centreline section every
+30 s. Both blow up, the 200-iteration run 30 s earlier (`u_max` 63 m/s
+at 510 s against 53 m/s at 540 s), so the projection count is not the
+cause. The residual divergence is flat at 0.04-0.09 1/s until 480 s and
+rises only once the velocity has: it is a consequence. What the sections
+show is the starting plume's head reaching the lid at 420 s (top 1515 m)
+and the downstream face at 480-510 s, and the first cells to run away
+are in the last column of the domain, `x` = 1775-1835 m, `z` = 825-1295 m
+(`c25_blowup.png`); from there a block of vorticity of either sign
+spreads back into the plume within 30 s. (The harness also missed the
+end: once the field is non-finite every maximum it reports is 0, because
+the reductions use `fmaxf`, which drops NaN; the guard now treats `u_max`
+= 0 after the first step as non-finite.)
+
+The convective face takes its value, at every projection, from the
+velocity the advection delivers to it (`ConvectiveFaceUpdateKernel`:
+`bc_val = u_axis` on the face). At the reinitialization's projection that
+velocity is the impulse pulled back through the cycle's flow map, which
+carries a gauge part -- a gradient the projection removes from the
+interior but cannot remove from a face whose normal velocity is
+prescribed. Over a 1.25 s cycle that part is small; over 2.5 s, where
+the strong plume's head arrives at the face, it is not, and it is
+written into the boundary condition. `convective_face_from_projected_`
+(`--face-projected`) has that projection take the face value from the
+last per-step projected velocity of the cycle (`mid_u_[cycle_len_ - 1]`)
+instead, which is divergence-free and already convectively updated; the
+per-step projections are unchanged. `stage_a_faceproj.sbatch` 0, the same
+member with the flag:
+
+| | face from the impulse (120 it) | face from the projected velocity |
+|---|---|---|
+| outcome | non-finite at 570 s | 900 s, pair present |
+| plume top | 1515 m at 420 s, then runaway | 1515 m at 420 s (the head), 805 m from 600 s |
+| max abs div u, 600-900 s | -- | 0.04-0.09 1/s |
+| `theta_split` at 900 s | -- | 261 m |
+| `theta_width` | -- | 524 m |
+| peak abs `omega_z` | -- | 0.016 |
+| `w_max` | -- | 9.3 m/s |
+
+The head leaves through the face and the plume settles. But against the
+criterion configuration's reading of the same case at 900 s (top 705 m,
+`theta_split` 386 m, `theta_width` 598 m, peak `omega_z` 0.0071,
+`w_max` 8.0), the 2.5 s cycle still gives a plume 100 m taller, a pair
+twice as strong and a column a third narrower -- the same narrowing the
+survivors of the 2.5 s set showed. The blow-up and the narrowing are
+therefore two things: the face is fixed, the strong source's dependence
+on the cycle length between 1.25 and 2.5 s is not understood, and the 2.5
+s row stays "runs, not converged in cycle length for the strong source".
+
+The flag at the criterion configuration (`stage_a_faceproj.sbatch` 1-2,
+`z0` = 100 m, `Q0` = 1 kW/m^3, 1600 s, last 1000 s, mean +- standard
+error over 35 samples):
+
+| | `theta_split` | `theta_width` | plume top | `w_max` | peak `omega_z` | peak `P(y)` |
+|---|---|---|---|---|---|---|
+| criterion run (build-v16) | 395.3 +- 0.7 | 674.4 +- 2.2 | 730.4 +- 1.2 | 8.635 | 0.00490 | 2.275 |
+| control, rebuilt binary, flag off | 395.4 +- 0.7 | 674.0 +- 2.1 | 731.0 +- 1.2 | 8.632 | 0.00490 | 2.275 |
+| flag on | 397.2 +- 0.5 | 674.1 +- 2.0 | 722.7 +- 0.8 | 8.603 | 0.00503 | 2.288 |
+
+The rebuild is regression-clean (the control reproduces the criterion
+run to the last digit). The flag itself moves the reading: +2 m on the
+split, -8 m on the top, +3% on the pair strength, +0.013 K on the peak --
+small, systematic, and not nothing, so the criterion configuration keeps
+the face as it was, and the flag is used where it is needed, the 2.5 s
+cycle. Which face value is the right one for a plume leaving through the
+boundary is a boundary-condition question the long box (`--long`) can
+arbitrate, not settled here.
+
+### Why the tolerance mode runs to its cap: the iteration does not reduce the residual past a factor of 2-3
+
+`stage_a_sec8.sbatch` 2 prints the AMGPCG residual at every iteration
+(`--cg-verbose`; `|residual|_2` is sqrt(rTr) of the solver's own
+residual vector), and `stage_a_divstats.sbatch` puts the projected
+field's divergence statistics next to it (`--log-div` now reports the
+maximum and its cell, the rms, the interior rms two or more cells from
+every boundary, the 2-norm, the share of the sum of squares in the
+one-cell boundary layer, and the signed mean). First the two agree: on
+the last logged projection the solver's final residual is the field's
+divergence 2-norm times `dx` (ratios 9.5, 10.0, 9.7, 9.4, 10.0 in five
+runs), so what the solver prints is what the field carries. Then what the
+iteration does with it, weak case, 1.25 s cycle, the reinitialization's
+projection at step 40:
+
+| count | residual at iteration 1 | its minimum (at) | at the last iteration | last / first | field: max abs div, l2 |
+|---|---|---|---|---|---|
+| 15 | 31.6 | 31.6 (1) | 49.0 | 1.55 | 0.057, 5.16 |
+| 120 | 14.6 | 11.8 (34) | 23.5 | 1.61 | 0.024, 2.35 |
+| 120, restart every 30 | 11.8 | 8.1 (94) | 14.2 | 1.20 | 0.015, 1.47 |
+| 120, restart every 15 | 11.9 | 9.7 (108) | 13.3 | 1.12 | 0.013, 1.41 |
+| 120, restart every 1 (steepest descent) | 20.4 | 20.4 (1) | 24.3 | 1.19 | 0.020, 2.43 |
+| `n` = 1, 15 (80 projections) | -- | at iteration 1 in 79 of 80 | -- | 1.5-1.75 | 0.027, 2.42 |
+
+In every projection of every run the residual norm is at or near its
+minimum after the first iteration or within the first few dozen, and
+higher at the end than at the start; over 199 iterations in tolerance
+mode it never falls below 0.35 of its first value (49 projections, the
+reinitialization's the worst at 0.8-1.0), so a relative tolerance of
+1e-2 on rTr (0.1 on the norm) is never met and the mode always runs to
+its cap. That is the whole of the cost measured in the tolerance section.
+The count still matters between runs because each projection starts from
+the field the previous ones left: at 15 iterations the divergence rms
+over 600 s grows to 1.2e-2 1/s (max 0.35-0.50), at 120 it holds at
+1.0-1.7e-3 (max 0.03-0.07) -- a factor of ten -- and the 600 s plume
+differs accordingly (peak anomaly 11.8 K against 14.8 K).
+
+What the residual is not. It is not a net flux imbalance: the signed
+mean of the divergence is 1e-11 1/s (`v20/stage-a-4-divstats`), so the
+pure-Neumann recentering is not hiding a constant. It is not at the
+boundaries: the boundary layer's share of the sum of squares is
+0.03-0.05, the same as that layer's share of the cells (0.041), and the
+interior rms equals the rms. It is not cured by restarting the recurrence
+(restart every 30 iterations: 1.6x lower on one projection, no
+difference in the 600 s divergence trend or the plume, `stage-a-4-
+cgrestart`), and steepest descent, which needs no conjugacy, is worse.
+The residual is a zero-mean field of rms 1e-3 1/s spread through the
+whole domain, peaking 30x higher in the plume, that the multigrid-
+preconditioned iteration reduces by a factor of 2-3 and then lets grow.
+`AMGPCG::restart_every_` (`--cg-restart`) stays in as a knob that does
+not help; the criterion configuration keeps its fixed 120 iterations.
+
+What it is: the preconditioner is not symmetric. `--test amg-sym`
+(`stage_a_amgsym.sbatch`) builds the plume's Poisson problem, draws two
+random zero-mean vectors `r1`, `r2`, applies one V-cycle from zero to
+each (`z = M r`, what every CG iteration applies) and the Laplacian
+(`A r`), and compares the cross products:
+
+| operator | `r2 . (op r1)` | `r1 . (op r2)` | relative asymmetry | `r . (op r)` |
+|---|---|---|---|---|
+| `A`, convective face | -1.945158e+04 | -1.945158e+04 | 4.0e-8 | 2.0e+07, positive |
+| `M`, convective face | -2.220e+03 | -1.723e+03 | 0.22 | 7.4e+05, positive |
+| `A`, closed box | -1.945158e+04 | -1.945158e+04 | 4.0e-8 | positive |
+| `M`, closed box | -1.628e+03 | -1.475e+03 | 0.094 | positive |
+
+The Laplacian is symmetric to single precision; the multigrid V-cycle is
+not symmetric at all (the down-sweep smooths in one colour order and the
+up-sweep, `ProlongGaussSeidelDot`, in the same order, so the cycle is not
+its own transpose), and conjugate gradient with a non-symmetric
+preconditioner has no convergence theory. The same test then runs the
+solver's own loop on two right-hand sides: on white noise CG still
+reduces the residual tenfold in 120 iterations (the V-cycle's smoothing
+does that on its own); on a smooth right-hand side -- one low mode, what
+a divergence field looks like -- the residual is lowest after the first
+iteration and 2.8x higher after 120. That is the projection's behaviour
+on the plume, reproduced without the plume. The remedy is either a
+symmetric cycle (reverse the colour order on the way up) or a Krylov
+method that tolerates a variable preconditioner; the flexible variant
+of CG (Polak-Ribiere `beta` = `z_new . (r_new - r_old) / (z_old . r_old)`,
+one extra vector and one dot per iteration) is the cheaper test and is
+tried next.
+
+### Flexible conjugate gradient converges where the standard recurrence diverged, and what that does to the criteria
+
+`AMGPCG::flexible_` (`--cg-flexible`): `beta` = `z_new . (r_new - r_old) /
+(z_old . r_old)` (Polak-Ribiere), one vector copy and one dot per
+iteration; identical to the standard `beta` for a symmetric
+preconditioner. `stage_a_cgflex.sbatch`:
+
+| test | standard CG, last / first | flexible CG, last / first |
+|---|---|---|
+| `amg-sym`, random right-hand side, 120 it | 0.103 | 0.036 |
+| `amg-sym`, smooth right-hand side, 120 it | 2.81 (minimum at iteration 1) | 0.70 (minimum at 117) |
+| weak case, reinitialization projection at step 40, 120 it | 1.61; field l2 2.35 | 1.03; field l2 1.12 |
+| the same at 60 it | (15 it: 1.55; l2 5.16) | 1.15; l2 1.50 |
+
+The recurrence is fixed: the residual no longer rises within a
+projection, and 60 flexible iterations leave less than 120 standard
+ones. But it converges slowly on the smooth right-hand side (0.70 in 120
+iterations) and over 600 s the divergence trend at 120 flexible (rms
+1.2e-3, max 0.03-0.10) is no better than 120 standard (1.1e-3, 0.03-
+0.07). The reason is in the test's own header: the multigrid has 4
+levels on the plume grid, the coarsest level is 3 x 2 x 3 tiles = 9216
+cells, and it is "solved" by `bottom_smoothing_` = 10 Gauss-Seidel
+sweeps -- which cannot converge the smoothest modes of a 9000-unknown
+problem, and those are the domain-wide, zero-mean, boundary-indifferent
+residual the statistics found. `--amg-bottom N` raises the count; the
+test is the next section.
+
+The criteria feel the projection. Criterion configuration (`z0` = 100
+m, `Q0` = 1 kW/m^3, 1600 s, last 1000 s), `stage-a-4-cgflex` against the
+control:
+
+| projection | residual max / rms, late | `theta_split` | `theta_width` | plume top | peak `omega_z` | peak `P(y)` |
+|---|---|---|---|---|---|---|
+| standard 120 (criterion run) | 0.023 / -- | 395.4 +- 0.7 | 674 +- 2 | 731 +- 1 | 0.00490 | 2.275 |
+| flexible 120 | 0.0064 / 2.9e-4 | 408.8 +- 1.5 | 686 +- 2 | 727 +- 2 | 0.00534 | 2.329 |
+| flexible 60 | 0.023 / 8e-4 | 420.6 +- 2.5 | 700 +- 2 | 753 +- 22 | 0.00567 | 2.313 |
+
+Converging the projection 3.5x further moves the split by +13 m (3%,
+9 standard errors), the width by +12 m, the pair strength by +9% and the
+peak by +0.05 K; and 60 flexible iterations, which leave the same
+maximum residual as 120 standard but a different residual field, give
+yet another reading (+25 m, and an unsteady top). So the criterion
+readings carry a projection-dependent uncertainty of order 15-25 m on
+the split and 10-15% on the pair strength that the sampling standard
+errors (0.5-2.5 m) do not show. The orderings survive it (the `z0`
+column's gaps are 56-127 m); the `Q0` gap at `z0` = 150 m (8.5 m) was
+already below it. The criterion configuration is not changed here --
+the reading to compare across cuts stays the standard 120 -- but the
+six cases must be re-read once the projection converges properly, and
+the numbers above are the size of the correction to expect.

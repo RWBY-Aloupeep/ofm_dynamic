@@ -1578,8 +1578,10 @@ int main(int argc, char** argv)
                 plume.outflow = 3, outflow.outflow = 2;
             else if (mode == "cxy")
                 plume.outflow = 4, outflow.outflow = 2;
+            else if (mode == "cxy-d")
+                plume.outflow = 5, outflow.outflow = 2;
             else {
-                printf("--outflow takes closed, x (or open), xy, cx (or conv) or cxy\n");
+                printf("--outflow takes closed, x (or open), xy, cx (or conv), cxy or cxy-d (lateral convective, correction on the downstream face only)\n");
                 return 1;
             }
         }

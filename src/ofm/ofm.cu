@@ -418,11 +418,19 @@ void OFM::ProjectAsync(cudaStream_t _stream)
         for (int f = 0; f < 6; f++)
             if (convective_face_[f])
                 ConvectiveFaceUpdateAsync(*bc_val[f / 2], *tmp_u[f / 2], tile_dim_, f / 2, f % 2, _stream);
-        cudaMemsetAsync(flux_sum_, 0, 2 * sizeof(double), _stream);
-        DomainFluxAsync(flux_sum_, tile_dim_, *is_bc_x_, *is_bc_y_, *is_bc_z_, *bc_val_x_, *bc_val_y_, *bc_val_z_,
-                        *tmp_u_x_, *tmp_u_y_, *tmp_u_z_, convective_face_, _stream);
+        bool any_absorb = false;
         for (int f = 0; f < 6; f++)
-            if (convective_face_[f])
+            any_absorb = any_absorb || flux_correct_face_[f];
+        bool absorb[6];
+        for (int f = 0; f < 6; f++)
+            absorb[f] = any_absorb ? (flux_correct_face_[f] && convective_face_[f]) : convective_face_[f];
+        cudaMemsetAsync(flux_sum_, 0, 2 * sizeof(double), _stream);
+        // The flux is summed over every face; the count -- the area the
+        // correction is spread over -- only over the faces that absorb it.
+        DomainFluxAsync(flux_sum_, tile_dim_, *is_bc_x_, *is_bc_y_, *is_bc_z_, *bc_val_x_, *bc_val_y_, *bc_val_z_,
+                        *tmp_u_x_, *tmp_u_y_, *tmp_u_z_, absorb, _stream);
+        for (int f = 0; f < 6; f++)
+            if (absorb[f])
                 ConvectiveFaceCorrectAsync(*bc_val[f / 2], tile_dim_, f / 2, f % 2, flux_sum_, _stream);
     }
 

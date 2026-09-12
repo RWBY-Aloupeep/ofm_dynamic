@@ -1158,7 +1158,7 @@ __global__ void AmbientInflowThetaKernel(float* theta, int3 tile_dim, const floa
         const int3 ijk       = { tile_ijk.x * 8 + voxel_ijk.x, tile_ijk.y * 8 + voxel_ijk.y, tile_ijk.z * 8 + voxel_ijk.z };
         float inflow         = 0.0f; // inward normal speed summed over the cell's open faces
         const bool open_x    = outflow >= 1;
-        const bool open_y    = outflow == 2 || outflow == 4;
+        const bool open_y    = outflow == 2 || outflow == 4 || outflow == 5;
         if (open_x && ijk.x == cell_dim.x - 1)
             inflow += fmaxf(0.0f, -u_x[IjkToIdx(x_tile_dim, { ijk.x + 1, ijk.y, ijk.z })]);
         if (open_y && ijk.y == 0)
@@ -1226,7 +1226,12 @@ void SetPlumeBcAsync(ofm::OFM& solver, const PlumeSpec& spec, cudaStream_t strea
     solver.amgpcg_.pure_neumann_ = !(spec.outflow == 1 || spec.outflow == 2);
     // Convective faces keep their marks; the projection refreshes their values.
     solver.convective_face_[1] = (spec.outflow >= 3);
-    solver.convective_face_[2] = solver.convective_face_[3] = (spec.outflow == 4);
+    solver.convective_face_[2] = solver.convective_face_[3] = (spec.outflow == 4 || spec.outflow == 5);
+    // Mode 5: lateral faces convective too, but only the downstream face
+    // absorbs the net-flux correction.
+    for (int f = 0; f < 6; f++)
+        solver.flux_correct_face_[f] = false;
+    solver.flux_correct_face_[1] = (spec.outflow == 5);
 
     ofm::SetCoefByIsBcAsync(*(solver.amgpcg_.poisson_vector_[0].is_dof_),
                             *(solver.amgpcg_.poisson_vector_[0].a_diag_),

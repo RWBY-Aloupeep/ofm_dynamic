@@ -78,6 +78,12 @@ public:
     // pressure sees Neumann across them, nothing is pinned, and pure_neumann_
     // stays true. Index order: x-, x+, y-, y+, z-, z+.
     bool convective_face_[6] = { false, false, false, false, false, false };
+    // Which convective faces absorb the net-flux correction that keeps the
+    // pure-Neumann projection compatible. All false means every convective
+    // face shares it by area, the original behaviour. Setting only the
+    // downstream face keeps lateral convective faces from being handed a
+    // normal flux that is the downstream face's deficit.
+    bool flux_correct_face_[6] = { false, false, false, false, false, false };
     // Scratch for the flux correction: [0] net outward flux, [1] convective face
     // count. A raw device pointer because the submodule's DHMemory is only
     // instantiated for the types it uses itself, and double is not one of them.

@@ -4,4 +4,4 @@
 	branch = master
 [submodule "src/AMGPCG_Pybind_Torch"]
 	path = src/AMGPCG_Pybind_Torch
-	url = https://github.com/Mr-222/AMGPCG_Pybind
+	url = https://github.com/RWBY-Aloupeep/AMGPCG_Pybind
